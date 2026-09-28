@@ -15,6 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vertex = [
+    "google-auth>=2.30",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

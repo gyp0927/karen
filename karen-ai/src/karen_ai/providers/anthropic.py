@@ -130,12 +130,14 @@ def _anthropic_api_key_auth() -> ApiKeyAuth:
 
 
 def anthropic_provider():
+    from ..auth.oauth import anthropic_oauth
+
     return create_provider(
         CreateProviderOptions(
             id="anthropic",
             name="Anthropic",
             base_url=ANTHROPIC_BASE_URL,
-            auth=ProviderAuth(api_key=_anthropic_api_key_auth()),
+            auth=ProviderAuth(api_key=_anthropic_api_key_auth(), oauth=anthropic_oauth),
             models=list(ANTHROPIC_MODELS),
             api=anthropic_messages_api(),
         )

@@ -98,13 +98,23 @@ AuthType = Literal["api_key", "oauth"]
 # -- Login interaction --------------------------------------------------------
 
 
-class AuthPromptText(KarenBase):
+class _AuthPromptBase(KarenBase):
+    """Prompts carry an optional per-prompt signal so a flow can cancel one
+    prompt (e.g. a `manual_code` prompt raced against a callback server)
+    without aborting the whole login."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    signal: Optional[AbortSignal] = None
+
+
+class AuthPromptText(_AuthPromptBase):
     type: Literal["text"] = "text"
     message: str
     placeholder: Optional[str] = None
 
 
-class AuthPromptSecret(KarenBase):
+class AuthPromptSecret(_AuthPromptBase):
     type: Literal["secret"] = "secret"
     message: str
     placeholder: Optional[str] = None
@@ -116,13 +126,13 @@ class AuthSelectOption(KarenBase):
     description: Optional[str] = None
 
 
-class AuthPromptSelect(KarenBase):
+class AuthPromptSelect(_AuthPromptBase):
     type: Literal["select"] = "select"
     message: str
     options: List[AuthSelectOption]
 
 
-class AuthPromptManualCode(KarenBase):
+class AuthPromptManualCode(_AuthPromptBase):
     type: Literal["manual_code"] = "manual_code"
     message: str
     placeholder: Optional[str] = None

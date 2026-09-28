@@ -174,13 +174,14 @@ def _openrouter_api_key_auth() -> ApiKeyAuth:
 
 def openrouter_provider():
     from ..api import openrouter_images, typesafe_system_one
+    from ..auth.oauth import openrouter_oauth
 
     return create_provider(
         CreateProviderOptions(
             id="openrouter",
             name="OpenRouter",
             base_url=OPENROUTER_BASE_URL,
-            auth=ProviderAuth(api_key=_openrouter_api_key_auth()),
+            auth=ProviderAuth(api_key=_openrouter_api_key_auth(), oauth=openrouter_oauth),
             models=[*OPENROUTER_MODELS, *OPENROUTER_IMAGE_MODELS, *OPENROUTER_CLASSIFIER_MODELS],
             api=openai_completions_api(),
             images={"openrouter-images": openrouter_images.generate_images},
