@@ -67,7 +67,7 @@ def _downgrade_unsupported_images(messages: List[Message], model: Model) -> List
 def transform_messages(
     messages: List[Message],
     model: Model,
-    normalize_tool_call_id: Optional[Callable[[str], str]] = None,
+    normalize_tool_call_id: Optional[Callable[[str, Model, AssistantMessage], str]] = None,
 ) -> List[Message]:
     """Normalize a transcript for replay against `model`."""
     tool_call_id_map: Dict[str, str] = {}
@@ -117,7 +117,9 @@ def transform_messages(
                     continue
 
                 if block.type == "text":
-                    transformed_content.append(TextContent(text=block.text))
+                    # Same model: keep the block as-is (text signatures are
+                    # needed for replay); cross-model: plain text copy.
+                    transformed_content.append(block if is_same_model else TextContent(text=block.text))
                     continue
 
                 if block.type == "toolCall":
@@ -128,7 +130,7 @@ def transform_messages(
                         normalized_call = tool_call.model_copy(update={"thought_signature": None})
 
                     if not is_same_model and normalize_tool_call_id:
-                        normalized_id = normalize_tool_call_id(tool_call.id)
+                        normalized_id = normalize_tool_call_id(tool_call.id, model, assistant_msg)
                         if normalized_id != tool_call.id:
                             tool_call_id_map[tool_call.id] = normalized_id
                             normalized_call = normalized_call.model_copy(update={"id": normalized_id})

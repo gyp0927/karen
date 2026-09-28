@@ -273,7 +273,7 @@ def _convert_messages(
     normalized_context = resolve_transcript(context, compat.supports_mid_convo_system_messages)
     params: List[Dict[str, Any]] = []
 
-    def normalize_tool_call_id(id: str) -> str:
+    def normalize_tool_call_id(id: str, _target_model: Model = model, _source=None) -> str:
         # Handle pipe-separated IDs from OpenAI Responses-style APIs.
         if "|" in id:
             call_id, _, item_id = id.partition("|")

@@ -1,10 +1,13 @@
-"""OpenAI provider with a static flagship catalog."""
+"""OpenAI provider with a static flagship catalog.
+
+Matches pi-ai: the OpenAI provider speaks the Responses API for all models.
+"""
 
 from __future__ import annotations
 
 from typing import Optional
 
-from ..api import openai_completions_api
+from ..api import openai_responses_api
 from ..auth.types import ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthResult, ModelAuth, ProviderAuth
 from ..errors import AbortError
 from ..models import CreateProviderOptions, create_provider
@@ -29,7 +32,7 @@ def _model(
     return Model(
         id=id,
         name=name,
-        api="openai-completions",
+        api="openai-responses",
         provider="openai",
         base_url=OPENAI_BASE_URL,
         input=["text", "image"],
@@ -83,6 +86,6 @@ def openai_provider():
             base_url=OPENAI_BASE_URL,
             auth=ProviderAuth(api_key=_openai_api_key_auth()),
             models=list(OPENAI_MODELS),
-            api=openai_completions_api(),
+            api=openai_responses_api(),
         )
     )
