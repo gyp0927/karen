@@ -12,7 +12,7 @@ from ..api import openai_completions_api
 from ..auth.types import ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthResult, ModelAuth, ProviderAuth
 from ..errors import AbortError
 from ..models import CreateProviderOptions, create_provider
-from ..types import Model, ModelCost
+from ..types import ClassifierModel, ImageModel, Model, ModelCost
 
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -110,6 +110,44 @@ OPENROUTER_MODELS = [
 ]
 
 
+OPENROUTER_IMAGE_MODELS = [
+    ImageModel(
+        id="google/gemini-3-pro-image-preview",
+        name="Gemini 3 Pro Image (OpenRouter)",
+        api="openrouter-images",
+        provider="openrouter",
+        base_url=OPENROUTER_BASE_URL,
+        input=["text", "image"],
+        output=["image", "text"],
+        cost=ModelCost(input=2.0, output=12.0, cache_read=0.0, cache_write=0.0),
+    ),
+    ImageModel(
+        id="google/gemini-2.5-flash-image",
+        name="Gemini 2.5 Flash Image (OpenRouter)",
+        api="openrouter-images",
+        provider="openrouter",
+        base_url=OPENROUTER_BASE_URL,
+        input=["text", "image"],
+        output=["image"],
+        cost=ModelCost(input=0.3, output=2.5, cache_read=0.0, cache_write=0.0),
+    ),
+]
+
+
+# OpenRouter serves TypeSafe's System One protocol at /api/v1/systemone.
+OPENROUTER_CLASSIFIER_MODELS = [
+    ClassifierModel(
+        id="typesafe/jev",
+        name="Jev (OpenRouter)",
+        api="typesafe-system-one",
+        provider="openrouter",
+        base_url=OPENROUTER_BASE_URL,
+        input=["text"],
+        cost=ModelCost(input=0.0, output=0.0, cache_read=0.0, cache_write=0.0),
+    ),
+]
+
+
 def _openrouter_api_key_auth() -> ApiKeyAuth:
     async def login(interaction):
         from ..auth.types import AuthPromptSecret
@@ -135,13 +173,18 @@ def _openrouter_api_key_auth() -> ApiKeyAuth:
 
 
 def openrouter_provider():
+    from ..api import openrouter_images, typesafe_system_one
+
     return create_provider(
         CreateProviderOptions(
             id="openrouter",
             name="OpenRouter",
             base_url=OPENROUTER_BASE_URL,
             auth=ProviderAuth(api_key=_openrouter_api_key_auth()),
-            models=list(OPENROUTER_MODELS),
+            models=[*OPENROUTER_MODELS, *OPENROUTER_IMAGE_MODELS, *OPENROUTER_CLASSIFIER_MODELS],
             api=openai_completions_api(),
+            images={"openrouter-images": openrouter_images.generate_images},
+            # OpenRouter serves TypeSafe's System One protocol at /api/v1/systemone.
+            classifiers={"typesafe-system-one": typesafe_system_one.classify},
         )
     )
