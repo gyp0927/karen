@@ -67,6 +67,16 @@ def test_resolve_codex_url():
     assert resolve_codex_url("https://x.test/") == "https://x.test/codex/responses"
 
 
+def _request_body(request) -> dict:
+    """Decodes a captured request body, transparently handling zstd compression."""
+    content = request.content
+    if request.headers.get("content-encoding") == "zstd":
+        import zstandard
+
+        content = zstandard.ZstdDecompressor().decompress(content)
+    return json.loads(content)
+
+
 def test_text_stream_with_usage_and_headers():
     async def main():
         model = _model()
@@ -85,7 +95,7 @@ def test_text_stream_with_usage_and_headers():
                     _completed(),
                 )
             )
-            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(api_key=_jwt(), session_id="sess-9"))
+            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(transport="sse", api_key=_jwt(), session_id="sess-9"))
             events = [e async for e in stream]
             message = await stream.result()
 
@@ -104,7 +114,8 @@ def test_text_stream_with_usage_and_headers():
         assert request.headers["openai-beta"] == "responses=experimental"
         assert request.headers["accept"] == "text/event-stream"
 
-        body = json.loads(request.content)
+        assert request.headers["content-encoding"] == "zstd"
+        body = _request_body(request)
         assert body["model"] == model.id
         assert body["store"] is False
         assert body["stream"] is True
@@ -135,7 +146,7 @@ def test_usage_limit_friendly_message():
                     },
                 )
             )
-            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(api_key=_jwt()))
+            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(transport="sse", api_key=_jwt()))
             message = await stream.result()
 
         assert message.stop_reason == "error"
@@ -156,7 +167,7 @@ def test_retry_on_transient_500():
                 ]
             )
             stream = codex.stream(
-                model, _context(), OpenAICodexResponsesOptions(api_key=_jwt(), max_retries=2)
+                model, _context(), OpenAICodexResponsesOptions(transport="sse", api_key=_jwt(), max_retries=2)
             )
             message = await stream.result()
 
@@ -177,7 +188,7 @@ def test_response_failed_event():
                     {"type": "response.failed", "response": {"error": {"code": "boom", "message": "it broke"}}}
                 )
             )
-            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(api_key=_jwt()))
+            stream = codex.stream(model, _context(), OpenAICodexResponsesOptions(transport="sse", api_key=_jwt()))
             message = await stream.result()
 
         assert message.stop_reason == "error"
@@ -188,7 +199,7 @@ def test_response_failed_event():
 
 def test_invalid_jay_dubya_tee():
     async def main():
-        stream = codex.stream(_model(), _context(), OpenAICodexResponsesOptions(api_key="not-a-jwt"))
+        stream = codex.stream(_model(), _context(), OpenAICodexResponsesOptions(transport="sse", api_key="not-a-jwt"))
         message = await stream.result()
         assert message.stop_reason == "error"
         assert "accountId" in (message.error_message or "")

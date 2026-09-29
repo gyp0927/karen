@@ -38,6 +38,7 @@ def build_base_options(
             model, context, (options.max_tokens if options and options.max_tokens else model.max_tokens)
         ),
         signal=options.signal if options else None,
+        telemetry_context=options.telemetry_context if options else None,
         api_key=api_key or (options.api_key if options else None),
         transport=options.transport if options else None,
         cache_retention=options.cache_retention if options else None,

@@ -4,10 +4,13 @@ ChatGPT-backend Responses variant: JWT account auth, `store: false`, encrypted
 reasoning, zstd-compressed request bodies when a zstd codec is available, and
 usage-limit aware retries.
 
-Transport note: pi-ai additionally speaks a cached WebSocket transport
-(`transport="websocket" | "auto"` prefers it). karen-ai currently implements
-the SSE transport only; `auto`/`websocket` transparently use SSE, matching
-pi-ai's own fallback behavior when the socket cannot be established.
+Two transports are supported. `transport="sse"` posts to `/codex/responses` and
+parses the event stream; `transport="websocket"`, `"websocket-cached"` (and the
+default `"auto"`) prefer the cached WebSocket transport in
+`karen_ai.api.codex_websocket`, which reuses one socket per session and sends
+only the input delta plus `previous_response_id` on follow-up turns. A session
+whose WebSocket attempt fails before the first event is pinned to SSE for the
+rest of its life, matching pi-ai.
 """
 
 from __future__ import annotations
@@ -17,7 +20,9 @@ import base64
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -26,11 +31,13 @@ from ..models import clamp_thinking_level
 from ..transcript import (
     get_declared_tools,
     get_initial_system_message,
+    normalize_context,
     resolve_transcript,
     resolve_transcript_tools,
 )
 from ..types import (
     AssistantMessage,
+    Context,
     DoneEvent,
     ErrorEvent,
     Model,
@@ -43,11 +50,41 @@ from ..types import (
     TranscriptContext,
     Usage,
 )
-from ..utils.diagnostics import format_thrown_value
+from ..utils.diagnostics import (
+    append_assistant_message_diagnostic,
+    create_assistant_message_diagnostic,
+    format_thrown_value,
+)
 from ..utils.error_body import format_provider_error, normalize_provider_error
 from ..utils.headers import headers_to_record, provider_headers_to_record
 from ..utils.pi_user_agent import get_pi_user_agent
 from ..utils.text import get_system_message_text
+from .codex_errors import (
+    PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+    WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+    CodexApiError,
+    CodexProtocolError,
+    ProviderStreamEventCallbackError,
+    is_codex_non_transport_error,
+    is_previous_response_not_found_error,
+    is_websocket_connection_limit_reached_error,
+)
+from .codex_websocket import (
+    DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
+    OPENAI_BETA_RESPONSES_WEBSOCKETS,
+    CachedWebSocketConnection,
+    CachedWebSocketContinuation,
+    acquire_websocket,
+    build_cached_websocket_request_body,
+    close_openai_codex_websocket_sessions,
+    get_openai_codex_websocket_debug_stats,
+    is_websocket_sse_fallback_active,
+    parse_websocket,
+    record_websocket_failure,
+    record_websocket_request,
+    record_websocket_sse_fallback,
+    reset_openai_codex_websocket_debug_stats,
+)
 from .constrained_sampling import create_grammar_tool_input_properties
 from .openai_prompt_cache import clamp_openai_prompt_cache_key
 from .openai_responses_shared import (
@@ -79,17 +116,19 @@ class OpenAICodexResponsesOptions(StreamOptions):
     service_tier: Optional[str] = None
 
 
-class CodexApiError(Exception):
-    def __init__(self, message: str, code: Optional[str] = None, payload: Optional[Dict[str, Any]] = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.payload = payload
-
-
-class CodexProtocolError(Exception):
-    def __init__(self, message: str, payload: Any = None) -> None:
-        super().__init__(message)
-        self.payload = payload
+__all__ = [
+    "CodexApiError",
+    "CodexProtocolError",
+    "OpenAICodexResponsesOptions",
+    "close_openai_codex_websocket_sessions",
+    "extract_account_id",
+    "get_openai_codex_websocket_debug_stats",
+    "reset_openai_codex_websocket_debug_stats",
+    "resolve_codex_url",
+    "resolve_codex_websocket_url",
+    "stream",
+    "stream_simple",
+]
 
 
 def _assert_successful_output(output: AssistantMessage) -> None:
@@ -376,6 +415,31 @@ def resolve_codex_url(base_url: Optional[str]) -> str:
     return f"{normalized}/codex/responses"
 
 
+def resolve_codex_websocket_url(base_url: Optional[str]) -> str:
+    """The same endpoint as `resolve_codex_url`, on the websocket scheme."""
+    url = urlparse(resolve_codex_url(base_url))
+    scheme = "wss" if url.scheme == "https" else "ws" if url.scheme == "http" else url.scheme
+    return urlunparse(url._replace(scheme=scheme))
+
+
+def _build_websocket_headers(
+    init_headers: Optional[Dict[str, str]],
+    additional_headers: Optional[Dict[str, Optional[str]]],
+    account_id: str,
+    token: str,
+    request_id: str,
+) -> Dict[str, str]:
+    headers = _build_base_codex_headers(init_headers, additional_headers, account_id, token)
+    for name in ("accept", "content-type", "openai-beta"):
+        for existing in list(headers):
+            if existing.lower() == name:
+                del headers[existing]
+    headers["OpenAI-Beta"] = OPENAI_BETA_RESPONSES_WEBSOCKETS
+    headers["x-client-request-id"] = request_id
+    headers["session-id"] = request_id
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # Response processing
 # ---------------------------------------------------------------------------
@@ -395,9 +459,13 @@ def _extract_codex_event_error(event: Dict[str, Any]) -> tuple[Optional[str], Op
 async def _map_codex_events(events, output: AssistantMessage, model: Model, on_provider_stream_event):
     async for event in events:
         if on_provider_stream_event is not None:
-            maybe = on_provider_stream_event(event, model)
-            if asyncio.iscoroutine(maybe):
-                await maybe
+            try:
+                maybe = on_provider_stream_event(event, model)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except BaseException as error:
+                # Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
+                raise ProviderStreamEventCallbackError(error) from error
         event_type = event.get("type")
         if not isinstance(event_type, str):
             continue
@@ -460,8 +528,8 @@ async def _parse_sse(response: httpx.Response, signal=None):
                 ) from cause
 
 
-async def _process_stream(
-    response: httpx.Response,
+async def _process_event_stream(
+    events: AsyncIterator[Dict[str, Any]],
     output: AssistantMessage,
     stream: AssistantMessageEventStream,
     model: Model,
@@ -469,12 +537,7 @@ async def _process_stream(
     options: Optional[OpenAICodexResponsesOptions],
 ) -> None:
     await process_responses_stream(
-        _map_codex_events(
-            _parse_sse(response, options.signal if options else None),
-            output,
-            model,
-            options.on_provider_stream_event if options else None,
-        ),
+        _map_codex_events(events, output, model, options.on_provider_stream_event if options else None),
         output,
         stream,
         model,
@@ -485,6 +548,118 @@ async def _process_stream(
             apply_service_tier_pricing=lambda usage, tier: _apply_service_tier_pricing(usage, tier, model),
         ),
     )
+
+
+async def _process_stream(
+    response: httpx.Response,
+    output: AssistantMessage,
+    stream: AssistantMessageEventStream,
+    model: Model,
+    grammar_tool_input_properties: Dict[str, str],
+    options: Optional[OpenAICodexResponsesOptions],
+) -> None:
+    await _process_event_stream(
+        _parse_sse(response, options.signal if options else None),
+        output,
+        stream,
+        model,
+        grammar_tool_input_properties,
+        options,
+    )
+
+
+async def _process_websocket_stream(
+    url: str,
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+    output: AssistantMessage,
+    stream: AssistantMessageEventStream,
+    model: Model,
+    on_start,
+    idle_timeout_ms: Optional[int],
+    websocket_connect_timeout_ms: Optional[int],
+    cache_session_id: Optional[str],
+    account_id: str,
+    grammar_tool_input_properties: Dict[str, str],
+    options: Optional[OpenAICodexResponsesOptions],
+) -> None:
+    signal = options.signal if options else None
+    socket, entry, reused, release = await acquire_websocket(
+        url,
+        headers,
+        cache_session_id,
+        account_id,
+        signal,
+        websocket_connect_timeout_ms,
+        options.env if options else None,
+    )
+    keep_connection = True
+    use_cached_context = bool(options and options.transport in ("websocket-cached", "auto"))
+    full_body = body
+    request_body = (
+        build_cached_websocket_request_body(entry, full_body) if use_cached_context and entry is not None else full_body
+    )
+    record_websocket_request(cache_session_id, reused, use_cached_context, request_body)
+    started = False
+
+    def mark_started() -> None:
+        nonlocal started
+        if started:
+            return
+        started = True
+        on_start()
+
+    try:
+        await socket.send(json.dumps({"type": "response.create", **request_body}, separators=(",", ":")))
+        events = _start_on_first_event(
+            _map_codex_events(
+                parse_websocket(socket, signal, idle_timeout_ms),
+                output,
+                model,
+                options.on_provider_stream_event if options else None,
+            ),
+            mark_started,
+        )
+        await _process_event_stream(events, output, stream, model, grammar_tool_input_properties, options)
+
+        if signal is not None and signal.aborted:
+            keep_connection = False
+        elif use_cached_context and entry is not None and output.response_id:
+            response_items = [
+                item
+                for item in convert_responses_messages(
+                    model,
+                    normalize_context(Context(messages=[output])),
+                    CODEX_TOOL_CALL_PROVIDERS,
+                    ConvertResponsesMessagesOptions(
+                        include_system_prompt=False,
+                        grammar_tool_input_properties=grammar_tool_input_properties,
+                    ),
+                )
+                if item.get("type") not in ("function_call_output", "custom_tool_call_output")
+            ]
+            entry.continuation = CachedWebSocketContinuation(
+                last_request_body=full_body,
+                last_response_id=output.response_id,
+                last_response_items=list(response_items),
+            )
+    except BaseException:
+        if entry is not None:
+            entry.continuation = None
+        keep_connection = False
+        raise
+    finally:
+        await release(keep=keep_connection)
+
+
+async def _start_on_first_event(events, on_start):
+    """Emits `start` exactly when the first backend event arrives."""
+    started = False
+    async for event in events:
+        if not started:
+            started = True
+            on_start()
+        yield event
 
 
 def _parse_error_response(status: int, status_text: str, raw: str) -> tuple[str, Optional[str]]:
@@ -563,6 +738,102 @@ def stream(
                 model.headers, options.headers if options else None, account_id, api_key, codex_session_id
             )
             body_json = json.dumps(body, separators=(",", ":"))
+            signal = options.signal if options else None
+            timeout_ms = options.timeout_ms if options and options.timeout_ms else None
+            websocket_connect_timeout_ms = (
+                options.websocket_connect_timeout_ms if options and options.websocket_connect_timeout_ms else None
+            )
+            transport = (options.transport if options else None) or "auto"
+            start_emitted = [False]
+
+            def emit_start() -> None:
+                if start_emitted[0]:
+                    return
+                start_emitted[0] = True
+                event_stream.push(StartEvent(partial=output))
+
+            # --- Cached WebSocket transport (pi-ai's default for "auto") -----
+            websocket_disabled_for_session = transport != "sse" and is_websocket_sse_fallback_active(cache_session_id)
+            if websocket_disabled_for_session:
+                record_websocket_sse_fallback(cache_session_id)
+
+            if transport != "sse" and not websocket_disabled_for_session:
+                websocket_request_id = codex_session_id or str(uuid.uuid4())
+                websocket_headers = _build_websocket_headers(
+                    model.headers, options.headers if options else None, account_id, api_key, websocket_request_id
+                )
+                retried_connection_limit = False
+                retried_missing_continuation = False
+                while True:
+                    websocket_state = {"started": False}
+
+                    def mark_websocket_started() -> None:
+                        websocket_state["started"] = True
+                        emit_start()
+
+                    try:
+                        await _process_websocket_stream(
+                            resolve_codex_websocket_url(model.base_url),
+                            body,
+                            websocket_headers,
+                            output,
+                            event_stream,
+                            model,
+                            mark_websocket_started,
+                            timeout_ms,
+                            websocket_connect_timeout_ms,
+                            cache_session_id,
+                            account_id,
+                            grammar_tool_input_properties,
+                            options,
+                        )
+                        if signal is not None and signal.aborted:
+                            raise ValueError("Request was aborted")
+                        _assert_successful_output(output)
+                        event_stream.push(DoneEvent(reason=output.stop_reason, message=output))  # type: ignore[arg-type]
+                        return
+                    except Exception as error:
+                        aborted = bool(signal is not None and signal.aborted)
+                        connection_limit_before_start = (
+                            not websocket_state["started"] and is_websocket_connection_limit_reached_error(error)
+                        )
+                        if (
+                            not aborted
+                            and is_previous_response_not_found_error(error)
+                            and not retried_missing_continuation
+                        ):
+                            # The backend forgot the cached response: retry with the full context.
+                            retried_missing_continuation = True
+                            continue
+                        if not aborted and connection_limit_before_start and not retried_connection_limit:
+                            retried_connection_limit = True
+                            continue
+                        if aborted or (is_codex_non_transport_error(error) and not connection_limit_before_start):
+                            raise
+                        append_assistant_message_diagnostic(
+                            output,
+                            create_assistant_message_diagnostic(
+                                "provider_transport_failure",
+                                error,
+                                {
+                                    "configuredTransport": transport,
+                                    **({} if websocket_state["started"] else {"fallbackTransport": "sse"}),
+                                    "eventsEmitted": websocket_state["started"],
+                                    "phase": (
+                                        "after_message_stream_start"
+                                        if websocket_state["started"]
+                                        else "before_message_stream_start"
+                                    ),
+                                    "requestBytes": len(body_json.encode("utf-8")),
+                                },
+                            ),
+                        )
+                        record_websocket_failure(cache_session_id, error)
+                        if websocket_state["started"]:
+                            raise
+                        record_websocket_sse_fallback(cache_session_id)
+                        break
+
             compressed = _compress_request_body_zstd(body_json.encode("utf-8"))
             if compressed is not None:
                 headers["content-encoding"] = "zstd"
@@ -573,7 +844,6 @@ def stream(
             last_error: Optional[BaseException] = None
             max_retries = options.max_retries if options and options.max_retries is not None else DEFAULT_MAX_RETRIES
 
-            timeout_ms = options.timeout_ms if options and options.timeout_ms else None
             timeout = httpx.Timeout((timeout_ms or 600_000) / 1000, connect=60.0)
             client = httpx.AsyncClient(timeout=timeout)
             try:
@@ -637,12 +907,12 @@ def stream(
                     raise last_error or ValueError("Failed after retries")
 
                 try:
-                    event_stream.push(StartEvent(partial=output))
+                    emit_start()
                     await _process_stream(response, output, event_stream, model, grammar_tool_input_properties, options)
                 finally:
                     await response.aclose()
 
-                if options and options.signal and options.signal.aborted:
+                if signal is not None and signal.aborted:
                     raise ValueError("Request was aborted")
 
                 _assert_successful_output(output)

@@ -111,6 +111,56 @@ def builtin_models(options=None):
     return models
 
 
+# ---------------------------------------------------------------------------
+# Static catalog reads (pi-ai's providers/all.ts helpers)
+# ---------------------------------------------------------------------------
+
+
+def get_builtin_providers():
+    """Every built-in provider instance."""
+    return builtin_providers()
+
+
+def get_builtin_models(provider: str):
+    """Chat models of one built-in provider, from the vendored catalogs."""
+    from ..model_catalog import flatten_chat_model_catalog
+
+    return list(flatten_chat_model_catalog(provider).values())
+
+
+def get_builtin_image_models(provider: str):
+    """Image models of one built-in provider."""
+    from ..model_catalog import flatten_image_model_catalog
+
+    return list(flatten_image_model_catalog(provider).values())
+
+
+def get_builtin_classifier_models(provider: str):
+    """Classifier models of one built-in provider."""
+    from ..model_catalog import flatten_classifier_model_catalog
+
+    return list(flatten_classifier_model_catalog(provider).values())
+
+
+def get_all_builtin_models(provider: str):
+    """Every catalog model of one built-in provider, whatever its type."""
+    from ..model_catalog import flatten_all_model_catalog
+
+    return list(flatten_all_model_catalog(provider).values())
+
+
+def get_builtin_model(provider: str, model_id: str):
+    """One chat model from the built-in catalogs, or None."""
+    return next((model for model in get_builtin_models(provider) if model.id == model_id), None)
+
+
+def get_builtin_model_data_generated_at():
+    """When the vendored catalogs were generated (epoch ms), if known."""
+    from ..model_catalog import catalog_generated_at
+
+    return catalog_generated_at()
+
+
 __all__ = [
     "amazon_bedrock_provider",
     "ant_ling_provider",
@@ -157,6 +207,13 @@ __all__ = [
     "openai_compatible_provider",
     "builtin_providers",
     "builtin_models",
+    "get_all_builtin_models",
+    "get_builtin_classifier_models",
+    "get_builtin_image_models",
+    "get_builtin_model",
+    "get_builtin_model_data_generated_at",
+    "get_builtin_models",
+    "get_builtin_providers",
     "faux_assistant_message",
     "faux_model",
     "faux_text",

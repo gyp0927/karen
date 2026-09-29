@@ -131,10 +131,25 @@ def _chunks(text: str) -> List[str]:
 
 
 class FauxProviderRegistration:
-    def __init__(self, provider: Provider, models: List[Model], state: FauxProviderState, set_responses, append_responses, pending_count) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        models: List[Model],
+        state: FauxProviderState,
+        set_responses,
+        append_responses,
+        pending_count,
+        api: str = DEFAULT_API,
+        unregister: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.provider = provider
+        self.api = api
         self.models = models
         self.state = state
+        self.set_responses = set_responses
+        self.append_responses = append_responses
+        self.get_pending_response_count = pending_count
+        self.unregister = unregister or (lambda: None)
 
     def get_model(self, model_id: Optional[str] = None) -> Optional[Model]:
         if model_id is None:
@@ -258,8 +273,7 @@ def register_faux_provider(
         )
     )
 
-    registration = FauxProviderRegistration(provider, model_list, state, set_responses, append_responses, pending_count)
-    registration.set_responses = set_responses  # type: ignore[attr-defined]
-    registration.append_responses = append_responses  # type: ignore[attr-defined]
-    registration.get_pending_response_count = pending_count  # type: ignore[attr-defined]
+    registration = FauxProviderRegistration(
+        provider, model_list, state, set_responses, append_responses, pending_count, api=api
+    )
     return registration

@@ -1,17 +1,21 @@
-"""Provider-scoped environment lookup, mirroring utils/provider-env.ts."""
+"""Provider-scoped environment lookup, mirroring pi-ai's utils/provider-env.ts.
+
+Scoped `ProviderEnv` overrides win over the process environment.
+"""
 
 from __future__ import annotations
 
 import os
-from typing import Optional
-
-from ..types import ProviderEnv
+from typing import Dict, Optional
 
 
-def get_provider_env_value(name: str, env: Optional[ProviderEnv] = None) -> Optional[str]:
-    """Provider-scoped env values take precedence over process env."""
-    if env is not None:
-        value = env.get(name)
-        if value:
-            return value
-    return os.environ.get(name)
+def get_provider_env_value(name: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Resolves `name` from scoped overrides first, then the process environment."""
+    if env:
+        scoped = env.get(name)
+        if scoped:
+            return scoped
+    return os.environ.get(name) or None
+
+
+__all__ = ["get_provider_env_value"]

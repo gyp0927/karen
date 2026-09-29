@@ -26,6 +26,7 @@ from pydantic.alias_generators import to_camel
 from typing_extensions import TypeAliasType
 
 from .abort import AbortSignal
+from .telemetry.types import TelemetryContext
 
 if TYPE_CHECKING:
     from .event_stream import AssistantMessageEventStream
@@ -112,6 +113,7 @@ class ProviderRequestOptions(KarenBase):
     """Authentication, HTTP transport, and lifecycle callbacks shared by provider requests."""
 
     signal: Optional["AbortSignal"] = None
+    telemetry_context: Optional["TelemetryContext"] = None
     api_key: Optional[str] = None
     env: Optional[ProviderEnv] = None
     on_payload: Optional[Callable[[Any, Any], Union[None, dict, Awaitable[Union[None, dict]]]]] = None
