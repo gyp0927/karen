@@ -9,6 +9,7 @@ import respx
 from karen_ai.abort import AbortSignal
 from karen_ai.auth.types import OAuthCredential
 from karen_ai.models import ModelsPublication, RefreshModelsContext
+from karen_ai.model_catalog import flatten_chat_model_catalog
 from karen_ai.models_store import ModelsStoreEntry
 from karen_ai.providers.radius import radius_provider
 from karen_ai.providers.radius_config import (
@@ -80,7 +81,8 @@ def test_models_from_oauth_credential_extra():
 
 def test_baseline_catalog_for_default_gateway():
     provider = radius_provider()
-    assert len(provider.get_models()) == 30  # vendored radius.json
+    # The default gateway serves the vendored radius.json catalog.
+    assert len(provider.get_models()) == len(flatten_chat_model_catalog("radius"))
     # Custom gateways start empty (their catalog arrives via refresh).
     custom = radius_provider(gateway="radius.test")
     assert custom.get_models() == []

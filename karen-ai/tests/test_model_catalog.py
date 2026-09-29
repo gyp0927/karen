@@ -48,14 +48,18 @@ def test_anthropic_compat_richness():
 
 
 def test_openrouter_image_and_classifier_groups():
+    # OpenRouter's image and decision listings feed these two groups; their
+    # membership churns with the upstream catalog, so assert shape, not count.
     images = flatten_image_model_catalog("openrouter")
-    assert len(images) == 55
+    assert images
+    assert all(model.api == "openrouter-images" for model in images.values())
     sample = images["black-forest-labs/flux.2-flex"]
     assert sample.type == "image"
-    assert sample.api == "openrouter-images"
+    assert sample.output == ["image"]
 
     classifiers = flatten_classifier_model_catalog("openrouter")
-    assert classifiers["typesafe/jev"].api == "typesafe-system-one"
+    assert classifiers
+    assert all(model.api == "typesafe-system-one" for model in classifiers.values())
 
 
 def test_typesafe_and_cloudflare_classifier_catalogs():
@@ -75,4 +79,7 @@ def test_flatten_all_merges_types():
 
 
 def test_catalog_generated_at_from_manifest():
-    assert catalog_generated_at() == 1790105504346
+    generated_at = catalog_generated_at()
+    # The manifest records the generation time in epoch milliseconds.
+    assert isinstance(generated_at, int)
+    assert 1_577_836_800_000 < generated_at < 4_102_444_800_000  # 2020 .. 2100

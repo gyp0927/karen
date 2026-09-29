@@ -22,9 +22,12 @@ Context ──normalize_context()──▶ TranscriptContext ──▶ Provider 
 | `karen_ai.auth` | `auth/` | 凭证（api_key/OAuth）、`CredentialStore`（内存 + JSON 文件）、鉴权解析（OAuth 到期自动加锁刷新） |
 | `karen_ai.models` | `models.ts` | `Provider`、`Models` 注册表、`create_provider`、`calculate_cost`、thinking 级别映射 |
 | `karen_ai.models_store` | `models-store.ts` | 模型目录持久化（内存 + JSON 文件） |
-| `karen_ai.api` | `api/` | API 适配器：`anthropic_messages`、`openai_completions`、`openai_responses`、`openai_codex_responses`（SSE 传输）、`azure_openai_responses`、`bedrock_converse_stream`（手写 SigV4 + eventstream）、`google_generative_ai`、`google_vertex`、`mistral_conversations`、`pi_messages`（Radius 网关协议） |
+| `karen_ai.api` | `api/` | API 适配器：`anthropic_messages`、`openai_completions`、`openai_responses`、`openai_codex_responses`（SSE + WebSocket 双传输）、`azure_openai_responses`、`bedrock_converse_stream`（手写 SigV4 + eventstream）、`google_generative_ai`、`google_vertex`、`mistral_conversations`、`pi_messages`（Radius 网关协议） |
 | `karen_ai.model_catalog` | `model-catalog.ts` + `providers/data/` |  vendored 静态模型目录（42 个 provider、约 1500 个模型，来自 pi-ai 生成产物），按类型 flatten |
 | `karen_ai.providers` | `providers/` | 42 个内置 provider（与 pi-ai `builtinProviders()` 对齐）、通用 OpenAI 兼容工厂、faux 测试 provider |
+| `karen_ai.telemetry` | `@earendil-works/pi-telemetry` | `TelemetryContext` / `TelemetrySpan` 协议、`NOOP_TELEMETRY_CONTEXT`、`InMemoryTelemetryContext`、`define_telemetry_schema` / `create_typed_span_starter` |
+| `karen_ai.compat` + `karen_ai.api.legacy_aliases` | `compat.ts` / `legacy-api-aliases.ts` | 迁移期的全局 API：api 注册表、带环境变量注入的 `stream`/`complete`、静态目录读取、旧的逐 API 别名 |
+| `karen_ai.session_resources` | `session-resources.ts` | 会话级资源清理钩子（`cleanup_session_resources`），Codex WebSocket 连接池挂在这里 |
 
 ## 快速开始
 
@@ -76,11 +79,15 @@ for p in (anthropic_provider(), openai_provider(), deepseek_provider()):
 available = await models.get_available()   # 鉴权已配置的全部模型
 ```
 
-内置 provider 的模型目录 vendored 自 pi-ai 的生成产物（`providers/data/*.json`），可用脚本与上游版本同步：
+内置 provider 的模型目录由 `scripts/generate_models.py` 生成到 `providers/data/*.json`
+（pi-ai `scripts/generate-models.ts` 的 Python 移植：models.dev + OpenRouter + Vercel AI Gateway +
+Nvidia NIM + Radius，再叠加 pi-ai 的各 provider 修正表）：
 
 ```powershell
-python scripts/sync_model_catalogs.py            # 取 npm latest
-python scripts/sync_model_catalogs.py --dry-run  # 只看差异
+python scripts/generate_models.py            # 重新生成全部目录（含 .manifest.json）
+python scripts/generate_models.py --strict   # 上游失败 / 白名单不匹配直接报错
+python scripts/generate_models.py --json-only --json-output out/   # 只出 JSON 目录
+python scripts/check_model_data.py           # 校验已提交的目录与清单是否一致
 ```
 
 动态目录 provider（如 Radius 网关）在运行时通过 `models.refresh()` 抓取并持久化。
@@ -103,13 +110,14 @@ vllm = openai_compatible_provider(
 
 ## 与 pi-ai 的范围差异
 
-**已移植（核心层）**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 登录/刷新）、凭证/目录存储、Models 注册表、create_provider、全部 API 适配器（anthropic-messages / openai-completions / openai-responses / openai-codex-responses / azure-openai-responses / bedrock-converse-stream / google-generative-ai / google-vertex / mistral-conversations / pi-messages）、42 个内置 provider（vendored 目录 + OAuth 流程）、通用兼容工厂、图像生成（openrouter-images）、classifier（typesafe / cloudflare-workers-ai system-one）、faux 测试 provider。
+**已移植**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 登录/刷新）、凭证/目录存储、Models 注册表、create_provider、全部 API 适配器（anthropic-messages / openai-completions / openai-responses / openai-codex-responses / azure-openai-responses / bedrock-converse-stream / google-generative-ai / google-vertex / mistral-conversations / pi-messages）、42 个内置 provider（生成目录 + OAuth 流程）、通用兼容工厂、图像生成（openrouter-images）、classifier（typesafe / cloudflare-workers-ai system-one）、Codex WebSocket 传输（会话复用 + `previous_response_id` 续传 + SSE 回退）、`compat.ts` / `legacy-api-aliases.ts` 旧全局 API、`generate-models.ts` 生成管线、pi-telemetry 运行时、faux 测试 provider。
 
-**暂未移植（后续按需补）**：
-- Codex 的 WebSocket 传输（pi-ai 的会话缓存/续传优化；`transport="auto"/"websocket"` 目前透明走 SSE，与 pi-ai 自身的回退行为一致）
-- `compat.ts` / `legacy-api-aliases.ts` 旧全局 API（karen-ai 没有历史消费者，直接跳过）
-- pi-ai 的 `generate-models.ts` 全量生成管线（改用 `scripts/sync_model_catalogs.py` 从 npm 发布包同步生成产物）
-- 遥测
+**尚未移植**：无已知项。
+
+与 pi-ai 的**有意差异**：
+- `stream` 系列入口必须在运行中的事件循环里调用（`pi-ai` 同步返回流的设计在 Python 里通过后台 task 实现）。
+- `packages/coding-agent`（karen-agent 将基于本层重建，而非逐行移植）。
+- `file://` 与 base64 之外的图片编码细节、`scripts/generate-test-image.ts` 这类开发用脚本。
 
 ## 开发
 

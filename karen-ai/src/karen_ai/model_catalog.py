@@ -5,9 +5,11 @@ sources) at build time; the generated files ship with the package. karen-ai vend
 the same JSONs under `karen_ai/providers/data/` and flattens them into typed
 models on first use.
 
-Catalog JSON shape: `{ "<api>": { "<model-id>": { ...model fields } } }`. Chat
-models carry no `type` (or `"chat"`); image/classifier entries, when present,
-carry `"image"`/`"classifier"`.
+Catalog JSON shape: `{ "<api>": { "<model-key>": { ...model fields } } }`. The
+current generator keys entries as `"<type>:<id>"` and repeats `type` inside each
+model; catalogs vendored from older pi-ai releases key chat models by bare id and
+omit `type` for them. Both shapes flatten to the same model ids, which are read
+from the entry's own `id` field.
 """
 
 from __future__ import annotations
@@ -37,13 +39,29 @@ def catalog_available(provider_id: str) -> bool:
     return (_DATA_DIR / f"{provider_id}.json").is_file()
 
 
+def _model_id(key: str, model: Dict[str, Any]) -> str:
+    """The catalog entry's model id, whatever shape the key uses.
+
+    Generated catalogs key entries as `"<type>:<id>"`; older ones keyed chat
+    models by bare id. Either way the entry's own `id` field is authoritative,
+    with the key as a fallback for hand-edited data.
+    """
+    raw_id = model.get("id")
+    if isinstance(raw_id, str) and raw_id:
+        return raw_id
+    entry_type = model.get("type")
+    if isinstance(entry_type, str) and key.startswith(f"{entry_type}:"):
+        return key[len(entry_type) + 1 :]
+    return key
+
+
 def _flatten(groups: ModelGroups, model_type: str) -> Dict[str, Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
     for models in groups.values():
-        for model_id, model in models.items():
+        for key, model in models.items():
             entry_type = model.get("type", "chat")
             if entry_type == model_type:
-                merged[model_id] = model
+                merged[_model_id(key, model)] = model
     return merged
 
 
