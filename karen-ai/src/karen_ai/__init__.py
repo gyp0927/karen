@@ -37,6 +37,7 @@ from .model_catalog import (
     list_catalog_provider_ids,
     load_catalog_groups,
 )
+from .utils.validation import validate_tool_arguments, validate_tool_call
 from .transcript import (
     collapse_system_messages,
     create_initial_system_message,
@@ -51,6 +52,7 @@ from .transcript import (
     normalize_context,
     resolve_transcript,
     resolve_transcript_tools,
+    to_tool_declaration,
     without_initial_system_message,
 )
 from .types import *  # noqa: F403 — the type system is the public surface

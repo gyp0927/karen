@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.6",
     "websockets>=13.0",
     "zstandard>=0.22",
+    "jsonschema>=4.20",
 ]
 
 [project.optional-dependencies]
