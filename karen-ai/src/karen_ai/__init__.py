@@ -27,6 +27,16 @@ from .models import (
     models_are_equal,
 )
 from .models_store import InMemoryModelsStore, JsonFileModelsStore, ModelsStoreEntry
+from .model_catalog import (
+    catalog_available,
+    catalog_generated_at,
+    flatten_all_model_catalog,
+    flatten_chat_model_catalog,
+    flatten_classifier_model_catalog,
+    flatten_image_model_catalog,
+    list_catalog_provider_ids,
+    load_catalog_groups,
+)
 from .transcript import (
     collapse_system_messages,
     create_initial_system_message,

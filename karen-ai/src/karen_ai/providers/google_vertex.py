@@ -13,49 +13,15 @@ from typing import Optional
 from ..api import google_vertex_api
 from ..auth.types import ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthResult, ModelAuth, ProviderAuth
 from ..errors import AbortError
+from ..model_catalog import flatten_chat_model_catalog
 from ..models import CreateProviderOptions, create_provider
-from ..types import Model, ModelCost
+from ..types import Model
 
 GOOGLE_VERTEX_API_KEY_ENV = "VERTEX_API_KEY"
 GOOGLE_VERTEX_BASE_URL = "https://{location}-aiplatform.googleapis.com"
 # Marker stored in place of an API key when the user chooses ADC auth; the
 # adapter falls back to Application Default Credentials when it sees it.
 GCP_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials"
-
-
-def _model(
-    id: str,
-    name: str,
-    *,
-    input_cost: float,
-    output_cost: float,
-    cache_read: float = 0.0,
-    cache_write: float = 0.0,
-    context_window: int = 1_000_000,
-    max_tokens: int = 65_536,
-    reasoning: bool = True,
-) -> Model:
-    return Model(
-        id=id,
-        name=name,
-        api="google-vertex",
-        provider="google-vertex",
-        base_url=GOOGLE_VERTEX_BASE_URL,
-        input=["text", "image"],
-        cost=ModelCost(input=input_cost, output=output_cost, cache_read=cache_read, cache_write=cache_write),
-        reasoning=reasoning,
-        context_window=context_window,
-        max_tokens=max_tokens,
-    )
-
-
-GOOGLE_VERTEX_MODELS = [
-    _model("gemini-3-pro-preview", "Gemini 3 Pro Preview (Vertex)", input_cost=2.0, output_cost=12.0, cache_read=0.2),
-    _model("gemini-3-flash-preview", "Gemini 3 Flash Preview (Vertex)", input_cost=0.5, output_cost=3.0, cache_read=0.05),
-    _model("gemini-2.5-pro", "Gemini 2.5 Pro (Vertex)", input_cost=1.25, output_cost=10.0, cache_read=0.125),
-    _model("gemini-2.5-flash", "Gemini 2.5 Flash (Vertex)", input_cost=0.3, output_cost=2.5, cache_read=0.03),
-]
-
 
 def _vertex_api_key_auth() -> ApiKeyAuth:
     async def login(interaction):
@@ -83,7 +49,6 @@ def _vertex_api_key_auth() -> ApiKeyAuth:
 
     return ApiKeyAuth(name="Google Cloud credentials", login=login, resolve=resolve)
 
-
 def google_vertex_provider():
     return create_provider(
         CreateProviderOptions(
@@ -91,7 +56,7 @@ def google_vertex_provider():
             name="Google Vertex AI",
             base_url=GOOGLE_VERTEX_BASE_URL,
             auth=ProviderAuth(api_key=_vertex_api_key_auth()),
-            models=list(GOOGLE_VERTEX_MODELS),
+            models=list(flatten_chat_model_catalog("google-vertex").values()),
             api=google_vertex_api(),
         )
     )

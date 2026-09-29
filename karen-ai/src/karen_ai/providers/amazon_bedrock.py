@@ -25,93 +25,11 @@ from ..auth.types import (
     ProviderAuth,
 )
 from ..errors import AbortError
+from ..model_catalog import flatten_chat_model_catalog
 from ..models import CreateProviderOptions, create_provider
-from ..types import Model, ModelCost
+from ..types import Model
 
 BEDROCK_DEFAULT_BASE_URL = "https://bedrock-runtime.us-east-1.amazonaws.com"
-
-
-def _model(
-    id: str,
-    name: str,
-    *,
-    input_cost: float,
-    output_cost: float,
-    cache_read: float = 0.0,
-    cache_write: float = 0.0,
-    context_window: int = 200_000,
-    max_tokens: int = 64_000,
-    reasoning: bool = False,
-) -> Model:
-    return Model(
-        id=id,
-        name=name,
-        api="bedrock-converse-stream",
-        provider="amazon-bedrock",
-        base_url=BEDROCK_DEFAULT_BASE_URL,
-        input=["text", "image"],
-        cost=ModelCost(input=input_cost, output=output_cost, cache_read=cache_read, cache_write=cache_write),
-        reasoning=reasoning,
-        context_window=context_window,
-        max_tokens=max_tokens,
-    )
-
-
-AMAZON_BEDROCK_MODELS = [
-    _model(
-        "anthropic.claude-sonnet-4-5",
-        "Claude Sonnet 4.5 (Bedrock)",
-        input_cost=3.0,
-        output_cost=15.0,
-        cache_read=0.3,
-        cache_write=3.75,
-        reasoning=True,
-    ),
-    _model(
-        "anthropic.claude-opus-4-5",
-        "Claude Opus 4.5 (Bedrock)",
-        input_cost=15.0,
-        output_cost=75.0,
-        cache_read=1.5,
-        cache_write=18.75,
-        reasoning=True,
-    ),
-    _model(
-        "anthropic.claude-haiku-4-5",
-        "Claude Haiku 4.5 (Bedrock)",
-        input_cost=1.0,
-        output_cost=5.0,
-        cache_read=0.1,
-        cache_write=1.25,
-        reasoning=True,
-    ),
-    _model(
-        "anthropic.claude-3-7-sonnet",
-        "Claude 3.7 Sonnet (Bedrock)",
-        input_cost=3.0,
-        output_cost=15.0,
-        cache_read=0.3,
-        cache_write=3.75,
-        reasoning=True,
-    ),
-    _model(
-        "anthropic.claude-3-5-haiku",
-        "Claude 3.5 Haiku (Bedrock)",
-        input_cost=0.8,
-        output_cost=4.0,
-        cache_read=0.08,
-        cache_write=1.0,
-    ),
-    _model(
-        "amazon.nova-pro-v1:0",
-        "Amazon Nova Pro",
-        input_cost=0.8,
-        output_cost=3.2,
-        context_window=300_000,
-        max_tokens=10_000,
-    ),
-]
-
 
 def _bedrock_api_key_auth() -> ApiKeyAuth:
     async def login(interaction):
@@ -184,7 +102,6 @@ def _bedrock_api_key_auth() -> ApiKeyAuth:
 
     return ApiKeyAuth(name="AWS credentials or bearer token", login=login, resolve=resolve)
 
-
 def amazon_bedrock_provider():
     return create_provider(
         CreateProviderOptions(
@@ -192,7 +109,7 @@ def amazon_bedrock_provider():
             name="Amazon Bedrock",
             base_url=BEDROCK_DEFAULT_BASE_URL,
             auth=ProviderAuth(api_key=_bedrock_api_key_auth()),
-            models=list(AMAZON_BEDROCK_MODELS),
+            models=list(flatten_chat_model_catalog("amazon-bedrock").values()),
             api=bedrock_converse_stream_api(),
         )
     )

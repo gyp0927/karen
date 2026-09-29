@@ -28,13 +28,13 @@ from karen_ai import (
 )
 from karen_ai.api import bedrock_converse_stream as bedrock
 from karen_ai.api.bedrock_converse_stream import BedrockOptions
-from karen_ai.providers.amazon_bedrock import AMAZON_BEDROCK_MODELS
+from karen_ai.model_catalog import flatten_chat_model_catalog
 from karen_ai.utils.aws_eventstream import EventStreamDecoder, EventStreamError, decode_message
 from karen_ai.utils.aws_sigv4 import AwsCredentials, resolve_aws_credentials, sign_request
 
-MODEL = next(m for m in AMAZON_BEDROCK_MODELS if m.id == "anthropic.claude-sonnet-4-5")
+MODEL = flatten_chat_model_catalog("amazon-bedrock")["anthropic.claude-sonnet-4-5-20250929-v1:0"]
 ENDPOINT = "https://bedrock-runtime.us-east-1.amazonaws.com"
-CONVERSE_URL = f"{ENDPOINT}/model/anthropic.claude-sonnet-4-5/converse-stream"
+CONVERSE_URL = f"{ENDPOINT}/model/{MODEL.id}/converse-stream"
 
 ENV_CREDS = {"AWS_ACCESS_KEY_ID": "AKIDTEST", "AWS_SECRET_ACCESS_KEY": "secret-test"}
 
@@ -237,7 +237,7 @@ def test_convert_messages_merges_consecutive_tool_results():
             content=[ToolCall(id="call-1", name="a", arguments={}), ToolCall(id="call-2", name="b", arguments={})],
             api="bedrock-converse-stream",
             provider="amazon-bedrock",
-            model="anthropic.claude-sonnet-4-5",
+            model=MODEL.id,
             timestamp=2,
         ),
         ToolResultMessage(tool_call_id="call-1", tool_name="a", content=[TextContent(text="one")], timestamp=3),
@@ -264,7 +264,7 @@ def test_convert_messages_thinking_replay():
             content=[thinking],
             api="bedrock-converse-stream",
             provider="amazon-bedrock",
-            model="anthropic.claude-sonnet-4-5",
+            model=MODEL.id,
             timestamp=2,
         ),
     )
@@ -280,7 +280,7 @@ def test_convert_messages_thinking_replay():
             content=[thinking2],
             api="bedrock-converse-stream",
             provider="amazon-bedrock",
-            model="anthropic.claude-sonnet-4-5",
+            model=MODEL.id,
             timestamp=2,
         ),
     )
@@ -296,7 +296,7 @@ def test_convert_messages_thinking_replay():
             content=[redacted],
             api="bedrock-converse-stream",
             provider="amazon-bedrock",
-            model="anthropic.claude-sonnet-4-5",
+            model=MODEL.id,
             timestamp=2,
         ),
     )

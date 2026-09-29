@@ -7,43 +7,12 @@ from typing import Optional
 from ..api import openai_completions_api
 from ..auth.types import ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthResult, ModelAuth, ProviderAuth
 from ..errors import AbortError
+from ..model_catalog import flatten_chat_model_catalog
 from ..models import CreateProviderOptions, create_provider
-from ..types import Model, ModelCost
+from ..types import Model
 
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-
-
-def _model(
-    id: str,
-    name: str,
-    *,
-    input_cost: float,
-    output_cost: float,
-    cache_read: float,
-    reasoning: bool,
-    context_window: int = 128_000,
-    max_tokens: int = 64_000,
-) -> Model:
-    return Model(
-        id=id,
-        name=name,
-        api="openai-completions",
-        provider="deepseek",
-        base_url=DEEPSEEK_BASE_URL,
-        input=["text"],
-        cost=ModelCost(input=input_cost, output=output_cost, cache_read=cache_read, cache_write=input_cost),
-        reasoning=reasoning,
-        context_window=context_window,
-        max_tokens=max_tokens,
-    )
-
-
-DEEPSEEK_MODELS = [
-    _model("deepseek-chat", "DeepSeek V3.2 Chat", input_cost=0.28, output_cost=0.42, cache_read=0.028, reasoning=False),
-    _model("deepseek-reasoner", "DeepSeek V3.2 Reasoner", input_cost=0.28, output_cost=0.42, cache_read=0.028, reasoning=True),
-]
-
 
 def _deepseek_api_key_auth() -> ApiKeyAuth:
     async def login(interaction):
@@ -68,7 +37,6 @@ def _deepseek_api_key_auth() -> ApiKeyAuth:
 
     return ApiKeyAuth(name="DeepSeek API key", login=login, resolve=resolve)
 
-
 def deepseek_provider():
     return create_provider(
         CreateProviderOptions(
@@ -76,7 +44,7 @@ def deepseek_provider():
             name="DeepSeek",
             base_url=DEEPSEEK_BASE_URL,
             auth=ProviderAuth(api_key=_deepseek_api_key_auth()),
-            models=list(DEEPSEEK_MODELS),
+            models=list(flatten_chat_model_catalog("deepseek").values()),
             api=openai_completions_api(),
         )
     )

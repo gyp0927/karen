@@ -22,8 +22,9 @@ Context ──normalize_context()──▶ TranscriptContext ──▶ Provider 
 | `karen_ai.auth` | `auth/` | 凭证（api_key/OAuth）、`CredentialStore`（内存 + JSON 文件）、鉴权解析（OAuth 到期自动加锁刷新） |
 | `karen_ai.models` | `models.ts` | `Provider`、`Models` 注册表、`create_provider`、`calculate_cost`、thinking 级别映射 |
 | `karen_ai.models_store` | `models-store.ts` | 模型目录持久化（内存 + JSON 文件） |
-| `karen_ai.api` | `api/` | API 适配器：`anthropic_messages`、`openai_completions`（含兼容自动探测与各家 thinking 格式） |
-| `karen_ai.providers` | `providers/` | 内置 provider：anthropic / openai / deepseek / openrouter / 通用 OpenAI 兼容工厂 / faux 测试 provider |
+| `karen_ai.api` | `api/` | API 适配器：`anthropic_messages`、`openai_completions`、`openai_responses`、`openai_codex_responses`（SSE 传输）、`azure_openai_responses`、`bedrock_converse_stream`（手写 SigV4 + eventstream）、`google_generative_ai`、`google_vertex`、`mistral_conversations`、`pi_messages`（Radius 网关协议） |
+| `karen_ai.model_catalog` | `model-catalog.ts` + `providers/data/` |  vendored 静态模型目录（42 个 provider、约 1500 个模型，来自 pi-ai 生成产物），按类型 flatten |
+| `karen_ai.providers` | `providers/` | 42 个内置 provider（与 pi-ai `builtinProviders()` 对齐）、通用 OpenAI 兼容工厂、faux 测试 provider |
 
 ## 快速开始
 
@@ -58,11 +59,14 @@ asyncio.run(main())
 
 ```python
 from karen_ai.providers import (
-    anthropic_provider,      # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN
+    anthropic_provider,      # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / Claude Pro·Max OAuth
     openai_provider,         # OPENAI_API_KEY
+    openai_codex_provider,   # ChatGPT Plus/Pro OAuth（订阅）
     deepseek_provider,       # DEEPSEEK_API_KEY
-    openrouter_provider,     # OPENROUTER_API_KEY
+    openrouter_provider,     # OPENROUTER_API_KEY / OAuth，含图像生成与分类器
+    github_copilot_provider, # COPILOT_GITHUB_TOKEN / GitHub OAuth（订阅）
     openai_compatible_provider,  # 任意 OpenAI 兼容端点（vLLM / llama.cpp / 代理）
+    builtin_providers,       # 全部 42 个内置 provider
 )
 
 models = create_models()
@@ -71,6 +75,15 @@ for p in (anthropic_provider(), openai_provider(), deepseek_provider()):
 
 available = await models.get_available()   # 鉴权已配置的全部模型
 ```
+
+内置 provider 的模型目录 vendored 自 pi-ai 的生成产物（`providers/data/*.json`），可用脚本与上游版本同步：
+
+```powershell
+python scripts/sync_model_catalogs.py            # 取 npm latest
+python scripts/sync_model_catalogs.py --dry-run  # 只看差异
+```
+
+动态目录 provider（如 Radius 网关）在运行时通过 `models.refresh()` 抓取并持久化。
 
 自定义 OpenAI 兼容端点：
 
@@ -90,14 +103,13 @@ vllm = openai_compatible_provider(
 
 ## 与 pi-ai 的范围差异
 
-**已移植（核心层）**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 刷新逻辑）、凭证/目录存储、Models 注册表、create_provider、`anthropic-messages` 与 `openai-completions` 适配器（流式、工具调用、thinking、缓存控制、compat 自动探测、跨 provider 消息变换）、四个内置 provider、通用兼容工厂、faux 测试 provider。
+**已移植（核心层）**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 登录/刷新）、凭证/目录存储、Models 注册表、create_provider、全部 API 适配器（anthropic-messages / openai-completions / openai-responses / openai-codex-responses / azure-openai-responses / bedrock-converse-stream / google-generative-ai / google-vertex / mistral-conversations / pi-messages）、42 个内置 provider（vendored 目录 + OAuth 流程）、通用兼容工厂、图像生成（openrouter-images）、classifier（typesafe / cloudflare-workers-ai system-one）、faux 测试 provider。
 
 **暂未移植（后续按需补）**：
-- `openai-responses` / `azure` / `codex` / `bedrock` / `google` / `mistral` 等其余 API 适配器
-- 各 provider 的 OAuth 登录流程（类型与刷新机制已就绪）
-- 动态模型目录抓取脚本（pi-ai 的 `generate-models.ts` 产物）；内置 provider 使用手写精简目录
-- deferred response、图像生成、classifier（类型已定义，调用会返回明确的 error 结果）
-- `compat.ts` 旧全局 API、遥测
+- Codex 的 WebSocket 传输（pi-ai 的会话缓存/续传优化；`transport="auto"/"websocket"` 目前透明走 SSE，与 pi-ai 自身的回退行为一致）
+- `compat.ts` / `legacy-api-aliases.ts` 旧全局 API（karen-ai 没有历史消费者，直接跳过）
+- pi-ai 的 `generate-models.ts` 全量生成管线（改用 `scripts/sync_model_catalogs.py` 从 npm 发布包同步生成产物）
+- 遥测
 
 ## 开发
 
