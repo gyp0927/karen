@@ -45,6 +45,7 @@ from .google_shared import (
     build_google_stream_simple_thinking,
     process_google_stream,
 )
+from .request_options import coerce_options
 from .simple_options import build_base_options
 
 KAREN_USER_AGENT = "karen-ai/0.1.0"
@@ -204,6 +205,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[GoogleVertexOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, GoogleVertexOptions)
     event_stream = AssistantMessageEventStream()
     normalized_context = collapse_system_messages(context)
 

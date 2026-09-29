@@ -60,6 +60,7 @@ from ..utils.retry import ProviderHttpError, retry_provider_request
 from ..utils.sanitize import sanitize_surrogates
 from ..utils.sse import iterate_sse_messages
 from ..utils.text import get_system_message_text, render_system_message_update
+from .request_options import coerce_options
 from .simple_options import (
     adjust_max_tokens_for_thinking,
     build_base_options,
@@ -608,6 +609,7 @@ def stream(
     options: Optional[AnthropicOptions] = None,
 ) -> AssistantMessageEventStream:
     """Stream a normalized transcript through the Anthropic Messages API."""
+    options = coerce_options(options, AnthropicOptions)
     event_stream = AssistantMessageEventStream()
     compat = _get_anthropic_compat(model)
     normalized_context = resolve_transcript(context, compat.supports_mid_convo_system_messages)

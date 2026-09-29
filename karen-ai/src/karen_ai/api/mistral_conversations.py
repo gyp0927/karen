@@ -41,6 +41,7 @@ from ..utils.sanitize import sanitize_surrogates
 from ..utils.sse import iterate_sse_messages
 from ..utils.text import get_system_message_text, render_system_message_update
 from .constrained_sampling import get_json_schema_tool_parameters, resolve_json_schema_strict_sampling
+from .request_options import coerce_options
 from .simple_options import build_base_options
 from .transform_messages import transform_messages
 
@@ -649,6 +650,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[MistralOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, MistralOptions)
     event_stream = AssistantMessageEventStream()
     compat_supports_mid_convo = getattr(model.compat, "supports_mid_convo_system_messages", None)
     normalized_context = resolve_transcript(context, compat_supports_mid_convo is True)

@@ -69,6 +69,7 @@ from ..utils.retry import ProviderHttpError, retry_provider_request
 from ..utils.sanitize import sanitize_surrogates
 from ..utils.text import get_system_message_text
 from .constrained_sampling import get_json_schema_tool_parameters, resolve_json_schema_strict_sampling
+from .request_options import coerce_options
 from .simple_options import adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context, clamp_reasoning
 from .transform_messages import transform_messages
 
@@ -774,7 +775,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[BedrockOptions] = None,
 ) -> AssistantMessageEventStream:
-    options = options or BedrockOptions()
+    options = coerce_options(options, BedrockOptions) or BedrockOptions()
     event_stream = AssistantMessageEventStream()
     # Bedrock has no mid-conversation system messages; fold them into the leading prompt.
     normalized_context = collapse_system_messages(context)

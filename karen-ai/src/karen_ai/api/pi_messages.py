@@ -52,6 +52,8 @@ from ..utils.provider_env import get_provider_env_value
 from ..utils.retry import ProviderHttpError, retry_provider_request
 from ..utils.sse import iterate_sse_messages
 
+from .request_options import coerce_options
+
 
 class PiMessagesOptions(StreamOptions):
     reasoning: Optional[ThinkingLevel] = None
@@ -277,6 +279,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[PiMessagesOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, PiMessagesOptions)
     event_stream = AssistantMessageEventStream()
     converter = _EventConverter(model)
 

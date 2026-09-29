@@ -591,6 +591,7 @@ class Models:
         self,
         model: AnyModel,
         options: Optional[ProviderRequestOptions],
+        default_options: Optional[type] = None,
     ) -> tuple[AnyModel, Optional[ProviderRequestOptions]]:
         self._require_provider(model)
         resolution = await self.get_auth(
@@ -615,8 +616,11 @@ class Models:
         env = {**(resolution.env or {}), **(options.env or {})} if (resolution.env or (options and options.env)) else None
         request_model = model.model_copy(update={"base_url": auth.base_url}) if auth.base_url else model
 
+        # A caller that passes no options still gets the option type its API expects:
+        # adapters read plain fields off it (temperature, reasoning, ...) rather than
+        # guarding every access, so a bare ProviderRequestOptions would raise there.
         if options is None:
-            request_options = ProviderRequestOptions(api_key=api_key, headers=headers, env=env)
+            request_options = (default_options or ProviderRequestOptions)(api_key=api_key, headers=headers, env=env)
         else:
             request_options = options.model_copy(update={"api_key": api_key, "headers": headers, "env": env})
         return request_model, request_options
@@ -633,7 +637,7 @@ class Models:
             provider = self._require_chat_provider(model)
             if provider.stream is None:
                 raise ModelsError("stream", f"Provider {model.provider} does not support streaming")
-            request_model, request_options = await self._apply_auth(model, options)
+            request_model, request_options = await self._apply_auth(model, options, StreamOptions)
             return provider.stream(request_model, transcript, request_options)
 
         return lazy_stream(model, setup)
@@ -658,7 +662,7 @@ class Models:
             provider = self._require_chat_provider(model)
             if provider.stream_simple is None:
                 raise ModelsError("stream", f"Provider {model.provider} does not support streaming")
-            request_model, request_options = await self._apply_auth(model, options)
+            request_model, request_options = await self._apply_auth(model, options, SimpleStreamOptions)
             return provider.stream_simple(request_model, transcript, request_options)
 
         return lazy_stream(model, setup)
@@ -681,7 +685,7 @@ class Models:
             provider = self._require_chat_provider(model)
             if not provider.fetch_deferred:
                 raise ModelsError("provider", f"Provider {model.provider} does not support deferred responses")
-            request_model, request_options = await self._apply_auth(model, options)
+            request_model, request_options = await self._apply_auth(model, options, DeferredFetchOptions)
             return provider.fetch_deferred(request_model, handle, request_options)
 
         return lazy_stream(model, setup)
@@ -703,7 +707,7 @@ class Models:
         provider = self._require_chat_provider(model)
         if not provider.cancel_deferred:
             raise ModelsError("provider", f"Provider {model.provider} does not support deferred responses")
-        request_model, request_options = await self._apply_auth(model, options)
+        request_model, request_options = await self._apply_auth(model, options, DeferredCancelOptions)
         await provider.cancel_deferred(request_model, handle, request_options)
 
     async def generate_images(

@@ -92,7 +92,8 @@ class JsonFileCredentialStore:
 
     def _load(self) -> Dict[str, Credential]:
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            # Hand-authored files: Windows editors (and Set-Content -Encoding utf8) prepend a BOM.
+            raw = json.loads(self._path.read_text(encoding="utf-8-sig"))
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
         entries: Dict[str, Credential] = {}

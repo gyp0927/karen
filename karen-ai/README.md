@@ -58,6 +58,9 @@ asyncio.run(main())
 
 注意：所有 stream 入口都必须在运行中的事件循环里调用（asyncio 生态约束，`pi-ai` 中同步返回流的设计在 Python 里通过后台 task 实现）。
 
+对真实 API 的最小验证脚本见 `examples/deepseek_smoke.py`（读 `DEEPSEEK_API_KEY`，
+`python examples/deepseek_smoke.py [--model deepseek-flash] ["问题"]`）。
+
 ## Provider
 
 ```python

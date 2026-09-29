@@ -45,6 +45,7 @@ from .openai_responses_shared import (
     convert_responses_tools,
     process_responses_stream,
 )
+from .request_options import coerce_options
 from .simple_options import build_base_options
 
 KAREN_USER_AGENT = "karen-ai/0.1.0"
@@ -279,6 +280,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[AzureOpenAIResponsesOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, AzureOpenAIResponsesOptions)
     event_stream = AssistantMessageEventStream()
     normalized_context = resolve_transcript(
         context, _compat_flag(model, "supports_mid_convo_system_messages", False)

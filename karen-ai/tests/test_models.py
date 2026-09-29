@@ -1,6 +1,7 @@
 """Tests for the Models registry: auth resolution, cost, thinking levels, dispatch."""
 
 import asyncio
+import json
 
 import pytest
 
@@ -9,16 +10,27 @@ from karen_ai import (
     ApiKeyCredential,
     AuthResult,
     Context,
+    CreateProviderOptions,
+    DeferredCancelOptions,
+    DeferredFetchOptions,
+    DeferredHandle,
+    DoneEvent,
     ModelAuth,
     ModelsError,
     ProviderAuth,
+    ProviderStreams,
+    SimpleStreamOptions,
+    StartEvent,
+    StreamOptions,
     Usage,
     UserMessage,
     calculate_cost,
     clamp_thinking_level,
     create_models,
+    create_provider,
     get_supported_thinking_levels,
 )
+from karen_ai.event_stream import AssistantMessageEventStream
 from karen_ai.providers import faux_assistant_message, faux_model, register_faux_provider
 
 
@@ -183,3 +195,103 @@ def test_stored_credential_wins_over_ambient():
 
 async def _store_key(current):
     return ApiKeyCredential(key="stored-key")
+
+
+def _recording_stream(seen):
+    def do_stream(model, context, options=None):
+        seen.append(options)
+        event_stream = AssistantMessageEventStream()
+
+        async def run():
+            message = faux_assistant_message("ok", api=model.api, provider=model.provider, model=model.id)
+            event_stream.push(StartEvent(partial=message))
+            event_stream.push(DoneEvent(reason="stop", message=message))
+            event_stream.end()
+
+        asyncio.get_running_loop().create_task(run())
+        return event_stream
+
+    return do_stream
+
+
+def _recording_cancel(seen):
+    async def do_cancel(model, handle, options=None):
+        seen.append(options)
+
+    return do_cancel
+
+
+def _option_recording_provider(streams):
+    async def resolve(input):
+        return AuthResult(auth=ModelAuth(api_key="test-key"), source="test")
+
+    return create_provider(
+        CreateProviderOptions(
+            id="option-types",
+            auth=ProviderAuth(api_key=ApiKeyAuth(name="option-types", resolve=resolve)),
+            models=[faux_model(id="faux-1", provider="option-types")],
+            api=streams,
+        )
+    )
+
+
+def test_omitted_options_still_reach_the_adapter_fully_typed():
+    """Each entry point hands its adapter the option type that adapter reads fields off.
+
+    Adapters read plain fields (`options.temperature`, `options.reasoning`, ...) instead
+    of guarding every access, so a call made without options used to arrive as a bare
+    ProviderRequestOptions and raised AttributeError inside every API implementation.
+    """
+
+    async def main():
+        seen = []
+        streams = ProviderStreams(
+            stream=_recording_stream(seen),
+            stream_simple=_recording_stream(seen),
+            fetch_deferred=_recording_stream(seen),
+            cancel_deferred=_recording_cancel(seen),
+        )
+        models = create_models()
+        models.set_provider(_option_recording_provider(streams))
+        model = models.get_model("option-types", "faux-1")
+        context = Context(messages=[UserMessage(content="hi", timestamp=1)])
+        handle = DeferredHandle(provider="option-types", model_id="faux-1", api=model.api, id="d-1")
+
+        await models.stream(model, context).result()
+        await models.stream_simple(model, context).result()
+        await models.stream_deferred(model, handle).result()
+        await models.cancel_deferred(model, handle)
+
+        assert [type(options) for options in seen] == [
+            StreamOptions,
+            SimpleStreamOptions,
+            DeferredFetchOptions,
+            DeferredCancelOptions,
+        ]
+
+    asyncio.run(main())
+
+
+def test_json_file_credential_store_round_trip_and_bom(tmp_path):
+    async def main():
+        from karen_ai import JsonFileCredentialStore
+
+        path = tmp_path / "credentials.json"
+        store = JsonFileCredentialStore(path)
+
+        async def write_key(current):
+            return ApiKeyCredential(key="sk-from-store")
+
+        assert await store.read("deepseek") is None
+        await store.modify("deepseek", write_key)
+        assert (await store.read("deepseek")).key == "sk-from-store"
+        assert json.loads(path.read_text(encoding="utf-8"))["deepseek"]["key"] == "sk-from-store"
+
+        # A BOM (Notepad, `Set-Content -Encoding utf8`) must not silently empty the store.
+        path.write_text(
+            '﻿{"deepseek": {"type": "api_key", "key": "sk-bom"}}',
+            encoding="utf-8",
+        )
+        assert (await store.read("deepseek")).key == "sk-bom"
+
+    asyncio.run(main())

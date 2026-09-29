@@ -7,8 +7,20 @@ import httpx
 import pytest
 import respx
 
-from karen_ai import Context, Tool, UserMessage, normalize_context
-from karen_ai.api import openai_completions
+from karen_ai import (
+    ApiKeyAuth,
+    AuthResult,
+    Context,
+    CreateProviderOptions,
+    ModelAuth,
+    ProviderAuth,
+    Tool,
+    UserMessage,
+    create_models,
+    create_provider,
+    normalize_context,
+)
+from karen_ai.api import openai_completions, openai_completions_api
 from karen_ai.providers import faux_model
 
 BASE_URL = "https://api.test/v1"
@@ -264,5 +276,48 @@ def test_deepseek_thinking_format_params():
         assert payload["thinking"] == {"type": "enabled"}
         # DeepSeek uses the legacy max_tokens field.
         assert "max_completion_tokens" not in payload
+
+    asyncio.run(main())
+
+
+def test_models_registry_calls_the_adapter_without_explicit_options():
+    """`models.complete_simple(model, context)` — no options — must reach the wire.
+
+    Regression: the registry handed the adapter a bare ProviderRequestOptions, so the
+    very first field read (`options.temperature`) raised AttributeError and every call
+    made without options failed before building a request.
+    """
+
+    async def main():
+        async def resolve(input):
+            return AuthResult(auth=ModelAuth(api_key="sk-test"), source="test")
+
+        model = _model()
+        provider = create_provider(
+            CreateProviderOptions(
+                id="testprov",
+                base_url=BASE_URL,
+                auth=ProviderAuth(api_key=ApiKeyAuth(name="testprov", resolve=resolve)),
+                models=[model],
+                api=openai_completions_api(),
+            )
+        )
+        models = create_models()
+        models.set_provider(provider)
+
+        context = Context(messages=[UserMessage(content="hi", timestamp=1)])
+        with respx.mock:
+            respx.post(f"{BASE_URL}/chat/completions").mock(
+                side_effect=lambda request: _sse(
+                    _chunk(content="Hi"), _chunk(finish="stop", usage={"prompt_tokens": 3, "completion_tokens": 1})
+                )
+            )
+            simple = await models.complete_simple(model, context)
+            plain = await models.complete(model, context)
+
+        assert simple.stop_reason == "stop"
+        assert "".join(block.text for block in simple.content if block.type == "text") == "Hi"
+        assert simple.usage.input == 3
+        assert plain.stop_reason == "stop"
 
     asyncio.run(main())

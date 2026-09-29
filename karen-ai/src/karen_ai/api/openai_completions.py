@@ -53,6 +53,7 @@ from ..utils.retry import ProviderHttpError, retry_provider_request
 from ..utils.sanitize import sanitize_surrogates
 from ..utils.sse import iterate_sse_messages
 from ..utils.text import get_system_message_text, render_system_message_update
+from .request_options import coerce_options
 from .simple_options import (
     build_base_options,
     clamp_thinking_budget_to_answer_room,
@@ -733,6 +734,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[OpenAICompletionsOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, OpenAICompletionsOptions)
     event_stream = AssistantMessageEventStream()
     compat = _ResolvedCompat(model)
     normalized_context = resolve_transcript(context, compat.supports_mid_convo_system_messages)

@@ -39,6 +39,7 @@ from .google_shared import (
     convert_messages,
     process_google_stream,
 )
+from .request_options import coerce_options
 from .simple_options import build_base_options
 
 KAREN_USER_AGENT = "karen-ai/0.1.0"
@@ -99,6 +100,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[GoogleOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, GoogleOptions)
     event_stream = AssistantMessageEventStream()
     normalized_context = collapse_system_messages(context)
 

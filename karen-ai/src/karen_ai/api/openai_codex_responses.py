@@ -95,6 +95,7 @@ from .openai_responses_shared import (
     convert_responses_tools,
     process_responses_stream,
 )
+from .request_options import coerce_options
 from .simple_options import build_base_options
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
@@ -696,6 +697,7 @@ def stream(
     context: TranscriptContext,
     options: Optional[OpenAICodexResponsesOptions] = None,
 ) -> AssistantMessageEventStream:
+    options = coerce_options(options, OpenAICodexResponsesOptions)
     event_stream = AssistantMessageEventStream()
     compat = model.compat
     normalized_context = resolve_transcript(context, getattr(compat, "supports_mid_convo_system_messages", None))
