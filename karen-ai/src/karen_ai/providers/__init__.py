@@ -1,5 +1,6 @@
 """Built-in providers."""
 
+from .amazon_bedrock import amazon_bedrock_provider
 from .anthropic import anthropic_provider
 from .compatible import openai_compatible_provider
 from .deepseek import deepseek_provider
@@ -21,6 +22,7 @@ from .openrouter import openrouter_provider
 def builtin_providers():
     """Every built-in provider (the ported subset of pi-ai's builtinProviders())."""
     return [
+        amazon_bedrock_provider(),
         anthropic_provider(),
         deepseek_provider(),
         google_provider(),

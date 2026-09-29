@@ -3,6 +3,7 @@
 from ..lazy import ProviderStreams
 from . import (
     anthropic_messages,
+    bedrock_converse_stream,
     google_generative_ai,
     google_vertex,
     mistral_conversations,
@@ -35,15 +36,21 @@ def mistral_conversations_api() -> ProviderStreams:
     return ProviderStreams(stream=mistral_conversations.stream, stream_simple=mistral_conversations.stream_simple)
 
 
+def bedrock_converse_stream_api() -> ProviderStreams:
+    return ProviderStreams(stream=bedrock_converse_stream.stream, stream_simple=bedrock_converse_stream.stream_simple)
+
+
 __all__ = [
     "ProviderStreams",
     "anthropic_messages",
+    "bedrock_converse_stream",
     "google_generative_ai",
     "google_vertex",
     "mistral_conversations",
     "openai_completions",
     "openai_responses",
     "anthropic_messages_api",
+    "bedrock_converse_stream_api",
     "google_generative_ai_api",
     "google_vertex_api",
     "mistral_conversations_api",

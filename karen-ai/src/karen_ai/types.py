@@ -279,9 +279,17 @@ class UserMessage(KarenBase):
     timestamp: int
 
 
+class DiagnosticErrorInfo(KarenBase):
+    name: Optional[str] = None
+    message: str
+    stack: Optional[str] = None
+    code: Optional[Union[str, int]] = None
+
+
 class AssistantMessageDiagnostic(KarenBase):
     type: str
     timestamp: int
+    error: Optional[DiagnosticErrorInfo] = None
     details: Optional[Dict[str, Any]] = None
 
 
