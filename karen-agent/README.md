@@ -58,7 +58,11 @@ fork = await repo.fork(session.metadata, BranchForkOptions(branch="main", entry_
   (direct `pathlib` I/O instead), and the chord `Context` parameter.
 
 See [`examples/session_smoke.py`](examples/session_smoke.py) for a runnable
-create → fork → resume round trip (no API key needed).
+create → fork → resume round trip (no API key needed), and
+[`examples/agent_session_smoke.py`](examples/agent_session_smoke.py) for a
+real-API integration check: an agent-loop run persisted to a session, then a
+simulated restart that reopens the session and continues the conversation from
+the persisted transcript (verified against DeepSeek).
 
 ## Usage
 
