@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "karen-ai",
     "pydantic>=2.6",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

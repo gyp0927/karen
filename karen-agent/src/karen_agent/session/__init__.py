@@ -26,6 +26,12 @@ from .commit import (
     prepare_storage_commit,
     validate_committed_writes,
 )
+from .context import (
+    SessionContextBuildOptions,
+    build_context_entries,
+    build_session_context,
+    session_entry_to_context_messages,
+)
 from .fork import ForkDestinationSnapshot, ForkSourceSnapshot, create_fork_snapshot
 from .fork_policy import (
     UNDEFINED,

@@ -16,11 +16,83 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `types.py` | `AgentContext`, `AgentTool`, `AgentToolResult`, `AgentLoopConfig`, hook payloads, the 10 `AgentEvent` types |
 | `stream_fn.py` | default stream-fn registry + `models_stream_fn()` (bridges a karen-ai `Models` registry into the loop) |
 | `agent_loop.py` | `agent_loop` / `agent_loop_continue` and their `run_*` async variants — the full port of pi's `agent-loop.ts` |
+| `messages.py` | harness message shapes (`bashExecution`/`custom`/`branchSummary`/`compactionSummary`) + `convert_to_llm` (pi's `harness/messages.ts`) |
+| `result.py` | `Result`/`Ok`/`Err` + `CompactionError`/`BranchSummaryError` (pi's `harness/types.ts` result helpers) |
+| `hooks.py` | `HookRegistry`: pi's 11 harness hooks with their aggregation semantics + `HarnessStreamOptions`/`StreamOptionsPatch` |
+| `resources.py` | `Skill` / `PromptTemplate` / `Resources` |
+| `prompt_templates.py` | prompt-template loading (frontmatter, diagnostics) + `$1`/`$@`/`$ARGUMENTS`/`${@:N:L}` substitution |
+| `system_prompt.py` | `format_skills_for_system_prompt` (the `<available_skills>` block) |
+| `compaction/` | compaction + branch summarization (pi's `harness/compaction/`): cut points, token estimation, summary generation, file-op tracking |
 | `tools/` | built-in tools (pi's `harness/tools/`): `read`, `write`, `edit`, `bash` + supporting utils (edit-diff, image detection, path utils, file mutation queue, local shell) |
 | `session/` | durable session persistence (pi's `harness/session/`): entries, branches, typed values/lists, usage rows, fork, resume |
+| `session/context.py` | project session entries into model-context messages (pi's `harness/session/context.ts`) |
 | `session/jsonl/` | format-4 JSONL storage + `JsonlSessionRepo` (one file per session under a sessions root) |
 | `session/memory.py` | `MemoryStorage` / `MemorySessionRepo` (in-memory backend, same `Storage`/`Session` contract) |
 | `utils/` | `usage.py` (pi's usage.ts), `truncate.py` (line/byte truncation), `output_capture.py` (bounded shell-output views), `adaptive_publisher.py` (rate-limited publishing) |
+
+## Compaction, hooks, prompt templates (M3)
+
+`karen_agent.compaction` ports pi's context compaction:
+
+```python
+from karen_agent.compaction import CompactionSettings, compact, prepare_compaction
+from karen_agent.result import Err
+
+preparation = prepare_compaction(path_entries, CompactionSettings()).value  # None when not applicable
+await hooks.run("before_compaction", BeforeCompactionEvent(reason="threshold", preparation=preparation))
+result = await compact(preparation, models, model)  # the model writes the summary
+if not isinstance(result, Err):
+    ...  # persist CompactionEntry(summary, retained_tail, tokens_before, details, usage)
+```
+
+- **Cut points & budgets**: `estimate_context_tokens` (provider usage + trailing char/4
+  estimate, images = 4800 chars), `find_cut_point` (keeps ~`keep_recent_tokens`,
+  never cuts at tool results, splits oversized turns at the turn start),
+  `should_compact` (`tokens > context_window - reserve_tokens`, defaults
+  16384/20000).
+- **Summaries**: `compact()` runs pi's structured-checkpoint prompt (or the
+  update variant when a previous summary exists), and a second turn-prefix
+  summary when the cut splits a turn. File operations from read/write/edit tool
+  calls are tracked across compactions and appended as `<read-files>` /
+  `<modified-files>` tags. All summary requests go through a caller-owned
+  one-request boundary (`compact_with_request` / `generate_summary_with_request`)
+  with `cache_retention="none"` + a fresh uuid7 `session_id`.
+- **Branch summaries**: `collect_entries_for_branch_summary` +
+  `generate_branch_summary` summarize an abandoned branch before navigation.
+- **`karen_agent.messages.convert_to_llm`** is the harness-grade boundary:
+  `compactionSummary`/`branchSummary` become `<summary>`-wrapped user messages,
+  `bashExecution` renders as `Ran \`cmd\` + output`, `custom` becomes a user
+  message, unknown roles drop. Session loading keeps these as plain dicts, so
+  all accessors accept models *and* camelCase dicts.
+- **`karen_agent.session.context`**: `build_context_entries` (latest compaction
+  + tail only), `session_entry_to_context_messages` (assistant
+  error/aborted/deferred messages drop out), `build_session_context` (custom
+  entries resolve through `entry_projectors`).
+- **`HookRegistry`** (pi's `harness/hooks.ts`): 11 hooks — `before_run`
+  (prompt chaining + injection), `before_drive` (fail-closed), `before_run_end`
+  (last follow-up wins), `transform_context`, `before_request` (stream-options
+  patches merged, diff returned), `before_payload`, `after_response`,
+  `before_tool` (args chaining, first block wins, handler errors block),
+  `after_tool` (field-wise merge), `before_compaction`/`before_navigation`
+  (first decline-or-result wins). Handler errors go to the `report_error`
+  callback; `close()` makes later `on`/`run` raise.
+- **Prompt templates** (`prompt_templates.py`): load `.md` files (direct
+  children only) with YAML frontmatter, per-file diagnostics instead of
+  exceptions, `parse_command_args` shell-style quoting and `substitute_args`
+  placeholders. `system_prompt.py` renders `<available_skills>`.
+
+M3 deviations from pi, all documented at the port sites: no chord `Context`
+parameter (an explicit `signal=` keyword threads aborts into summary requests);
+pi-ai's assistant-call retry layer (`retryAssistantCall`/`RetryPolicy`) is not
+ported — karen-ai adapters retry transient HTTP errors via `max_retries`; the
+hook registry drops pi's lanes/effect-gates/telemetry spans (events are exactly
+the `HookMap` payloads, handlers take just the event); template loading uses
+synchronous `pathlib` I/O and PyYAML. Prompt constants are byte-identical to pi.
+
+See [`examples/agent_compaction_smoke.py`](examples/agent_compaction_smoke.py)
+for the real-API check: compact a session with a live model, persist the
+compaction entry, reopen the session, and continue the conversation from the
+summary (verified against DeepSeek).
 
 ## Built-in tools (M2)
 

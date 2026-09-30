@@ -7,7 +7,7 @@
 | 包 | 说明 | 状态 |
 | --- | --- | --- |
 | [karen-ai](karen-ai/) | 统一 LLM API 层：消息类型、事件流、Provider/Models 注册表、鉴权、Anthropic 与 OpenAI 兼容适配器。参考 [`@earendil-works/pi-ai`](https://github.com/earendil-works/pi) 的 Python 重写。 | 核心已完成 |
-| [karen-agent](karen-agent/) | 基于 karen-ai 的 agent 层：agent loop（工具执行/事件/钩子）+ session 持久化（JSONL、分支、fork/resume）+ 内置工具（read/write/edit/bash）。移植 pi 的 packages/agent 核心。 | M0–M2 已完成 |
+| [karen-agent](karen-agent/) | 基于 karen-ai 的 agent 层：agent loop（工具执行/事件/钩子）+ session 持久化（JSONL、分支、fork/resume）+ 内置工具（read/write/edit/bash）+ compaction/hooks/prompt 模板。移植 pi 的 packages/agent 核心。 | M0–M3 已完成 |
 
 ## 布局
 
