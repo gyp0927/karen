@@ -16,6 +16,9 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `types.py` | `AgentContext`, `AgentTool`, `AgentToolResult`, `AgentLoopConfig`, hook payloads, the 10 `AgentEvent` types |
 | `stream_fn.py` | default stream-fn registry + `models_stream_fn()` (bridges a karen-ai `Models` registry into the loop) |
 | `agent_loop.py` | `agent_loop` / `agent_loop_continue` and their `run_*` async variants — the full port of pi's `agent-loop.ts` |
+| `agent.py` | `Agent` (pi's `agent.ts`): stateful wrapper with transcript state, event subscription, steering/follow-up queues, abort and `wait_for_idle` |
+| `config.py` | harness config validation (pi's `harness/config.ts`): tool-name/retry/compaction validation, `RetryPolicy` + defaults |
+| `skills.py` | skill loading (pi's `harness/skills.ts`): `SKILL.md` discovery, ignore files, metadata diagnostics, `format_skill_invocation` |
 | `messages.py` | harness message shapes (`bashExecution`/`custom`/`branchSummary`/`compactionSummary`) + `convert_to_llm` (pi's `harness/messages.ts`) |
 | `result.py` | `Result`/`Ok`/`Err` + `CompactionError`/`BranchSummaryError` (pi's `harness/types.ts` result helpers) |
 | `hooks.py` | `HookRegistry`: pi's 11 harness hooks with their aggregation semantics + `HarnessStreamOptions`/`StreamOptionsPatch` |
@@ -126,6 +129,62 @@ printf 'hello\n/quit\n' | python examples/karen_cli.py --new   # scripted/piped
 Verified against DeepSeek: piped session runs a write tool call, compacts,
 answers a question from the summary, and a second process resumes the session
 and answers from the compacted history.
+
+## Agent class, skills, config (M5)
+
+`karen_agent.agent` ports pi's `agent.ts` — the stateful, app-facing wrapper
+around the loop:
+
+```python
+from karen_agent import Agent, AgentInitialState, create_builtin_tools, models_stream_fn
+
+agent = Agent(
+    stream_fn=models_stream_fn(models),
+    initial_state=AgentInitialState(system_prompt=prompt, model=model, tools=create_builtin_tools(cwd)),
+)
+unsubscribe = agent.subscribe(lambda event, signal: ...)   # awaited in subscription order
+await agent.prompt("hello")        # str | AgentMessage | list, plus optional images
+agent.steer(UserMessage(...))      # injected after the current turn
+agent.follow_up(UserMessage(...))  # runs when the agent would otherwise stop
+agent.abort()                      # then: await agent.wait_for_idle()
+agent.reset()                      # keeps the replayed prompt/tool baseline
+await agent.continue_()            # pi's continue(); renamed — `continue` is a keyword
+```
+
+- `AgentInitialState` seeds the leading system message from `system_prompt` +
+  `tools` (unless `messages` already starts with one); `state.system_prompt`
+  replays it, and assigning `state.tools` / `state.messages` copies the list.
+- Steering and follow-up queues drain `"one-at-a-time"` (default) or `"all"`;
+  `has_queued_messages()` / `peek_queued_messages()` / `clear_all_queues()`.
+- Failed runs follow pi: the error becomes an assistant message with stop reason
+  `"error"`/`"aborted"` emitted through the normal message/turn/agent events
+  (also recorded in `state.error_message`) instead of raising out of `prompt()`.
+- `state.pending_tool_calls` / `state.is_streaming` / `state.streaming_message`
+  track the live run; `wait_for_idle()` resolves after `agent_end` listeners
+  settle.
+
+`karen_agent.skills` ports `harness/skills.ts`: `load_skills()` walks directories
+recursively for `SKILL.md` (and direct root `.md` files with frontmatter), honors
+`.gitignore` / `.ignore` / `.fdignore`, validates names (`a-z0-9-`, ≤64 chars,
+must match the directory) and descriptions (≤1024 chars) as warnings, and returns
+`SkillDiagnostic`s instead of raising. `format_skill_invocation()` renders the
+explicit-invocation prompt; `format_skills_for_system_prompt()` (M3) offers the
+loaded skills to the model. `load_sourced_skills()` tags results with
+application-defined provenance values.
+
+`karen_agent.config` ports `harness/config.ts`: `validate_tool_names`,
+`validate_retry_policy`, `validate_compaction_settings`, and `RetryPolicy` +
+`DEFAULT_RETRY_POLICY` (3 retries, 1s base delay, 60s agent-delay cap).
+
+M5 deviations: `RetryPolicy` is declared and validated but not yet consumed by
+the loop (karen-ai adapters retry via `max_retries`); pi's `RangeError`/`TypeError`
+become Python `ValueError`/`TypeError`; skill loading uses synchronous `pathlib`
+I/O, PyYAML (parser error text differs), and pathspec's `GitIgnoreSpec` in place
+of the `ignore` npm package; no chord `Context` parameter.
+
+See [`examples/agent_class_smoke.py`](examples/agent_class_smoke.py) — verified
+against DeepSeek: the agent writes a file, a steered question is injected
+mid-run, and the model answers it by reading a loaded skill file.
 
 ## Built-in tools (M2)
 

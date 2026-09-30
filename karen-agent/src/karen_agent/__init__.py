@@ -5,7 +5,16 @@ coding-agent app, MCP, and TUI stay out of scope for now). The loop works with
 AgentMessage throughout and transforms to Message[] only at the LLM call boundary.
 """
 
+from .agent import DEFAULT_MODEL, Agent, AgentInitialState, AgentState, default_convert_to_llm
 from .agent_loop import agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue
+from .config import (
+    DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    validate_compaction_settings,
+    validate_retry_policy,
+    validate_tool_names,
+)
 from .hooks import (
     HOOK_NAMES,
     AfterResponseEvent,
@@ -54,6 +63,8 @@ from .messages import (
 from .prompt_templates import (
     LoadPromptTemplatesResult,
     PromptTemplateDiagnostic,
+    SourcedPath,
+    SourcedPromptTemplate,
     format_prompt_template_invocation,
     load_prompt_templates,
     load_sourced_prompt_templates,
@@ -72,6 +83,20 @@ from .result import (
     get_or_undefined,
     ok,
     to_error,
+)
+from .skills import (
+    IGNORE_FILE_NAMES,
+    MAX_DESCRIPTION_LENGTH,
+    MAX_NAME_LENGTH,
+    LoadSkillsResult,
+    LoadSourcedSkillsResult,
+    SourcedSkill,
+    SourcedSkillDiagnostic,
+    SkillDiagnostic,
+    SkillDiagnosticCode,
+    format_skill_invocation,
+    load_skills,
+    load_sourced_skills,
 )
 from .stream_fn import get_default_stream_fn, models_stream_fn, set_default_stream_fn
 from .system_prompt import escape_xml, format_skills_for_system_prompt
@@ -235,10 +260,38 @@ __all__ = [
     "load_sourced_prompt_templates",
     "LoadPromptTemplatesResult",
     "PromptTemplateDiagnostic",
+    "SourcedPath",
+    "SourcedPromptTemplate",
     "parse_command_args",
     "substitute_args",
     "format_prompt_template_invocation",
     # system prompt (M3)
     "format_skills_for_system_prompt",
     "escape_xml",
+    # agent (M5)
+    "Agent",
+    "AgentState",
+    "AgentInitialState",
+    "default_convert_to_llm",
+    "DEFAULT_MODEL",
+    # config (M5)
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
+    "DEFAULT_MAX_AGENT_RETRY_DELAY_MS",
+    "validate_tool_names",
+    "validate_retry_policy",
+    "validate_compaction_settings",
+    # skills (M5)
+    "load_skills",
+    "load_sourced_skills",
+    "LoadSkillsResult",
+    "LoadSourcedSkillsResult",
+    "SourcedSkill",
+    "SourcedSkillDiagnostic",
+    "SkillDiagnostic",
+    "SkillDiagnosticCode",
+    "format_skill_invocation",
+    "MAX_NAME_LENGTH",
+    "MAX_DESCRIPTION_LENGTH",
+    "IGNORE_FILE_NAMES",
 ]
