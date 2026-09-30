@@ -16,6 +16,49 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `types.py` | `AgentContext`, `AgentTool`, `AgentToolResult`, `AgentLoopConfig`, hook payloads, the 10 `AgentEvent` types |
 | `stream_fn.py` | default stream-fn registry + `models_stream_fn()` (bridges a karen-ai `Models` registry into the loop) |
 | `agent_loop.py` | `agent_loop` / `agent_loop_continue` and their `run_*` async variants — the full port of pi's `agent-loop.ts` |
+| `session/` | durable session persistence (pi's `harness/session/`): entries, branches, typed values/lists, usage rows, fork, resume |
+| `session/jsonl/` | format-4 JSONL storage + `JsonlSessionRepo` (one file per session under a sessions root) |
+| `session/memory.py` | `MemoryStorage` / `MemorySessionRepo` (in-memory backend, same `Storage`/`Session` contract) |
+| `utils/usage.py` | `empty_usage` / `add_usage` (pi's `harness/utils/usage.ts`) |
+
+## Sessions (M1)
+
+`karen_agent.session` ports pi's session persistence layer:
+
+```python
+from karen_agent.session import JsonlSessionRepo, JsonlSessionCreateOptions, JsonlSessionListOptions
+
+repo = JsonlSessionRepo("~/.karen/sessions")
+session = await repo.create(JsonlSessionCreateOptions(cwd=os.getcwd()))
+branch = await session.create_branch("main", None)
+entry_id = await branch.append_message(UserMessage(content="hi", timestamp=ms))
+await session.close()
+
+# resume: discover + reopen, entries/values/lists/usage replay from the file
+metadata = (await repo.list(JsonlSessionListOptions(cwd=os.getcwd())))[0]
+session = await repo.open(metadata)
+
+# fork: TreeForkOptions() copies the whole tree; BranchForkOptions(branch, entry_id, position)
+# copies one branch ancestry up to an entry (lane state restarts idle, op/usage state excluded)
+fork = await repo.fork(session.metadata, BranchForkOptions(branch="main", entry_id=entry_id))
+```
+
+- **Storage model**: every commit is one JSONL line — entries (`message` / `compaction` /
+  `branch_summary` / `custom`), usage rows, scalar value set/delete, list append/delete.
+  All writes go through a per-session `MutationLine`; a mutator allows exactly one commit.
+- **Wire format**: pi's format v4 — camelCase keys, header line with `v`/`kind`/`id`/
+  `storageVersion`/`createdAt`/`cwd`, single-write transactions as bare objects. Loaded
+  messages are coerced back into karen-ai models via the `Message` role union; unknown
+  shapes stay plain dicts.
+- **Crash safety**: appends are line-atomic; a torn final line is discarded and the file
+  repaired on open; snapshot rewrites (fork) publish via temp-file + rename.
+- **Not ported** (out of M1 scope): the durable runtime operation state machine
+  (`OperationState` leaves, `pi.op.*` payloads are typed `Any`), legacy v3 session
+  migration (v3 files are detected and rejected), pi's `FileSystem` capability abstraction
+  (direct `pathlib` I/O instead), and the chord `Context` parameter.
+
+See [`examples/session_smoke.py`](examples/session_smoke.py) for a runnable
+create → fork → resume round trip (no API key needed).
 
 ## Usage
 
