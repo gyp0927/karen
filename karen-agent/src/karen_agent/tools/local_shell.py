@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from typing import Dict, List, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 from karen_ai import AbortSignal
 
@@ -155,6 +155,7 @@ async def run_shell_command(
     capture: OutputCapture,
     spill: bool = False,
     signal: Optional[AbortSignal] = None,
+    on_spawn: Optional["Callable[[asyncio.subprocess.Process], None]"] = None,
 ) -> int:
     """Run `command` to completion, streaming decoded output into `capture`.
 
@@ -189,6 +190,9 @@ async def run_shell_command(
         )
     except OSError as error:
         raise ExecutionError("spawn_error", str(error), error)
+
+    if on_spawn is not None:
+        on_spawn(proc)
 
     if use_stdin and proc.stdin is not None:
         try:

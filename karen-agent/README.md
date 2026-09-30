@@ -19,6 +19,9 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `agent.py` | `Agent` (pi's `agent.ts`): stateful wrapper with transcript state, event subscription, steering/follow-up queues, abort and `wait_for_idle` |
 | `config.py` | harness config validation (pi's `harness/config.ts`): tool-name/retry/compaction validation, `RetryPolicy` + defaults |
 | `skills.py` | skill loading (pi's `harness/skills.ts`): `SKILL.md` discovery, ignore files, metadata diagnostics, `format_skill_invocation` |
+| `env/` | execution environment (pi's `harness/types.ts` FileSystem/Shell + `harness/env/nodejs.ts`): `ExecutionEnv` protocols, stable `FileError`/`ExecutionError` codes, `LocalExecutionEnv` |
+| `search.py` | session search service interfaces (pi's `search/index.ts`) — protocols only |
+| `proxy.py` | `stream_proxy` (pi's `proxy.ts`): stream fn that routes LLM calls through a proxy server speaking the `data: `-line event protocol |
 | `messages.py` | harness message shapes (`bashExecution`/`custom`/`branchSummary`/`compactionSummary`) + `convert_to_llm` (pi's `harness/messages.ts`) |
 | `result.py` | `Result`/`Ok`/`Err` + `CompactionError`/`BranchSummaryError` (pi's `harness/types.ts` result helpers) |
 | `hooks.py` | `HookRegistry`: pi's 11 harness hooks with their aggregation semantics + `HarnessStreamOptions`/`StreamOptionsPatch` |
@@ -31,7 +34,7 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `session/context.py` | project session entries into model-context messages (pi's `harness/session/context.ts`) |
 | `session/jsonl/` | format-4 JSONL storage + `JsonlSessionRepo` (one file per session under a sessions root) |
 | `session/memory.py` | `MemoryStorage` / `MemorySessionRepo` (in-memory backend, same `Storage`/`Session` contract) |
-| `utils/` | `usage.py` (pi's usage.ts), `truncate.py` (line/byte truncation), `output_capture.py` (bounded shell-output views), `adaptive_publisher.py` (rate-limited publishing) |
+| `utils/` | `usage.py` (pi's usage.ts), `truncate.py` (line/byte truncation), `output_capture.py` (bounded shell-output views), `adaptive_publisher.py` (rate-limited publishing), `shell_output.py` (pi's shell-output.ts capture collector) |
 
 ## Compaction, hooks, prompt templates (M3)
 
@@ -185,6 +188,63 @@ of the `ignore` npm package; no chord `Context` parameter.
 See [`examples/agent_class_smoke.py`](examples/agent_class_smoke.py) — verified
 against DeepSeek: the agent writes a file, a steered question is injected
 mid-run, and the model answers it by reading a loaded skill file.
+
+## Execution environment, search, proxy (M6)
+
+`karen_agent.env` ports pi's `ExecutionEnv` capability interface
+(`harness/types.ts`: `FileSystem` + `Shell`) and its Node implementation
+(`harness/env/nodejs.ts`) as `LocalExecutionEnv`:
+
+```python
+from karen_agent import LocalExecutionEnv, ShellExecOptions, execute_shell_with_capture
+from karen_agent.result import Ok
+
+env = LocalExecutionEnv("/path/to/project")
+await env.write_file("notes/todo.txt", "ship it\n")          # creates parents
+info = (await env.file_info("notes/todo.txt")).value          # FileInfo(kind="file", ...)
+reader = (await env.open_text_line_reader("notes/todo.txt")).value  # strict-LF, torn-tail aware
+
+result = await env.exec("cat notes/todo.txt", ShellExecOptions(timeout=5))
+captured = await execute_shell_with_capture(env, "make build")  # pi's default tail capture + spill
+await env.cleanup()  # kills any processes still running from exec
+```
+
+- **Never-throws contract**: every operation returns `Result` with stable,
+  backend-independent error codes — `FileError.code` ∈
+  `aborted|not_found|permission_denied|not_directory|is_directory|invalid|not_supported|unknown`,
+  `ExecutionError.code` ∈ `aborted|timeout|shell_unavailable|spawn_error|callback_error|unknown`.
+- `exec` reuses the M2 shell engine (bash resolution, process-tree kills,
+  spill) and adds env merging (`inherit_env` + per-call `env`), per-command
+  `cwd`, bounded capture (`ShellOutputLimits`) and active-process tracking for
+  `cleanup()`. Path handling ports pi's `resolvePath` (`~` expansion, `file://`
+  URLs, cwd-relative).
+- `utils/shell_output.py`'s `execute_shell_with_capture` is the compatibility
+  collector from pi's `shell-output.ts`: runs `exec` with pi's default
+  tail-retained 50KB/2000-line capture + spill and folds aborts
+  (`cancelled=True`) and — with `return_execution_errors=True` — execution
+  failures into one `ShellCaptureResult`.
+- `karen_agent.search` ports pi's `search/index.ts` as pure protocols:
+  `SearchQuery` / `SessionSearchHit` / `EntrySearchHit` /
+  `SessionSearchService`; implementations live outside karen-agent.
+- `karen_agent.proxy` ports `proxy.ts`: `stream_proxy(model, context,
+  ProxyStreamOptions(auth_token=..., proxy_url=...))` POSTs
+  `{model, context, options}` to `{proxyUrl}/api/stream` with Bearer auth and
+  reconstructs the partial assistant message client-side from the server's
+  `data: `-line events (the server strips `partial` to save bandwidth). A clean
+  EOF without a terminal `done`/`error` surfaces as
+  `"Connection closed by proxy server before the response completed"`. Use it
+  as an `Agent`'s `stream_fn` when provider credentials live behind a server.
+
+M6 deviations: no chord `Context` parameter — an explicit `signal=` keyword
+threads aborts into every env method; `ShellExecOptions.on_update` still
+receives complete snapshots (M2 deviation), so `on_chunk` diffs consecutive
+snapshots and reports nothing when the retained window slides; text file I/O
+disables newline translation (Node byte-verbatim semantics); the proxy keeps
+only a connect timeout (pi's `fetch` sets none).
+
+See [`examples/agent_env_proxy_smoke.py`](examples/agent_env_proxy_smoke.py) —
+keyless verification: env ops against the real local bash, and an `Agent`
+driven by `stream_proxy` against a scripted loopback proxy server.
 
 ## Built-in tools (M2)
 

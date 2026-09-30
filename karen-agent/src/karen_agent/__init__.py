@@ -15,6 +15,24 @@ from .config import (
     validate_retry_policy,
     validate_tool_names,
 )
+from .env import (
+    ExecutionEnv,
+    FileError,
+    FileErrorCode,
+    FileInfo,
+    FileKind,
+    FileSystem,
+    LocalExecutionEnv,
+    Shell,
+    ShellExecOptions,
+    ShellExecResult,
+    ShellOutputCaptureOptions,
+    ShellOutputLimits,
+    ShellOutputMetadata,
+    ShellOutputRetention,
+    TextLine,
+    TextLineReader,
+)
 from .hooks import (
     HOOK_NAMES,
     AfterResponseEvent,
@@ -71,6 +89,7 @@ from .prompt_templates import (
     parse_command_args,
     substitute_args,
 )
+from .proxy import ProxyStreamOptions, build_proxy_request_options, process_proxy_event, stream_proxy
 from .resources import PromptTemplate, Resources, Skill
 from .result import (
     BranchSummaryError,
@@ -84,6 +103,7 @@ from .result import (
     ok,
     to_error,
 )
+from .search import EntrySearchHit, SearchQuery, SessionSearchHit, SessionSearchService
 from .skills import (
     IGNORE_FILE_NAMES,
     MAX_DESCRIPTION_LENGTH,
@@ -145,6 +165,12 @@ from .types import (
     ToolExecutionUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
+)
+from .utils.shell_output import (
+    ShellCaptureOptions,
+    ShellCaptureProgress,
+    ShellCaptureResult,
+    execute_shell_with_capture,
 )
 
 __all__ = [
@@ -294,4 +320,36 @@ __all__ = [
     "MAX_NAME_LENGTH",
     "MAX_DESCRIPTION_LENGTH",
     "IGNORE_FILE_NAMES",
+    # execution environment (M6)
+    "ExecutionEnv",
+    "FileSystem",
+    "Shell",
+    "LocalExecutionEnv",
+    "FileError",
+    "FileErrorCode",
+    "FileInfo",
+    "FileKind",
+    "TextLine",
+    "TextLineReader",
+    "ShellExecOptions",
+    "ShellExecResult",
+    "ShellOutputCaptureOptions",
+    "ShellOutputLimits",
+    "ShellOutputMetadata",
+    "ShellOutputRetention",
+    # shell capture (M6)
+    "execute_shell_with_capture",
+    "ShellCaptureOptions",
+    "ShellCaptureProgress",
+    "ShellCaptureResult",
+    # search interfaces (M6)
+    "SearchQuery",
+    "SessionSearchHit",
+    "EntrySearchHit",
+    "SessionSearchService",
+    # proxy stream fn (M6)
+    "stream_proxy",
+    "ProxyStreamOptions",
+    "build_proxy_request_options",
+    "process_proxy_event",
 ]
