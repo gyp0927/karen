@@ -94,6 +94,39 @@ for the real-API check: compact a session with a live model, persist the
 compaction entry, reopen the session, and continue the conversation from the
 summary (verified against DeepSeek).
 
+## Demo CLI (M4)
+
+[`examples/karen_cli.py`](examples/karen_cli.py) puts the whole stack behind an
+interactive terminal agent:
+
+```bash
+python examples/karen_cli.py [--cwd PATH] [--model ID] [--new]
+printf 'hello\n/quit\n' | python examples/karen_cli.py --new   # scripted/piped
+```
+
+- Streams replies, prints tool calls (`[tool ->] write(path='a.py', ...)`), and
+  a context-token estimate after every turn.
+- Resumes the most recent session for the working directory (sessions under
+  `~/.karen/sessions`, override with `KAREN_SESSIONS_ROOT`); `/new` starts
+  fresh. Every message and usage row is persisted as it arrives.
+- **Auto-compaction**: when estimated context tokens cross
+  `context_window - reserve_tokens`, the model writes a structured summary that
+  is persisted as a compaction entry and the context rebuilds from it.
+  `/compact [focus]` triggers it manually.
+- **Prompt templates**: `/templates` lists templates from `.karen/prompts`
+  (project) and `~/.karen/prompts` (user); `/name args...` expands `$1`, `$@`,
+  `${@:N:L}` and sends the result.
+- **Hooks**: a `HookRegistry` is bridged into the loop's `before_tool_call` /
+  `after_tool_call` hooks — the demo registers a path guard (write/edit outside
+  the working directory is blocked) and a tool-call counter.
+- The leading system message carries prompt + tool declarations (pi's
+  `initialState` pattern), so resumed sessions replay tools without extra
+  system messages.
+
+Verified against DeepSeek: piped session runs a write tool call, compacts,
+answers a question from the summary, and a second process resumes the session
+and answers from the compacted history.
+
 ## Built-in tools (M2)
 
 `karen_agent.tools` ports pi's four built-in tools. Factories take an optional
