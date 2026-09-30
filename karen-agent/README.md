@@ -16,10 +16,55 @@ shapes (compaction markers, notifications, …) in the transcript and decide in
 | `types.py` | `AgentContext`, `AgentTool`, `AgentToolResult`, `AgentLoopConfig`, hook payloads, the 10 `AgentEvent` types |
 | `stream_fn.py` | default stream-fn registry + `models_stream_fn()` (bridges a karen-ai `Models` registry into the loop) |
 | `agent_loop.py` | `agent_loop` / `agent_loop_continue` and their `run_*` async variants — the full port of pi's `agent-loop.ts` |
+| `tools/` | built-in tools (pi's `harness/tools/`): `read`, `write`, `edit`, `bash` + supporting utils (edit-diff, image detection, path utils, file mutation queue, local shell) |
 | `session/` | durable session persistence (pi's `harness/session/`): entries, branches, typed values/lists, usage rows, fork, resume |
 | `session/jsonl/` | format-4 JSONL storage + `JsonlSessionRepo` (one file per session under a sessions root) |
 | `session/memory.py` | `MemoryStorage` / `MemorySessionRepo` (in-memory backend, same `Storage`/`Session` contract) |
-| `utils/usage.py` | `empty_usage` / `add_usage` (pi's `harness/utils/usage.ts`) |
+| `utils/` | `usage.py` (pi's usage.ts), `truncate.py` (line/byte truncation), `output_capture.py` (bounded shell-output views), `adaptive_publisher.py` (rate-limited publishing) |
+
+## Built-in tools (M2)
+
+`karen_agent.tools` ports pi's four built-in tools. Factories take an optional
+`cwd` (default: the process cwd at call time) in place of pi's
+`ExecutionToolContext`; `create_builtin_tools(cwd)` returns all four:
+
+```python
+from karen_agent.tools import create_builtin_tools
+
+context = AgentContext(messages=[], tools=create_builtin_tools("/path/to/project"))
+```
+
+- **read** — text files (offset/limit, 2000-line/50KB head truncation with
+  continuation hints) and images (jpg/png/gif/webp/bmp magic-byte detection,
+  base64 attachments, optional `image_processor` hook for conversion/resizing).
+- **write** — creates parent directories, writes raw UTF-8 (no newline
+  translation), serialized per path through a mutation queue.
+- **edit** — exact-unique-match replacements with fuzzy fallback (smart quotes,
+  dashes, NBSP folding) that preserves untouched lines byte-for-byte, CRLF/BOM
+  round-tripping, `prepare_arguments` tolerating JSON-string/single-object/
+  legacy `oldText`/`newText` shapes, diff + unified patch in `details`.
+- **bash** — runs through a real bash (Git Bash on Windows, /bin/bash→PATH→sh
+  on POSIX), combined stdout+stderr, tail truncation (last 2000 lines/50KB)
+  with full output spilled to a temp file, timeout and abort kill the whole
+  process tree, streaming partial results via `on_update`.
+
+Error messages, truncation footers, and result `details` shapes match pi
+byte-for-byte (camelCase keys). Differences from pi, all consequences of
+dropping the `ExecutionEnv` capability layer (consistent with M1): direct
+`pathlib`/subprocess I/O instead of a `FileSystem`/`Shell` interface; shell
+output updates publish complete snapshots in-process instead of pi's
+replace/append/slide delta protocol; pi's 2s durable-checkpoint throttle is
+dropped (karen's update callback has no checkpoint channel); stderr merges
+into stdout at OS level (`stderr=STDOUT`) instead of interleaving two pipes;
+spill files are named `karen-output-*.log`.
+
+See [`examples/agent_tools_smoke.py`](examples/agent_tools_smoke.py) for a
+real-API check: the model writes a file, edits it, and verifies it with bash
+(verified against DeepSeek).
+
+> **Note:** your `convert_to_llm` must keep `"system"` messages. The loop
+> declares the executable tool set via `tools_added` on a system message —
+> filtering system messages out hides all tools from the model.
 
 ## Sessions (M1)
 
@@ -88,7 +133,7 @@ async def main():
     context = AgentContext(messages=[], tools=[echo])
     config = AgentLoopConfig(
         model=model,
-        convert_to_llm=lambda ms: [m for m in ms if getattr(m, "role", None) in ("user", "assistant", "toolResult")],
+        convert_to_llm=lambda ms: [m for m in ms if getattr(m, "role", None) in ("system", "user", "assistant", "toolResult")],
     )
     stream = agent_loop([UserMessage(content="Say hi via the echo tool", timestamp=0)],
                         context, config, None, models_stream_fn(models))

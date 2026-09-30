@@ -7,6 +7,18 @@ AgentMessage throughout and transforms to Message[] only at the LLM call boundar
 
 from .agent_loop import agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue
 from .stream_fn import get_default_stream_fn, models_stream_fn, set_default_stream_fn
+from .tools import (
+    BashExecution,
+    Edit,
+    ExecutionError,
+    ImageProcessingFailed,
+    ProcessedImage,
+    create_bash_tool,
+    create_builtin_tools,
+    create_edit_tool,
+    create_read_tool,
+    create_write_tool,
+)
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -82,4 +94,14 @@ __all__ = [
     "ToolExecutionUpdateEvent",
     "TurnEndEvent",
     "TurnStartEvent",
+    "BashExecution",
+    "Edit",
+    "ExecutionError",
+    "ImageProcessingFailed",
+    "ProcessedImage",
+    "create_bash_tool",
+    "create_builtin_tools",
+    "create_edit_tool",
+    "create_read_tool",
+    "create_write_tool",
 ]
