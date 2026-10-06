@@ -306,6 +306,22 @@ async def test_rpc_new_session_rebinds_holder_and_server(tmp_path):
     await holder.agent_session.close()
 
 
+async def test_rpc_new_session_keeps_the_structured_prompt(tmp_path):
+    sections = {"preamble": "You are karen.", "cwd": "<cwd>\n/tmp\n</cwd>"}
+    session = await _make_session(
+        tmp_path, [faux_assistant_message("x")], system_prompt_sections=sections
+    )
+    holder = RpcSession(session)
+    server = RpcServer(holder, input_iter=[], emit=lambda _l: None)
+
+    await server.handle_command({"type": "new_session"})
+
+    assert holder.agent_session.system_prompt_sections == sections
+    rebound = holder.agent_session.agent.state.messages[0]
+    assert rebound.sections == sections and rebound.content == ""
+    await holder.agent_session.close()
+
+
 # ---------------------------------------------------------------------------
 # model commands (faux provider carries the catalog)
 # ---------------------------------------------------------------------------

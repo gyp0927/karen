@@ -179,7 +179,9 @@ must match the directory) and descriptions (≤1024 chars) as warnings, and retu
 `SkillDiagnostic`s instead of raising. `format_skill_invocation()` renders the
 explicit-invocation prompt; `format_skills_for_system_prompt()` (M3) offers the
 loaded skills to the model. `load_sourced_skills()` tags results with
-application-defined provenance values.
+application-defined provenance values. The coding-agent app builds its
+`skills` prompt section and its `/name` skill invocations on these two
+functions (karen-coding-agent M6).
 
 `karen_agent.config` ports `harness/config.ts`: `validate_tool_names`,
 `validate_retry_policy`, `validate_compaction_settings`, and `RetryPolicy` +

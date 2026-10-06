@@ -121,6 +121,7 @@ class RpcSession:
             fresh=True,
             branch_name=old.branch_name,
             system_prompt=old.system_prompt_text,
+            system_prompt_sections=old.system_prompt_sections,
             tools=old.tools,
             hooks=old.hooks,
             compaction_settings=old.settings,

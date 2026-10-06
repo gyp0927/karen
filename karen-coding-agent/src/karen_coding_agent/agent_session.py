@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from karen_ai import Model, Models, SystemMessage
 from karen_ai.utils.overflow import is_context_overflow, is_recoverable_length
+from karen_ai.utils.text import get_system_message_text
 from karen_agent import (
     AfterToolEvent,
     Agent,
@@ -102,6 +103,7 @@ class AgentSession:
         fresh: bool = False,
         branch_name: str = DEFAULT_BRANCH,
         system_prompt: Optional[str] = None,
+        system_prompt_sections: Optional[Dict[str, str]] = None,
         tools: Optional[List[AgentTool]] = None,
         shell_path: Optional[str] = None,
         shell_command_prefix: Optional[str] = None,
@@ -125,13 +127,21 @@ class AgentSession:
             if tools is not None
             else create_default_tools(cwd, shell_path=shell_path, shell_command_prefix=shell_command_prefix)
         )
-        self.system_prompt_text = (
-            system_prompt
-            if system_prompt is not None
-            else DEFAULT_SYSTEM_PROMPT.format(
-                cwd=cwd, powershell="/powershell" if sys.platform == "win32" else ""
+        #: Structured prompt sections (pi's `SystemMessage.sections`), when the
+        #: caller assembles the prompt with `karen_coding_agent.prompt`.
+        self.system_prompt_sections = system_prompt_sections
+        if system_prompt_sections is not None:
+            self.system_prompt_text = get_system_message_text(
+                SystemMessage(content="", sections=dict(system_prompt_sections), timestamp=0)
             )
-        )
+        else:
+            self.system_prompt_text = (
+                system_prompt
+                if system_prompt is not None
+                else DEFAULT_SYSTEM_PROMPT.format(
+                    cwd=cwd, powershell="/powershell" if sys.platform == "win32" else ""
+                )
+            )
         self.settings = compaction_settings or CompactionSettings()
         self.hooks = hooks if hooks is not None else HookRegistry(_report_hook_error)
         self._listener = listener
@@ -184,7 +194,15 @@ class AgentSession:
     def _system_message(self) -> SystemMessage:
         # pi's initialState pattern: the leading system message carries prompt +
         # tool declarations, so resumed sessions replay tools without extra
-        # system messages.
+        # system messages. Structured prompts carry their sections and leave
+        # `content` empty, exactly like pi's transcript.
+        if self.system_prompt_sections is not None:
+            return SystemMessage(
+                content="",
+                sections=dict(self.system_prompt_sections),
+                tools_added=self.tools,
+                timestamp=_now_ms(),
+            )
         return SystemMessage(
             content=self.system_prompt_text, tools_added=self.tools, timestamp=_now_ms()
         )

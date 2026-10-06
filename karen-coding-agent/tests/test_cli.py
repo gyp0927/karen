@@ -41,6 +41,14 @@ def test_parse_template_invocation():
     assert karen_cli.parse_command("/nope x", {"review"}) == ("prompt", None, "/nope x")
 
 
+def test_parse_skill_invocation():
+    assert karen_cli.parse_command("/greet now", set(), {"greet"}) == ("skill", "greet", "now")
+    assert karen_cli.parse_command("/greet", set(), {"greet"}) == ("skill", "greet", "")
+    assert karen_cli.parse_command("/skills", set(), {"greet"})[0] == "skills"
+    # templates and skills share one namespace; templates win
+    assert karen_cli.parse_command("/greet", {"greet"}, {"greet"})[0] == "template"
+
+
 # ---------------------------------------------------------------------------
 # format_args_preview
 # ---------------------------------------------------------------------------
@@ -200,3 +208,109 @@ def test_unknown_model_exits(tmp_path, monkeypatch, faux_models):
     monkeypatch.setattr(karen_cli, "build_models", faux_models)
     with pytest.raises(SystemExit):
         karen_cli.KarenCli(cwd=str(tmp_path), model_id="nope", fresh=True, provider="faux")
+
+
+# ---------------------------------------------------------------------------
+# system prompt assembly (M6)
+# ---------------------------------------------------------------------------
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _capturing_factory(captured, reply="pong"):
+    """A faux response step that records the messages the model was called with."""
+
+    def factory(context, options, state, model):
+        captured.append(list(context.messages))
+        return faux_assistant_message(reply)
+
+    return factory
+
+
+def test_print_mode_prompt_carries_context_files_and_skills(tmp_path, monkeypatch, capsys):
+    cwd = tmp_path / "proj"
+    _write(cwd / "AGENTS.md", "Always run pytest before answering.")
+    _write(
+        cwd / ".karen" / "skills" / "greet" / "SKILL.md",
+        "---\nname: greet\ndescription: Say hi warmly\n---\n\nGreet the user.",
+    )
+    monkeypatch.setattr(karen_cli, "DEFAULT_AGENT_DIR", tmp_path / "agent")
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    captured = []
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory([_capturing_factory(captured)]))
+
+    exit_code = karen_cli.main(
+        ["-p", "hi", "--new", "--cwd", str(cwd), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    assert exit_code == 0 and captured
+    system = captured[0][0]
+    assert system.role == "system"
+    assert system.content == ""  # the prompt lives in sections, like pi
+    assert "You are an expert coding assistant operating inside karen" in system.sections["preamble"]
+    assert "Always run pytest before answering." in system.sections["project_context"]
+    assert "<name>greet</name>" in system.sections["skills"]
+    assert system.sections["cwd"] == f"<cwd>\n{cwd.as_posix()}\n</cwd>"
+    tool_names = [tool.name for tool in system.tools_added]
+    assert {"read", "bash", "edit", "write", "grep", "find", "ls"} <= set(tool_names)
+    assert "- read: Read file contents" in system.sections["tools"]
+
+
+def test_system_md_replaces_preamble_and_append_system_md_adds_addendum(tmp_path, monkeypatch, capsys):
+    cwd = tmp_path / "proj"
+    _write(cwd / ".karen" / "SYSTEM.md", "You are a terse test agent.")
+    _write(cwd / ".karen" / "APPEND_SYSTEM.md", "Always answer in one line.")
+    monkeypatch.setattr(karen_cli, "DEFAULT_AGENT_DIR", tmp_path / "agent")
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    captured = []
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory([_capturing_factory(captured)]))
+
+    assert karen_cli.main(["-p", "hi", "--new", "--cwd", str(cwd), "--provider", "faux", "--model", "faux-1"]) == 0
+
+    sections = captured[0][0].sections
+    assert sections["preamble"] == "You are a terse test agent."
+    assert "tools" not in sections and "rules" not in sections
+    assert sections["addendum"] == "<addendum>\nAlways answer in one line.\n</addendum>"
+
+
+def test_settings_default_tools_limit_the_session(tmp_path, monkeypatch, capsys):
+    cwd = tmp_path / "proj"
+    _write(cwd / ".karen" / "settings.json", '{"defaultTools": ["read", "grep"]}')
+    monkeypatch.setattr(karen_cli, "DEFAULT_AGENT_DIR", tmp_path / "agent")
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    captured = []
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory([_capturing_factory(captured)]))
+
+    assert karen_cli.main(["-p", "hi", "--new", "--cwd", str(cwd), "--provider", "faux", "--model", "faux-1"]) == 0
+
+    system = captured[0][0]
+    assert [tool.name for tool in system.tools_added] == ["read", "grep"]
+    assert "- read: Read file contents" in system.sections["tools"]
+    assert "- bash:" not in system.sections["tools"]
+
+
+def test_repl_skill_listing_and_invocation(tmp_path, monkeypatch, capsys, faux_models):
+    cwd = tmp_path / "proj"
+    _write(
+        cwd / ".karen" / "skills" / "greet" / "SKILL.md",
+        "---\nname: greet\ndescription: Say hi warmly\n---\n\nGreet the user.",
+    )
+    monkeypatch.setattr(karen_cli, "DEFAULT_AGENT_DIR", tmp_path / "agent")
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/skills\n/greet be nice\n/quit\n"))
+
+    exit_code = karen_cli.main(["--new", "--cwd", str(cwd), "--provider", "faux", "--model", "faux-1"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "/greet  Say hi warmly" in out
+    # the skill block reached the model: it is persisted as the user message
+    session_files = list((tmp_path / "sessions").rglob("*.jsonl"))
+    assert len(session_files) == 1
+    transcript = session_files[0].read_text(encoding="utf-8")
+    assert 'skill name=' in transcript and "be nice" in transcript
+    assert "Greet the user." in transcript

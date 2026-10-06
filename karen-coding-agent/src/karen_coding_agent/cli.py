@@ -1,5 +1,5 @@
 """`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode;
-M5: RPC mode).
+M5: RPC mode; M6: structured system prompt, context files and skills).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
@@ -29,10 +29,24 @@ from pathlib import Path
 
 from karen_ai import CreateModelsOptions, JsonFileCredentialStore, create_models
 from karen_ai.providers import deepseek_provider
-from karen_agent import format_prompt_template_invocation, load_prompt_templates, parse_command_args
+from karen_agent import (
+    format_prompt_template_invocation,
+    format_skill_invocation,
+    load_prompt_templates,
+    parse_command_args,
+)
 
 from .agent_session import AgentSession
 from .json_events import to_json_event
+from .prompt import build_system_prompt_sections
+from .resources import (
+    DEFAULT_AGENT_DIR,
+    discover_append_system_prompt_file,
+    discover_system_prompt_file,
+    load_project_context_files,
+    load_project_skills,
+    read_text_file,
+)
 from .rpc import run_rpc_mode
 from .settings import (
     LoadedSettings,
@@ -50,15 +64,20 @@ HELP_TEXT = """Commands:
   /new                  start a fresh session
   /compact [focus]      compact the context now (optional extra instructions)
   /templates            list available prompt templates
+  /skills               list available skills
   /quit                 exit
-  /<template> [args]    invoke a prompt template ($1, $@, ${@:N:L} supported)
+  /<name> [args]        invoke a prompt template or skill from the current project
 Anything else is sent to the model."""
 
 
-def parse_command(line: str, template_names):
+def parse_command(line: str, template_names, skill_names=()):
     """Route one input line. Returns (kind, name, arg_string).
 
-    kind: "quit" | "help" | "new" | "compact" | "templates" | "template" | "prompt"
+    kind: "quit" | "help" | "new" | "compact" | "templates" | "skills"
+          | "template" | "skill" | "prompt"
+
+    Templates and skills share one `/name` namespace, like pi's slash commands;
+    templates win when a name is defined as both.
     """
     if not line.startswith("/"):
         return "prompt", None, line
@@ -76,8 +95,12 @@ def parse_command(line: str, template_names):
         return "compact", None, rest
     if name == "templates":
         return "templates", None, ""
+    if name == "skills":
+        return "skills", None, ""
     if name in template_names:
         return "template", name, rest
+    if name in skill_names:
+        return "skill", name, rest
     return "prompt", None, line  # unknown slash command: send verbatim
 
 
@@ -132,7 +155,11 @@ class KarenCli:
         if provider == "deepseek":
             self.models.set_provider(deepseek_provider())
         self.model = self.resolve_model()
+        self.agent_dir = DEFAULT_AGENT_DIR
         self.templates, self.template_diagnostics = load_all_templates(cwd, self.settings.prompts)
+        skills_result = load_project_skills(cwd, self.agent_dir)
+        self.skills = skills_result.skills
+        self.skill_diagnostics = skills_result.diagnostics
         self.session: AgentSession | None = None
         self.tool_counts = {}
         for diagnostic in self.loaded_settings.diagnostics:
@@ -140,6 +167,8 @@ class KarenCli:
                 f"[settings warning: Invalid settings file {diagnostic.path}: {diagnostic.message}]",
                 file=sys.stderr,
             )
+        for diagnostic in self.skill_diagnostics:
+            print(f"[skill warning: {diagnostic.code} {diagnostic.path}: {diagnostic.message}]", file=sys.stderr)
 
     def resolve_model(self):
         model = self.models.get_model(self.provider, self.model_id)
@@ -211,7 +240,9 @@ class KarenCli:
             shell_path=self.settings.shell_path,
             shell_command_prefix=self.settings.shell_command_prefix,
         )
-        names = resolve_default_tool_names(entries, [tool.name for tool in all_tools])
+        all_names = [tool.name for tool in all_tools]
+        # no settings entry at all -> pi's built-in default tool set
+        names = resolve_default_tool_names(entries, all_names) if entries else all_names
         by_name = {tool.name: tool for tool in all_tools}
         selected = []
         for name in names:
@@ -222,6 +253,36 @@ class KarenCli:
             selected.append(tool)
         return selected
 
+    def _build_prompt_sections(self, tools):
+        """Assemble the structured system prompt (pi's buildSystemPrompt call).
+
+        Sources: `SYSTEM.md` replaces the default preamble, `APPEND_SYSTEM.md`
+        adds the `addendum` section, AGENTS.md/CLAUDE.md ancestors become
+        `project_context`, skills become `skills`, and the session's tool set
+        drives `tools`/`rules`.
+        """
+        system_prompt_file = discover_system_prompt_file(self.cwd, self.agent_dir)
+        append_prompt_file = discover_append_system_prompt_file(self.cwd, self.agent_dir)
+        custom_prompt = self._read_optional(system_prompt_file)
+        append_prompt = self._read_optional(append_prompt_file) or ""
+        return build_system_prompt_sections(
+            cwd=self.cwd,
+            selected_tools=[tool.name for tool in tools],
+            custom_prompt=custom_prompt,
+            append_system_prompt=append_prompt,
+            context_files=load_project_context_files(self.cwd, self.agent_dir),
+            skills=self.skills,
+        )
+
+    def _read_optional(self, path):
+        if path is None:
+            return None
+        try:
+            return read_text_file(path)
+        except OSError as error:
+            print(f"[warning: could not read {path}: {error}]", file=sys.stderr)
+            return None
+
     async def _open_session(self, fresh: bool) -> None:
         if self.session is not None:
             await self.session.close()
@@ -229,6 +290,7 @@ class KarenCli:
         sessions_root = None
         if settings.session_dir and not os.environ.get("KAREN_SESSIONS_ROOT"):
             sessions_root = settings.session_dir
+        tools = self._select_default_tools(settings.default_tools)
         self.session = AgentSession(
             cwd=self.cwd,
             models=self.models,
@@ -236,9 +298,8 @@ class KarenCli:
             fresh=fresh,
             listener=self._on_session_event,
             sessions_root=sessions_root,
-            tools=self._select_default_tools(settings.default_tools)
-            if settings.default_tools is not None
-            else None,
+            tools=tools,
+            system_prompt_sections=self._build_prompt_sections(tools),
             shell_path=settings.shell_path,
             shell_command_prefix=settings.shell_command_prefix,
             compaction_settings=compaction_settings_from_wire(settings.compaction)
@@ -305,7 +366,9 @@ class KarenCli:
                 break
             if not line:
                 continue
-            kind, name, rest = parse_command(line, {t.name for t in self.templates})
+            kind, name, rest = parse_command(
+                line, {t.name for t in self.templates}, {s.name for s in self.skills}
+            )
             if kind == "quit":
                 break
             if kind == "help":
@@ -317,6 +380,12 @@ class KarenCli:
                 for template in self.templates:
                     print(f"  /{template.name}  {template.description or ''}")
                 continue
+            if kind == "skills":
+                if not self.skills:
+                    print("no skills (add SKILL.md files to .karen/skills or ~/.karen/skills)")
+                for skill in self.skills:
+                    print(f"  /{skill.name}  {skill.description}")
+                continue
             if kind == "new":
                 await self._open_session(fresh=True)
                 continue
@@ -326,6 +395,9 @@ class KarenCli:
             if kind == "template":
                 template = next(t for t in self.templates if t.name == name)
                 line = format_prompt_template_invocation(template, parse_command_args(rest))
+            elif kind == "skill":
+                skill = next(s for s in self.skills if s.name == name)
+                line = format_skill_invocation(skill, rest or None)
             try:
                 await self.session.prompt(line)
                 print(f"[context ~{self.session.estimate_tokens()} tokens; tools used: {self.tool_counts or '{}'}]")

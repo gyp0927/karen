@@ -75,6 +75,23 @@ async def test_prompt_persists_every_message(tmp_path):
     await session.close()
 
 
+async def test_system_prompt_sections_ride_the_system_message(tmp_path):
+    models, registration = _models_with_faux([faux_assistant_message("ok")])
+    sections = {"preamble": "You are karen.", "cwd": "<cwd>\n/tmp\n</cwd>"}
+    session = await _open(tmp_path, models, registration, system_prompt_sections=sections)
+
+    system_message = session.agent.state.messages[0]
+    assert system_message.role == "system"
+    assert system_message.content == ""  # sections carry the prompt, like pi
+    assert system_message.sections == sections
+    assert system_message.tools_added  # tools still ride the system message
+    # the rendered text matches what a request would send
+    assert session.system_prompt_text == "You are karen.\n\n<cwd>\n/tmp\n</cwd>"
+
+    await session.prompt("hello")
+    await session.close()
+
+
 async def test_resume_rebuilds_context(tmp_path):
     models, registration = _models_with_faux([faux_assistant_message("hi there")])
     session = await _open(tmp_path, models, registration)

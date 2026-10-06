@@ -80,9 +80,10 @@ printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive i
 - Sessions live under `~/.karen/sessions` (override with
   `KAREN_SESSIONS_ROOT`), resumed per working directory; `/new` starts fresh.
 - Slash commands: `/help`, `/new`, `/compact [focus]`, `/templates`,
-  `/quit`; `/name args...` invokes a prompt template from `.karen/prompts`
-  (project) or `~/.karen/prompts` (user), with `$1`/`$@`/`${@:N:L}`
-  substitution.
+  `/skills`, `/quit`; `/name args...` invokes a prompt template from
+  `.karen/prompts` (project) or `~/.karen/prompts` (user), with
+  `$1`/`$@`/`${@:N:L}` substitution, or a skill from `.karen/skills` /
+  `~/.karen/skills` (see M6).
 - Ctrl-C aborts the running turn (`agent.abort()` + `wait_for_idle()`).
 
 Credentials come from `~/.karen/credentials.json` (override with
@@ -212,10 +213,52 @@ stream → `get_last_assistant_text` = `"RPC-OK"`, model switching,
 `new_session` rebinding (second header), unknown-command/parse-error
 responses, and a clean exit 0 on EOF.
 
+## M6: structured system prompt, context files and skills
+
+`src/karen_coding_agent/prompt.py` ports pi's `core/system-prompt.ts`, and
+`src/karen_coding_agent/resources.py` the context-file/skill discovery of
+`core/resource-loader.ts`. The session's system message now carries pi's
+structured sections (`SystemMessage.sections`, `content` empty) instead of one
+flat string, so request rendering matches pi's transcript exactly:
+
+| section | source |
+| --- | --- |
+| `preamble` (untagged) | the default karen preamble, or `SYSTEM.md` |
+| `tools` | one line per selected tool that has a snippet (pi's `promptSnippet`s) |
+| `rules` | shell-fallback rule, per-tool guidelines, then "Be concise…"/"Show file paths…" (deduplicated, order kept) |
+| `addendum` | `APPEND_SYSTEM.md` |
+| `project_context` | `<project_instructions path="…">` per AGENTS.md/CLAUDE.md |
+| `skills` | `<available_skills>` block (only with a read/bash tool, like pi) |
+| `cwd` | the working directory, forward-slashed |
+
+- **Context files**: `~/.karen/AGENTS.md` first, then every ancestor of the
+  cwd outermost-first; per directory the first of
+  `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`
+  wins. Paths are deduplicated by real path and read as UTF-8 with the BOM
+  stripped. Deviations: the git-worktree "shadowed context file" rule is not
+  ported.
+- **`SYSTEM.md` / `APPEND_SYSTEM.md`**: project (`<cwd>/.karen/`) wins over
+  global (`~/.karen/`). pi gates the project files behind its project-trust
+  prompt; karen has no trust system, so they always apply.
+- **Skills**: `<cwd>/.karen/skills` and `~/.karen/skills` (SKILL.md, loaded by
+  karen-agent's loader, diagnostics on stderr). Skills are advertised to the
+  model in the `skills` section and can be invoked by name — `/token-skill
+  please` expands to `format_skill_invocation(skill, "please")`; `/skills`
+  lists them. Templates and skills share one `/name` namespace (templates
+  win), like pi's slash commands.
+- Not ported: pi's `docs` section (no karen docs tree), `forceSystemPrompt`
+  (extension hook), the `PI_*` session-env guideline the shell tools
+  contribute, and `/reload` (`/new` rebuilds the prompt).
+
+Verified against real DeepSeek: an AGENTS.md rule and an `APPEND_SYSTEM.md`
+rule both showed up in the reply, and `/token-skill please` made the model
+answer with the skill's mandated token.
+
 ## Roadmap
 
 Later milestones (tracked in the repo root README): extensions / MCP / TUI /
-image input / fork and branch-navigation RPC commands (unscheduled).
+image input / session navigation (fork, clone, tree, switch) / auto-retry
+(unscheduled).
 
 ## Development
 
