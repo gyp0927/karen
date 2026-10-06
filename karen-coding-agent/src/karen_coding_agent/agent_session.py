@@ -1,10 +1,11 @@
 """Application-level agent session for the karen coding agent.
 
 Wires karen_agent's `Agent` to durable session persistence, automatic
-compaction (threshold + overflow recovery), and the hook registry — the karen
-equivalent of pi coding-agent's `core/agent-session.ts`, greatly simplified:
-no settings manager, session projections, context edits, retries, or
-extension events yet (those are later milestones).
+compaction (threshold + overflow recovery), session navigation (tree, fork,
+clone, switch — M7), and the hook registry — the karen equivalent of pi
+coding-agent's `core/agent-session.ts`, greatly simplified: no settings
+manager, session projections, context edits, retries, or extension events yet
+(those are later milestones).
 
 Persistence model: every message is persisted as its `message_end` event
 arrives (crash-safe, like pi). Overflow recovery rewinds the branch tip to
@@ -40,29 +41,46 @@ from karen_agent import (
 )
 from karen_agent.compaction import (
     CompactionSettings,
+    GenerateBranchSummaryOptions,
     compact as _compact_impl,
+    collect_entries_for_branch_summary,
     estimate_context_tokens,
+    generate_branch_summary,
     prepare_compaction,
     should_compact,
 )
 from karen_agent.messages import message_field
 from karen_agent.result import Err
 from karen_agent.session import (
+    BranchForkOptions,
     BranchScan,
+    BranchSummaryEntry,
+    Entry,
+    EntryQuery,
     JsonlSessionCreateOptions,
     JsonlSessionListOptions,
+    JsonlSessionMetadata,
     JsonlSessionRepo,
+    LaneConfiguration,
+    LaneModelRef,
+    LaneState,
     MessageEntry,
     Session,
     UsageRow,
+    Value,
     branch_tip,
+    branch_tip_inventory_prefix,
+    entry_label,
     insert_entry,
     insert_usage,
+    lane_config,
+    lane_state,
     set_value,
 )
 from karen_agent.session.context import build_session_context
 from karen_agent.session.jsonl import to_jsonable
 from karen_agent.session.types import CompactionEntry
+from .navigation import TreeNode, build_tree, entry_text, forkable_user_messages
 from .tools import create_default_tools
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".karen" / "sessions"
@@ -81,12 +99,27 @@ def _report_hook_error(error: BaseException, hook: str) -> None:
     print(f"\n[hook {hook} error: {error}]", file=sys.stderr)
 
 
+def _add_usage(totals: Dict[str, float], usage) -> None:
+    """Accumulate one `Usage` object into the running token/cost totals."""
+    if usage is None:
+        return
+    for key in ("input", "output", "cache_read", "cache_write"):
+        totals[key] += message_field(usage, key, default=0) or 0
+    cost = message_field(usage, "cost")
+    if cost is not None:
+        totals["cost"] += message_field(cost, "total", default=0.0) or 0.0
+
+
 #: Session lifecycle events forwarded to the optional `listener` callable:
-#: {"type": "session_opened", "session_id": str, "resumed": bool}
+#: {"type": "session_opened", "session_id": str, "resumed": bool,
+#:  "reason"?: "new" | "fork" | "clone" | "switch"}
 #: {"type": "compaction_start", "reason": "manual" | "threshold" | "overflow"}
 #: {"type": "compaction_end", "reason": ..., "compacted": bool, "detail"?: str, "tokens_before"?: int}
 #: {"type": "overflow_retry"}   — overflow compacted; the turn is being retried
 #: {"type": "overflow_give_up"} — recovery attempt exhausted; keeping the failure
+#: {"type": "session_tree", "new_leaf_id": str | None, "old_leaf_id": str | None,
+#:  "summary_entry_id": str | None, "editor_text": str | None}
+#: {"type": "session_info_changed", "name": str}
 SessionListener = Callable[[Dict[str, Any]], Any]
 
 
@@ -177,12 +210,33 @@ class AgentSession:
         if self.session is None:
             self.session = await self.repo.create(JsonlSessionCreateOptions(cwd=self.cwd))
             self.fresh = True
-        if await self.session.branch(self.branch_name) is None:
-            await self.session.create_branch(self.branch_name, None)
+        await self._ensure_branch(self.session)
         await self._reload_context()
         self._emit(
             {"type": "session_opened", "session_id": self.session.metadata.id, "resumed": resumed}
         )
+
+    async def _ensure_branch(self, session: Session) -> None:
+        """Make sure the branch exists and is a configured lane.
+
+        karen-agent's fork only copies *configured* lanes (`pi.lane.config` +
+        `pi.lane.state`); pi's runtime writes the same pair when it binds a
+        session to a model. Existing values are left alone, so an old session
+        gains forkability without losing its recorded model.
+        """
+        if await session.branch(self.branch_name) is None:
+            await session.create_branch(self.branch_name, None)
+        if await session.get_value(lane_config(self.branch_name)) is None:
+            configuration = LaneConfiguration(
+                model=LaneModelRef(provider=self.model.provider, model_id=self.model.id),
+                thinking_level=self.agent.state.thinking_level,
+                active_tool_names=[tool.name for tool in self.tools],
+            )
+            await session.set_value(lane_config(self.branch_name), configuration.model_dump(mode="json", by_alias=True))
+        if await session.get_value(lane_state(self.branch_name)) is None:
+            await session.set_value(
+                lane_state(self.branch_name), LaneState().model_dump(mode="json", by_alias=True)
+            )
 
     async def close(self) -> None:
         if self.session is not None:
@@ -228,6 +282,289 @@ class AgentSession:
         if header is None:
             return None
         return to_jsonable(header)
+
+    # -- session info ------------------------------------------------------------
+
+    async def session_name(self) -> Optional[str]:
+        """The session's display name (pi's `getSessionName`)."""
+        return await self.session.get_name()
+
+    async def set_session_name(self, name: str) -> None:
+        """Name the session (pi's `setSessionName`); empty names are rejected."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Session name cannot be empty")
+        await self.session.set_name(name)
+        self._emit({"type": "session_info_changed", "name": name})
+
+    async def list_sessions(self) -> List[JsonlSessionMetadata]:
+        """Sessions on disk for this cwd, newest first (pi's resume list)."""
+        return await self.repo.list(JsonlSessionListOptions(cwd=self.cwd))
+
+    async def entries(self) -> List[Entry]:
+        """Every entry in the session file, oldest first (pi's `getEntries`)."""
+        return await self.session.find_entries(EntryQuery(order="asc"))
+
+    async def entry_labels(self) -> Dict[str, str]:
+        """Label per entry id (pi's `pi.entry.label` values)."""
+        stored = await self.session.scan_values(Value(namespace="pi.entry.label"))
+        return {item.address.key: item.value for item in stored}
+
+    async def session_tree(self) -> List[TreeNode]:
+        """The session tree roots (pi's `getTree`)."""
+        return build_tree(await self.entries(), await self.entry_labels())
+
+    async def branch_tip_id(self) -> Optional[str]:
+        """The current branch's tip (`leafId` in pi's protocol)."""
+        branch = await self.session.branch(self.branch_name)
+        return await branch.get_tip_id()
+
+    async def branch_tips(self) -> List[str]:
+        """Tip ids of every branch in the session (the tree marks them `○`)."""
+        stored = await self.session.scan_values(branch_tip_inventory_prefix())
+        return [item.value for item in stored if item.value]
+
+    async def session_stats(self) -> Dict[str, Any]:
+        """pi's `getSessionStats`: message breakdown plus token/cost totals.
+
+        Tokens and cost are summed from the entries themselves — assistant and
+        tool-result usage, plus the usage carried by compaction and
+        branch-summary entries, exactly the set pi sums. (karen's stored usage
+        rows hold the same assistant totals, but a fork copies entries and not
+        the usage rows, so entries are the durable source.) pi's `contextUsage`
+        field is not ported.
+        """
+        totals: Dict[str, float] = {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "cost": 0.0,
+        }
+        user_messages = assistant_messages = tool_calls = tool_results = total_messages = 0
+        for entry in await self.entries():
+            entry_type = getattr(entry, "type", None)
+            if entry_type in ("compaction", "branch_summary"):
+                _add_usage(totals, getattr(entry, "usage", None))
+            if entry_type != "message":
+                continue
+            total_messages += 1
+            message = entry.message
+            role = message_field(message, "role")
+            if role == "user":
+                user_messages += 1
+            elif role == "assistant":
+                assistant_messages += 1
+                for block in message_field(message, "content", default=[]) or []:
+                    if message_field(block, "type") == "toolCall":
+                        tool_calls += 1
+                _add_usage(totals, message_field(message, "usage"))
+            elif role == "toolResult":
+                tool_results += 1
+                _add_usage(totals, message_field(message, "usage"))
+        metadata = self.session.metadata
+        return {
+            "sessionFile": getattr(metadata, "path", None),
+            "sessionId": metadata.id,
+            "userMessages": user_messages,
+            "assistantMessages": assistant_messages,
+            "toolCalls": tool_calls,
+            "toolResults": tool_results,
+            "totalMessages": total_messages,
+            "tokens": {
+                "input": totals["input"],
+                "output": totals["output"],
+                "cacheRead": totals["cache_read"],
+                "cacheWrite": totals["cache_write"],
+                "total": totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"],
+            },
+            "cost": totals["cost"],
+        }
+
+    # -- navigation --------------------------------------------------------------
+
+    async def user_messages_for_forking(self) -> List[Dict[str, str]]:
+        """pi's `getUserMessagesForForking`: the fork-selector menu.
+
+        Deviation: only user messages on the current branch are listed. karen's
+        fork copies the branch path (pi's `createBranchedSession` can copy any
+        entry's ancestry), so a message from another branch is not yet a valid
+        target — navigate to that branch first.
+        """
+        branch = await self.session.branch(self.branch_name)
+        entries = await branch.find_entries(BranchScan(order="oldestFirst"))
+        return [
+            {"entryId": entry_id, "text": text}
+            for entry_id, text in forkable_user_messages(entries)
+        ]
+
+    async def navigate_tree(
+        self,
+        target_id: str,
+        *,
+        summarize: bool = False,
+        custom_instructions: Optional[str] = None,
+        replace_instructions: Optional[bool] = None,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Move the branch tip to another entry (pi's `navigateTree`).
+
+        Staying in the same session file, the tip moves to `target_id` — or, for
+        a user message, to its parent, with the message text returned as
+        `editorText` so the caller can put it back in the editor. With
+        `summarize`, the abandoned branch (old tip back to the common ancestor)
+        is condensed into a `branch_summary` entry placed at the new position.
+        """
+        if self.agent.state.is_streaming:
+            raise RuntimeError("Wait for the current response to finish before navigating the session tree.")
+        old_leaf = await self.branch_tip_id()
+        if target_id == old_leaf:
+            return {"cancelled": False, "editorText": None, "summaryEntryId": None}
+        target = await self.session.get_entry(target_id)
+        if target is None:
+            raise ValueError(f"Entry {target_id} not found")
+
+        summary_text: Optional[str] = None
+        summary_details: Optional[Dict[str, Any]] = None
+        summary_usage = None
+        if summarize:
+            branch = await self.session.branch(self.branch_name)
+            collected = await collect_entries_for_branch_summary(branch, self.session, old_leaf, target_id)
+            if collected.entries:
+                options = GenerateBranchSummaryOptions(
+                    models=self.models,
+                    model=self.model,
+                    custom_instructions=custom_instructions,
+                    replace_instructions=replace_instructions,
+                )
+                result = await generate_branch_summary(collected.entries, options)
+                if isinstance(result, Err):
+                    raise RuntimeError(str(result.error))
+                summary_text = result.value.summary
+                summary_usage = result.value.usage
+                summary_details = {
+                    "readFiles": list(result.value.read_files),
+                    "modifiedFiles": list(result.value.modified_files),
+                }
+
+        # pi: a user message navigates to its parent and hands the text back
+        editor_text: Optional[str] = None
+        if target.type == "message" and message_field(target.message, "role") == "user":
+            new_leaf = target.parent_id
+            editor_text = entry_text(target)
+        else:
+            new_leaf = target_id
+
+        summary_entry_id: Optional[str] = None
+        labeled_entry = target_id
+        if summary_text is not None:
+            summary_entry_id = self.session.id_generator.next()
+            labeled_entry = summary_entry_id
+
+        async def apply(mutator) -> None:
+            writes = []
+            leaf = new_leaf
+            if summary_text is not None:
+                writes.append(
+                    insert_entry(
+                        BranchSummaryEntry(
+                            id=summary_entry_id,
+                            parent_id=new_leaf,
+                            summary=summary_text,
+                            details=summary_details,
+                            usage=summary_usage,
+                            from_hook=False,
+                        )
+                    )
+                )
+                leaf = summary_entry_id
+            writes.append(set_value(branch_tip(self.branch_name), leaf))
+            if label:
+                writes.append(set_value(entry_label(labeled_entry), label))
+            await mutator.commit(writes)
+
+        await self.session.mutate(apply)
+        await self._reload_context()
+        self._emit(
+            {
+                "type": "session_tree",
+                "new_leaf_id": await self.branch_tip_id(),
+                "old_leaf_id": old_leaf,
+                "summary_entry_id": summary_entry_id,
+                "editor_text": editor_text,
+            }
+        )
+        return {"cancelled": False, "editorText": editor_text, "summaryEntryId": summary_entry_id}
+
+    async def fork(self, entry_id: Optional[str] = None, *, position: str = "before") -> Dict[str, Any]:
+        """Copy this branch into a new session file and switch to it.
+
+        `position="before"` (pi's fork default) requires `entry_id` to be a user
+        message on the current branch: everything up to its parent is copied and
+        the message text is returned as `selectedText`, ready to edit.
+        `position="at"` copies through the selected entry; with no `entry_id` it
+        copies the whole branch (pi's `clone`).
+        """
+        if position not in ("before", "at"):
+            raise ValueError(f"Invalid fork position: {position!r} (expected 'before' or 'at')")
+        if self.agent.state.is_streaming:
+            raise RuntimeError("Wait for the current response to finish before forking the session.")
+        selected_text: Optional[str] = None
+        if position == "before":
+            entry = await self.session.get_entry(entry_id) if entry_id else None
+            if entry is None or entry.type != "message" or message_field(entry.message, "role") != "user":
+                raise ValueError("Invalid entry ID for forking")
+            selected_text = entry_text(entry)
+        forked = await self.repo.fork(
+            self.session.metadata,
+            BranchForkOptions(branch=self.branch_name, entry_id=entry_id, position=position),
+        )
+        await self._rebind(forked, reason="fork")
+        return {"cancelled": False, "selectedText": selected_text}
+
+    async def clone(self) -> Dict[str, Any]:
+        """Copy the current branch into a new session file (pi's `clone`)."""
+        if await self.branch_tip_id() is None:
+            raise ValueError("Cannot clone session: no current entry selected")
+        return await self.fork(None, position="at")
+
+    async def switch_session(self, metadata: JsonlSessionMetadata) -> None:
+        """Open another on-disk session for this cwd and switch to it."""
+        if self.agent.state.is_streaming:
+            raise RuntimeError("Wait for the current response to finish before switching sessions.")
+        if metadata.id == self.session.metadata.id:
+            return  # already there: reopening an open session file is not allowed
+        await self._rebind(await self.repo.open(metadata), reason="switch")
+
+    async def set_label(self, entry_id: str, label: Optional[str]) -> None:
+        """Attach or clear a tree label on an entry (pi's `appendLabelChange`)."""
+        if await self.session.get_entry(entry_id) is None:
+            raise ValueError(f"Entry {entry_id} not found")
+
+        async def apply(mutator) -> None:
+            await mutator.commit([set_value(entry_label(entry_id), label)])
+
+        await self.session.mutate(apply)
+
+    async def _rebind(self, session: Session, *, reason: str = "new") -> None:
+        """Adopt a different session handle (fork/clone/switch) and reload context."""
+        previous = self.session
+        self.session = session
+        if previous is not None and previous is not session:
+            await previous.close()
+        await self._ensure_branch(session)
+        await self._reload_context()
+        branch = await session.branch(self.branch_name)
+        self._pre_run_tip = await branch.get_tip_id()
+        self._run_entries = []
+        self._emit(
+            {
+                "type": "session_opened",
+                "session_id": session.metadata.id,
+                "resumed": False,
+                "reason": reason,
+            }
+        )
 
     # -- agent passthrough -------------------------------------------------------
 

@@ -1,5 +1,6 @@
 """`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode;
-M5: RPC mode; M6: structured system prompt, context files and skills).
+M5: RPC mode; M6: structured system prompt, context files and skills; M7:
+session navigation — tree, fork, clone, switch).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
@@ -25,6 +26,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from karen_ai import CreateModelsOptions, JsonFileCredentialStore, create_models
@@ -38,6 +40,7 @@ from karen_agent import (
 
 from .agent_session import AgentSession
 from .json_events import to_json_event
+from .navigation import render_tree
 from .prompt import build_system_prompt_sections
 from .resources import (
     DEFAULT_AGENT_DIR,
@@ -63,6 +66,14 @@ HELP_TEXT = """Commands:
   /help                 show this help
   /new                  start a fresh session
   /compact [focus]      compact the context now (optional extra instructions)
+  /tree [id]            show the session tree; with an id, move the branch tip there
+  /tree --summarize <id>  move there and summarize the abandoned branch
+  /fork [n|id]          fork from a user message (lists them when no argument)
+  /clone                copy the current branch into a new session
+  /sessions             list saved sessions for this directory
+  /resume <n|id>        switch to a listed session
+  /name [text]          show or set the session name
+  /session              show session info (id, name, file, messages, tokens, cost)
   /templates            list available prompt templates
   /skills               list available skills
   /quit                 exit
@@ -73,8 +84,9 @@ Anything else is sent to the model."""
 def parse_command(line: str, template_names, skill_names=()):
     """Route one input line. Returns (kind, name, arg_string).
 
-    kind: "quit" | "help" | "new" | "compact" | "templates" | "skills"
-          | "template" | "skill" | "prompt"
+    kind: "quit" | "help" | "new" | "compact" | "tree" | "fork" | "clone"
+          | "sessions" | "resume" | "name" | "session" | "templates"
+          | "skills" | "template" | "skill" | "prompt"
 
     Templates and skills share one `/name` namespace, like pi's slash commands;
     templates win when a name is defined as both.
@@ -93,6 +105,20 @@ def parse_command(line: str, template_names, skill_names=()):
         return "new", None, ""
     if name == "compact":
         return "compact", None, rest
+    if name == "tree":
+        return "tree", None, rest
+    if name == "fork":
+        return "fork", None, rest
+    if name == "clone":
+        return "clone", None, ""
+    if name == "sessions":
+        return "sessions", None, rest
+    if name == "resume":
+        return "resume", None, rest
+    if name == "name":
+        return "name", None, rest
+    if name == "session":
+        return "session", None, ""
     if name == "templates":
         return "templates", None, ""
     if name == "skills":
@@ -211,7 +237,7 @@ class KarenCli:
                 print(json.dumps(event, ensure_ascii=False), flush=True)
             return
         if event_type == "session_opened":
-            kind = "resumed" if event["resumed"] else "new"
+            kind = "resumed" if event["resumed"] else event.get("reason", "new")
             self._tool_line(f"{kind} session {event['session_id']}")
         elif event_type == "compaction_start":
             self._tool_line(f"compacting ({event['reason']}; the model writes a summary)...")
@@ -313,6 +339,166 @@ class KarenCli:
         if restored:
             self._tool_line(f"context restored: {restored} messages, ~{self.session.estimate_tokens()} tokens")
 
+    # -- navigation --------------------------------------------------------------
+
+    async def _handle_navigation(self, kind: str, rest: str) -> None:
+        """Route the `/tree`, `/fork`, `/clone`, `/sessions`, `/resume`, `/name`
+        and `/session` REPL commands (pi's tree/fork/session TUI actions)."""
+        if kind == "tree":
+            await self._handle_tree(rest)
+        elif kind == "fork":
+            await self._handle_fork(rest)
+        elif kind == "clone":
+            await self._handle_clone()
+        elif kind in ("sessions", "resume"):
+            await self._handle_sessions(rest)
+        elif kind == "name":
+            await self._handle_name(rest)
+        else:
+            await self._print_session_info()
+
+    async def _resolve_entry(self, token: str) -> str:
+        """Resolve a full entry id, or a unique prefix/suffix of one.
+
+        Tree lines print the id's *last* 8 characters: karen's uuid7 ids share
+        their timestamp prefix, so the head is not distinguishing.
+        """
+        matches = [
+            entry.id
+            for entry in await self.session.entries()
+            if entry.id.startswith(token) or entry.id.endswith(token)
+        ]
+        if not matches:
+            raise ValueError(f"no entry matches {token!r}")
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous entry prefix {token!r} ({len(matches)} entries)")
+        return matches[0]
+
+    async def _show_tree(self) -> None:
+        roots = await self.session.session_tree()
+        if not roots:
+            print("(empty session tree)")
+            return
+        print(
+            render_tree(
+                roots,
+                leaf_id=await self.session.branch_tip_id(),
+                tips=await self.session.branch_tips(),
+            )
+        )
+        print("● current tip   ○ other branch tips   [label] entry label")
+
+    async def _handle_tree(self, rest: str) -> None:
+        tokens = rest.split()
+        summarize = bool(tokens) and tokens[0] == "--summarize"
+        if summarize:
+            tokens = tokens[1:]
+        if not tokens:
+            await self._show_tree()
+            return
+        target = await self._resolve_entry(tokens[0])
+        result = await self.session.navigate_tree(target, summarize=summarize)
+        if result["summaryEntryId"]:
+            print(f"summarized the abandoned branch into {result['summaryEntryId'][-8:]}")
+        await self._show_tree()
+        if result["editorText"]:
+            print("[message left the branch; send it again to branch off here]")
+            print(result["editorText"])
+
+    async def _handle_fork(self, rest: str) -> None:
+        messages = await self.session.user_messages_for_forking()
+        if not messages:
+            print("nothing to fork from: this session has no user messages yet")
+            return
+        token = rest.split()[0] if rest.split() else ""
+        if not token:
+            for index, item in enumerate(messages, start=1):
+                preview = " ".join(item["text"].split())
+                print(f"  {index}. [{item['entryId'][-8:]}] {preview[:72]}")
+            print("fork from one of these with /fork <n|id>")
+            return
+        if token.isdigit():
+            index = int(token)
+            if not 1 <= index <= len(messages):
+                print(f"[no fork target {index}: choose 1..{len(messages)}]")
+                return
+            entry_id = messages[index - 1]["entryId"]
+        else:
+            entry_id = await self._resolve_entry(token)
+        result = await self.session.fork(entry_id)
+        print(f"forked into session {self.session.session.metadata.id}")
+        if result["selectedText"]:
+            print("[edit and send it again to branch off here]")
+            print(result["selectedText"])
+
+    async def _handle_clone(self) -> None:
+        if await self.session.branch_tip_id() is None:
+            print("[nothing to clone yet: send a message first]")
+            return
+        await self.session.clone()
+        print(f"cloned into session {self.session.session.metadata.id}")
+
+    async def _handle_sessions(self, rest: str) -> None:
+        sessions = await self.session.list_sessions()
+        if not sessions:
+            print(f"no saved sessions for {self.cwd}")
+            return
+        token = rest.split()[0] if rest.split() else ""
+        if not token:
+            current = self.session.session.metadata.id
+            for index, metadata in enumerate(sessions, start=1):
+                marker = "*" if metadata.id == current else " "
+                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(metadata.created_at / 1000))
+                print(f"{marker} {index}. {metadata.id[-8:]}  {stamp}  {metadata.path}")
+            print("switch with /resume <n|id>")
+            return
+        metadata = None
+        if token.isdigit():
+            index = int(token)
+            if 1 <= index <= len(sessions):
+                metadata = sessions[index - 1]
+        else:
+            matches = [m for m in sessions if m.id.startswith(token) or m.id.endswith(token)]
+            if len(matches) > 1:
+                print(f"[ambiguous session id {token!r}]")
+                return
+            metadata = matches[0] if matches else None
+        if metadata is None:
+            print(f"[no session matches {token!r}]")
+            return
+        await self.session.switch_session(metadata)
+        restored = len(self.session.agent.state.messages) - 1
+        print(f"switched to session {metadata.id}")
+        print(f"context restored: {restored} messages, ~{self.session.estimate_tokens()} tokens")
+
+    async def _handle_name(self, rest: str) -> None:
+        if rest:
+            await self.session.set_session_name(rest)
+        name = await self.session.session_name()
+        print(f"session name: {name or '(unnamed)'}")
+
+    async def _print_session_info(self) -> None:
+        stats = await self.session.session_stats()
+        name = await self.session.session_name()
+        tip = await self.session.branch_tip_id()
+        tokens = stats["tokens"]
+        print(f"id: {stats['sessionId']}")
+        print(f"name: {name or '(unnamed)'}")
+        print(f"file: {stats['sessionFile']}")
+        print(f"cwd: {self.cwd}")
+        print(f"branch tip: {tip[-8:] if tip else '(none)'}")
+        print(
+            f"messages: {stats['totalMessages']} "
+            f"({stats['userMessages']} user, {stats['assistantMessages']} assistant, "
+            f"{stats['toolCalls']} tool calls, {stats['toolResults']} tool results)"
+        )
+        print(
+            f"tokens: in {tokens['input']} out {tokens['output']} "
+            f"cache read/write {tokens['cacheRead']}/{tokens['cacheWrite']} "
+            f"total {tokens['total']} | cost {stats['cost']:.4f}"
+        )
+        print(f"context: ~{self.session.estimate_tokens()} tokens")
+
     # -- modes ------------------------------------------------------------------
 
     async def run_print(self, prompts) -> int:
@@ -391,6 +577,12 @@ class KarenCli:
                 continue
             if kind == "compact":
                 await self.session.run_compaction("manual", custom_instructions=rest or None)
+                continue
+            if kind in ("tree", "fork", "clone", "sessions", "resume", "name", "session"):
+                try:
+                    await self._handle_navigation(kind, rest)
+                except Exception as error:  # bad ids, failed forks — keep the REPL alive
+                    print(f"[error: {error}]", file=sys.stderr)
                 continue
             if kind == "template":
                 template = next(t for t in self.templates if t.name == name)

@@ -356,6 +356,12 @@ session = await repo.open(metadata)
 fork = await repo.fork(session.metadata, BranchForkOptions(branch="main", entry_id=entry_id))
 ```
 
+A branch fork only copies a **configured lane**: the source branch needs
+`lane_config(branch)` (`pi.lane.config`) and `lane_state(branch)`
+(`pi.lane.state`) values, and forks of entries outside the branch tip's
+ancestry are rejected. pi's runtime writes that pair when it binds a session
+to a model — karen-coding-agent's `AgentSession` does the same on open/rebind.
+
 - **Storage model**: every commit is one JSONL line — entries (`message` / `compaction` /
   `branch_summary` / `custom`), usage rows, scalar value set/delete, list append/delete.
   All writes go through a per-session `MutationLine`; a mutator allows exactly one commit.

@@ -3,6 +3,7 @@ print/JSON modes — all driven by the scripted faux provider, no network."""
 
 import io
 import json
+import os
 import sys
 
 import pytest
@@ -39,6 +40,18 @@ def test_parse_template_invocation():
     assert karen_cli.parse_command("/review a.py b.py", {"review"}) == ("template", "review", "a.py b.py")
     # unknown slash commands are sent to the model verbatim
     assert karen_cli.parse_command("/nope x", {"review"}) == ("prompt", None, "/nope x")
+
+
+def test_parse_navigation_commands():
+    assert karen_cli.parse_command("/tree", set()) == ("tree", None, "")
+    assert karen_cli.parse_command("/tree --summarize ab12", set()) == ("tree", None, "--summarize ab12")
+    assert karen_cli.parse_command("/fork", set()) == ("fork", None, "")
+    assert karen_cli.parse_command("/fork 2", set()) == ("fork", None, "2")
+    assert karen_cli.parse_command("/clone", set()) == ("clone", None, "")
+    assert karen_cli.parse_command("/sessions", set()) == ("sessions", None, "")
+    assert karen_cli.parse_command("/resume abc123", set()) == ("resume", None, "abc123")
+    assert karen_cli.parse_command("/name my task", set()) == ("name", None, "my task")
+    assert karen_cli.parse_command("/session", set()) == ("session", None, "")
 
 
 def test_parse_skill_invocation():
@@ -314,3 +327,179 @@ def test_repl_skill_listing_and_invocation(tmp_path, monkeypatch, capsys, faux_m
     transcript = session_files[0].read_text(encoding="utf-8")
     assert 'skill name=' in transcript and "be nice" in transcript
     assert "Greet the user." in transcript
+
+
+# ---------------------------------------------------------------------------
+# session navigation in the REPL (M7)
+# ---------------------------------------------------------------------------
+
+
+async def _nav_cli(tmp_path, monkeypatch, responses):
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory(responses))
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    cli = karen_cli.KarenCli(cwd=str(tmp_path), model_id="faux-1", fresh=True, provider="faux")
+    await cli._open_session(fresh=True)
+    return cli
+
+
+async def test_cli_tree_command_renders_and_navigates(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(
+        tmp_path,
+        monkeypatch,
+        [faux_assistant_message("first reply"), faux_assistant_message("second reply")],
+    )
+    await cli.session.prompt("first question")
+    await cli.session.prompt("second question")
+    entries = await cli.session.entries()
+    capsys.readouterr()
+
+    await cli._handle_tree("")
+
+    listed = capsys.readouterr().out
+    assert "user: first question" in listed
+    assert "assistant: second reply" in listed
+    assert "● current tip" in listed
+
+    await cli._handle_tree(entries[2].id[-8:])
+
+    after = capsys.readouterr().out
+    assert "second question" in after  # the message came back for editing
+    assert await cli.session.branch_tip_id() == entries[1].id
+    await cli.session.close()
+
+
+async def test_cli_tree_reports_bad_ids(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(
+        tmp_path,
+        monkeypatch,
+        [faux_assistant_message("first reply"), faux_assistant_message("second reply")],
+    )
+    await cli.session.prompt("first question")
+    await cli.session.prompt("second question")
+    ids = [entry.id for entry in await cli.session.entries()]
+    shared = os.path.commonprefix(ids)
+    capsys.readouterr()
+
+    with pytest.raises(ValueError, match="no entry matches"):
+        await cli._handle_tree("zzzzzzzz")
+
+    assert len(shared) >= 1
+    with pytest.raises(ValueError, match="ambiguous entry prefix"):
+        await cli._handle_tree(shared)
+
+    # the tip never moved
+    assert await cli.session.branch_tip_id() == ids[-1]
+    await cli.session.close()
+
+
+def test_repl_keeps_running_after_a_bad_tree_id(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("question\n/tree zzzzzzzz\n/quit\n"))
+
+    exit_code = karen_cli.main(["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "pong" in captured.out
+    assert "[error: no entry matches" in captured.err
+
+
+async def test_cli_resolve_entry_reports_bad_prefixes(tmp_path, monkeypatch):
+    cli = await _nav_cli(tmp_path, monkeypatch, [faux_assistant_message("reply")])
+    await cli.session.prompt("question")
+
+    with pytest.raises(ValueError, match="no entry matches"):
+        await cli._resolve_entry("zzzzzzzz")
+
+    entry = (await cli.session.entries())[0]
+    assert await cli._resolve_entry(entry.id[-8:]) == entry.id
+    assert await cli._resolve_entry(entry.id) == entry.id
+    await cli.session.close()
+
+
+async def test_cli_fork_lists_targets_and_forks(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(
+        tmp_path,
+        monkeypatch,
+        [faux_assistant_message("first reply"), faux_assistant_message("second reply")],
+    )
+    await cli.session.prompt("first question")
+    await cli.session.prompt("second question")
+    original_id = cli.session.session.metadata.id
+    capsys.readouterr()
+
+    await cli._handle_fork("")
+
+    listed = capsys.readouterr().out
+    assert "1. [" in listed and "first question" in listed
+    assert "fork from one of these with /fork <n|id>" in listed
+
+    await cli._handle_fork("2")
+
+    after = capsys.readouterr().out
+    assert "forked into session" in after
+    assert "second question" in after  # pi hands the message back for editing
+    assert cli.session.session.metadata.id != original_id
+    assert len(await cli.session.entries()) == 2
+    await cli.session.close()
+
+
+async def test_cli_clone_and_resume_round_trip(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(tmp_path, monkeypatch, [faux_assistant_message("reply")])
+    await cli.session.prompt("question")
+    original_id = cli.session.session.metadata.id
+    capsys.readouterr()
+
+    await cli._handle_clone()
+
+    cloned_id = cli.session.session.metadata.id
+    assert cloned_id != original_id
+    assert "cloned into session" in capsys.readouterr().out
+
+    await cli._handle_sessions("")
+
+    listed = capsys.readouterr().out
+    assert "switch with /resume <n|id>" in listed
+    assert f"* 1. {cloned_id[-8:]}" in listed  # newest first, current marked
+    assert original_id[-8:] in listed
+
+    await cli._handle_sessions("2")
+
+    after = capsys.readouterr().out
+    assert f"switched to session {original_id}" in after
+    assert cli.session.session.metadata.id == original_id
+    await cli.session.close()
+
+
+async def test_cli_clone_without_entries_hints(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(tmp_path, monkeypatch, [])
+    capsys.readouterr()
+
+    await cli._handle_clone()
+
+    assert "nothing to clone yet" in capsys.readouterr().out
+    await cli.session.close()
+
+
+async def test_cli_name_and_session_info(tmp_path, monkeypatch, capsys):
+    cli = await _nav_cli(tmp_path, monkeypatch, [faux_assistant_message("reply")])
+    await cli.session.prompt("question")
+    capsys.readouterr()
+
+    await cli._handle_name("")
+
+    assert "session name: (unnamed)" in capsys.readouterr().out
+
+    await cli._handle_name("release prep")
+
+    assert "session name: release prep" in capsys.readouterr().out
+
+    await cli._print_session_info()
+
+    info = capsys.readouterr().out
+    assert f"id: {cli.session.session.metadata.id}" in info
+    assert "name: release prep" in info
+    assert "messages: 2 (1 user, 1 assistant, 0 tool calls, 0 tool results)" in info
+    assert "context: ~" in info
+    await cli.session.close()

@@ -356,3 +356,170 @@ async def test_rpc_set_model_and_available_models(tmp_path):
     assert switched["success"] is True
     assert session.model.id == "faux-2"
     await session.close()
+
+
+# ---------------------------------------------------------------------------
+# session navigation (M7)
+# ---------------------------------------------------------------------------
+
+
+async def _two_turn_server(tmp_path):
+    session = await _make_session(
+        tmp_path, [faux_assistant_message("first reply"), faux_assistant_message("second reply")]
+    )
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()  # `run()` does this first; session events reach the wire through it
+    for message in ("first question", "second question"):
+        await server.handle_command({"type": "prompt", "message": message})
+        await server.wait_for_idle()
+    return session, server, lines
+
+
+def _headers(lines):
+    return [json.loads(line) for line in lines if json.loads(line).get("kind") == "header"]
+
+
+def _deepest(tree_node):
+    while tree_node["children"]:
+        tree_node = tree_node["children"][0]
+    return tree_node
+
+
+async def test_rpc_get_tree_and_get_entries_with_since(tmp_path):
+    session, server, _lines = await _two_turn_server(tmp_path)
+
+    tree = await server.handle_command({"type": "get_tree"})
+    roots = tree["data"]["tree"]
+    assert len(roots) == 1
+    leaf_id = tree["data"]["leafId"]
+    assert leaf_id == _deepest(roots[0])["entry"]["id"]
+
+    entries = await server.handle_command({"type": "get_entries"})
+    ids = [entry["id"] for entry in entries["data"]["entries"]]
+    assert entries["data"]["leafId"] == leaf_id == ids[-1]
+    assert entries["data"]["entries"][0]["type"] == "message"
+
+    since = await server.handle_command({"type": "get_entries", "since": ids[0]})
+    assert [entry["id"] for entry in since["data"]["entries"]] == ids[1:]
+
+    missing = await server.handle_command({"type": "get_entries", "since": "nope"})
+    assert missing["success"] is False and "Entry not found" in missing["error"]
+    await session.close()
+
+
+async def test_rpc_get_fork_messages_and_fork(tmp_path):
+    session, server, lines = await _two_turn_server(tmp_path)
+    original_id = session.session.metadata.id
+
+    messages = await server.handle_command({"type": "get_fork_messages"})
+    assert [m["text"] for m in messages["data"]["messages"]] == ["first question", "second question"]
+
+    lines.clear()
+    forked = await server.handle_command(
+        {"type": "fork", "entryId": messages["data"]["messages"][1]["entryId"]}
+    )
+
+    assert forked["data"] == {"text": "second question", "cancelled": False}
+    assert session.session.metadata.id != original_id
+    assert _headers(lines)[0]["id"] == session.session.metadata.id
+    entries = (await server.handle_command({"type": "get_entries"}))["data"]["entries"]
+    # the fork stops before the second question: just the first turn is copied
+    assert len(entries) == 2
+    assert entries[0]["id"] == messages["data"]["messages"][0]["entryId"]
+    await session.close()
+
+
+async def test_rpc_fork_rejects_non_user_entries(tmp_path):
+    session, server, _lines = await _two_turn_server(tmp_path)
+    entries = (await server.handle_command({"type": "get_entries"}))["data"]["entries"]
+
+    reply = await server.handle_command({"type": "fork", "entryId": entries[1]["id"]})
+    assert reply["success"] is False and "Invalid entry ID for forking" in reply["error"]
+
+    bad_position = await server.handle_command(
+        {"type": "fork", "entryId": entries[0]["id"], "position": "sideways"}
+    )
+    assert bad_position["success"] is False and "Invalid fork position" in bad_position["error"]
+    await session.close()
+
+
+async def test_rpc_fork_at_position_copies_through_the_entry(tmp_path):
+    session, server, _lines = await _two_turn_server(tmp_path)
+    entries = (await server.handle_command({"type": "get_entries"}))["data"]["entries"]
+
+    at = await server.handle_command({"type": "fork", "entryId": entries[1]["id"], "position": "at"})
+
+    assert at["success"] is True and at["data"]["text"] is None
+    cloned = (await server.handle_command({"type": "get_entries"}))["data"]["entries"]
+    assert [entry["id"] for entry in cloned] == [entries[0]["id"], entries[1]["id"]]
+    await session.close()
+
+
+async def test_rpc_clone_copies_the_current_branch(tmp_path):
+    session, server, lines = await _two_turn_server(tmp_path)
+    original_id = session.session.metadata.id
+    entries = (await server.handle_command({"type": "get_entries"}))["data"]["entries"]
+
+    lines.clear()
+    cloned = await server.handle_command({"type": "clone"})
+
+    assert cloned["data"] == {"cancelled": False}
+    assert session.session.metadata.id != original_id
+    after = (await server.handle_command({"type": "get_entries"}))["data"]
+    assert [entry["id"] for entry in after["entries"]] == [entry["id"] for entry in entries]
+    assert after["leafId"] == entries[-1]["id"]
+    assert _headers(lines)
+    await session.close()
+
+
+async def test_rpc_switch_session_by_path_and_id(tmp_path):
+    session, server, _lines = await _two_turn_server(tmp_path)
+    first_id = session.session.metadata.id
+    first_path = session.session.metadata.path
+    await server.handle_command({"type": "clone"})
+    clone_id = session.session.metadata.id
+
+    switched = await server.handle_command({"type": "switch_session", "sessionPath": first_path})
+
+    assert switched["data"] == {"cancelled": False}
+    assert session.session.metadata.id == first_id
+    # a bare session id works too
+    by_id = await server.handle_command({"type": "switch_session", "sessionPath": clone_id})
+    assert by_id["success"] is True and session.session.metadata.id == clone_id
+
+    # switching to the session that is already open is a no-op, not an error
+    same = await server.handle_command({"type": "switch_session", "sessionPath": clone_id})
+    assert same["success"] is True and session.session.metadata.id == clone_id
+
+    missing = await server.handle_command({"type": "switch_session", "sessionPath": "nowhere.jsonl"})
+    assert missing["success"] is False and "Session not found" in missing["error"]
+
+    no_arg = await server.handle_command({"type": "switch_session"})
+    assert no_arg["success"] is False and "sessionPath is required" in no_arg["error"]
+    await session.close()
+
+
+async def test_rpc_set_session_name_and_session_stats(tmp_path):
+    session, server, lines = await _two_turn_server(tmp_path)
+
+    lines.clear()
+    named = await server.handle_command({"type": "set_session_name", "name": "  release prep  "})
+
+    assert named["success"] is True
+    assert {"type": "session_info_changed", "name": "release prep"} in [
+        json.loads(line) for line in lines
+    ]
+    assert await session.session_name() == "release prep"
+
+    empty = await server.handle_command({"type": "set_session_name", "name": "   "})
+    assert empty["success"] is False and "cannot be empty" in empty["error"]
+
+    stats = await server.handle_command({"type": "get_session_stats"})
+    data = stats["data"]
+    assert data["sessionId"] == session.session.metadata.id
+    assert data["userMessages"] == 2 and data["assistantMessages"] == 2
+    assert data["totalMessages"] == 4 and data["toolResults"] == 0
+    assert set(data["tokens"]) == {"input", "output", "cacheRead", "cacheWrite", "total"}
+    assert isinstance(data["cost"], (int, float))
+    await session.close()

@@ -301,3 +301,256 @@ def test_overflow_action_ignores_user_messages(session):
     from karen_ai import UserMessage
 
     assert session._overflow_action(UserMessage(content="hi", timestamp=1)) is None
+
+
+# ---------------------------------------------------------------------------
+# session navigation (M7)
+# ---------------------------------------------------------------------------
+
+
+async def _two_turn_session(tmp_path):
+    models, registration = _models_with_faux(
+        [faux_assistant_message("first reply"), faux_assistant_message("second reply")]
+    )
+    session = await _open(tmp_path, models, registration)
+    await session.prompt("first question")
+    await session.prompt("second question")
+    return session, registration
+
+
+def _texts(messages):
+    return [m.content[0].text for m in messages if getattr(m, "content", None)]
+
+
+async def test_navigate_tree_moves_the_tip_without_dropping_entries(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    entries = await session.entries()
+    first_reply = entries[1]
+
+    result = await session.navigate_tree(first_reply.id)
+
+    assert result == {"cancelled": False, "editorText": None, "summaryEntryId": None}
+    assert await session.branch_tip_id() == first_reply.id
+    # context is rebuilt from the new ancestry; the file keeps every entry
+    assert _texts(session.agent.state.messages[1:]) == ["first question", "first reply"]
+    assert [entry.id for entry in await session.entries()] == [entry.id for entry in entries]
+    await session.close()
+
+
+async def test_navigate_tree_on_a_user_message_returns_its_text(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    second_question = (await session.entries())[2]
+
+    result = await session.navigate_tree(second_question.id)
+
+    assert result["editorText"] == "second question"
+    assert await session.branch_tip_id() == second_question.parent_id
+    assert _texts(session.agent.state.messages[1:]) == ["first question", "first reply"]
+    await session.close()
+
+
+async def test_navigate_tree_to_the_first_user_message_resets_the_tip(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    first_question = (await session.entries())[0]
+
+    result = await session.navigate_tree(first_question.id)
+
+    assert result["editorText"] == "first question"
+    assert await session.branch_tip_id() is None
+    assert len(session.agent.state.messages) == 1  # just the seeded system message
+    await session.close()
+
+
+async def test_navigate_tree_is_a_noop_at_the_current_tip(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    tip = await session.branch_tip_id()
+
+    result = await session.navigate_tree(tip)
+
+    assert result == {"cancelled": False, "editorText": None, "summaryEntryId": None}
+    assert await session.branch_tip_id() == tip
+    await session.close()
+
+
+async def test_navigate_tree_rejects_unknown_ids(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    with pytest.raises(ValueError, match="not found"):
+        await session.navigate_tree("missing-entry")
+    await session.close()
+
+
+async def test_navigate_tree_summarizes_the_abandoned_branch(tmp_path):
+    models, registration = _models_with_faux(
+        [
+            faux_assistant_message("first reply"),
+            faux_assistant_message("second reply"),
+            faux_assistant_message("branch summary text"),
+        ]
+    )
+    events = []
+    session = await _open(tmp_path, models, registration, listener=events.append)
+    await session.prompt("first question")
+    await session.prompt("second question")
+    entries = await session.entries()
+
+    result = await session.navigate_tree(entries[1].id, summarize=True, label="kept")
+
+    summary_id = result["summaryEntryId"]
+    assert summary_id
+    assert await session.branch_tip_id() == summary_id
+    summary_entry = await session.session.get_entry(summary_id)
+    assert summary_entry.type == "branch_summary"
+    assert "branch summary text" in summary_entry.summary  # karen wraps it in pi's branch-summary preamble
+    assert summary_entry.parent_id == entries[1].id
+    assert summary_entry.from_hook is False
+    assert (await session.entry_labels())[summary_id] == "kept"
+    tree_events = [e for e in events if e.get("type") == "session_tree"]
+    assert tree_events[-1]["new_leaf_id"] == summary_id
+    assert tree_events[-1]["old_leaf_id"] == entries[3].id
+    await session.close()
+
+
+async def test_session_tree_and_labels(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    entries = await session.entries()
+    await session.set_label(entries[1].id, "checkpoint")
+
+    roots = await session.session_tree()
+
+    assert [root.entry.id for root in roots] == [entries[0].id]
+    assert roots[0].label is None
+    assert roots[0].children[0].label == "checkpoint"
+    assert roots[0].children[0].children[0].entry.id == entries[2].id
+    with pytest.raises(ValueError, match="not found"):
+        await session.set_label("missing-entry", "nope")
+    await session.close()
+
+
+async def test_session_name_round_trip(tmp_path):
+    events = []
+    session, _ = await _two_turn_session(tmp_path)
+    session._listener = events.append
+
+    assert await session.session_name() is None
+    await session.set_session_name("  my session  ")
+
+    assert await session.session_name() == "my session"
+    assert events[-1] == {"type": "session_info_changed", "name": "my session"}
+    with pytest.raises(ValueError, match="empty"):
+        await session.set_session_name("   ")
+    await session.close()
+
+
+async def test_session_stats_count_messages_tokens_and_cost(tmp_path):
+    from karen_ai import Usage, UsageCost
+
+    reply = faux_assistant_message("hi").model_copy(
+        update={"usage": Usage(input=10, output=5, total_tokens=15, cost=UsageCost(total=0.25))}
+    )
+    models, registration = _models_with_faux([reply])
+    session = await _open(tmp_path, models, registration)
+    await session.prompt("hello")
+
+    stats = await session.session_stats()
+
+    assert stats["sessionId"] == session.session.metadata.id
+    assert stats["sessionFile"].endswith(".jsonl")
+    assert stats["userMessages"] == 1
+    assert stats["assistantMessages"] == 1
+    assert stats["totalMessages"] == 2
+    assert stats["toolCalls"] == 0
+    assert stats["tokens"]["input"] == 10
+    assert stats["tokens"]["output"] == 5
+    assert stats["tokens"]["total"] == 15
+    assert stats["cost"] == pytest.approx(0.25)
+    await session.close()
+
+
+async def test_user_messages_for_forking_lists_the_prompts(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+
+    messages = await session.user_messages_for_forking()
+
+    assert [m["text"] for m in messages] == ["first question", "second question"]
+    assert all(m["entryId"] for m in messages)
+    await session.close()
+
+
+async def test_fork_copies_the_branch_before_a_user_message(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    original_id = session.session.metadata.id
+    entries = await session.entries()
+    second_question = entries[2]
+
+    result = await session.fork(second_question.id, position="before")
+
+    assert result["selectedText"] == "second question"
+    assert session.session.metadata.id != original_id
+    assert session.session.metadata.parent_session_id == original_id
+    assert [entry.id for entry in await session.entries()] == [entry.id for entry in entries[:2]]
+    assert _texts(session.agent.state.messages[1:]) == ["first question", "first reply"]
+    # both sessions are on disk, and the fork got its own file
+    assert len(await session.list_sessions()) == 2
+    await session.close()
+
+
+async def test_fork_before_rejects_non_user_entries(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    original_id = session.session.metadata.id
+    first_reply = (await session.entries())[1]
+
+    with pytest.raises(ValueError, match="Invalid entry ID for forking"):
+        await session.fork(first_reply.id, position="before")
+
+    assert session.session.metadata.id == original_id  # nothing was forked
+    await session.close()
+
+
+async def test_fork_at_an_entry_keeps_it(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    entries = await session.entries()
+    first_reply = entries[1]
+
+    result = await session.fork(first_reply.id, position="at")
+
+    assert result["selectedText"] is None
+    assert [entry.id for entry in await session.entries()] == [entry.id for entry in entries[:2]]
+    assert await session.branch_tip_id() == first_reply.id
+    await session.close()
+
+
+async def test_clone_copies_the_whole_branch(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    original_id = session.session.metadata.id
+    entries = await session.entries()
+
+    await session.clone()
+
+    assert session.session.metadata.id != original_id
+    assert session.session.metadata.parent_session_id == original_id
+    assert [entry.id for entry in await session.entries()] == [entry.id for entry in entries]
+    assert await session.branch_tip_id() == entries[-1].id
+    await session.close()
+
+
+async def test_switch_session_reopens_another_session(tmp_path):
+    session, _ = await _two_turn_session(tmp_path)
+    first_id = session.session.metadata.id
+
+    await session.clone()
+    second_id = session.session.metadata.id
+    assert second_id != first_id
+    target = next(m for m in await session.list_sessions() if m.id == first_id)
+
+    await session.switch_session(target)
+
+    assert session.session.metadata.id == first_id
+    assert _texts(session.agent.state.messages[1:]) == [
+        "first question",
+        "first reply",
+        "second question",
+        "second reply",
+    ]
+    # the clone survives on disk
+    assert second_id in [m.id for m in await session.list_sessions()]
+    await session.close()

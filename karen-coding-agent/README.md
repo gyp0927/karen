@@ -3,8 +3,8 @@
 The `karen` CLI coding assistant — the application layer on top of
 [karen-agent](../karen-agent), and the karen equivalent of
 [`@earendil-works/pi`](https://github.com/earendil-works/pi)'s
-`packages/coding-agent` (much smaller scope: no TUI, RPC, MCP, or extensions
-yet — see the milestone list).
+`packages/coding-agent` (much smaller scope: no TUI, MCP, or extensions yet —
+see the milestone list).
 
 ## M1: AgentSession + CLI
 
@@ -43,8 +43,9 @@ await session.close()
 - **Hooks**: a `HookRegistry` is bridged into the agent's
   `before_tool_call`/`after_tool_call`, and `before_compaction` can decline
   or replace any compaction.
-- **Lifecycle events** for the UI via `listener`: `session_opened`,
-  `compaction_start`/`compaction_end`, `overflow_retry`, `overflow_give_up`.
+- **Lifecycle events** for the UI via `listener`: `session_opened` (with the
+  `new`/`fork`/`clone`/`switch` reason), `compaction_start`/`compaction_end`,
+  `overflow_retry`, `overflow_give_up`, `session_tree`, `session_info_changed`.
 
 Simplifications vs pi (documented at the port sites): no settings manager on
 the session itself (the CLI loads the settings files, see M4), no session
@@ -79,11 +80,14 @@ printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive i
   yet.
 - Sessions live under `~/.karen/sessions` (override with
   `KAREN_SESSIONS_ROOT`), resumed per working directory; `/new` starts fresh.
-- Slash commands: `/help`, `/new`, `/compact [focus]`, `/templates`,
-  `/skills`, `/quit`; `/name args...` invokes a prompt template from
-  `.karen/prompts` (project) or `~/.karen/prompts` (user), with
+- Slash commands: `/help`, `/new`, `/compact [focus]`, `/tree [--summarize]
+  [id]`, `/fork [n|<id>]`, `/clone`, `/sessions`, `/resume <n|id>`,
+  `/name [text]`, `/session`, `/templates`, `/skills`, `/quit` (the session
+  navigation set arrived in M7); `/<template> args...` invokes a prompt
+  template from `.karen/prompts` (project) or `~/.karen/prompts` (user), with
   `$1`/`$@`/`${@:N:L}` substitution, or a skill from `.karen/skills` /
-  `~/.karen/skills` (see M6).
+  `~/.karen/skills` (see M6). Built-in command names win over templates and
+  skills of the same name, like pi's built-in slash commands.
 - Ctrl-C aborts the running turn (`agent.abort()` + `wait_for_idle()`).
 
 Credentials come from `~/.karen/credentials.json` (override with
@@ -201,12 +205,13 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
 - **`set_auto_compaction`** gates the post-run threshold check only; overflow
   recovery (compact-and-retry) always runs. Manual `compact` answers
   `{"compacted": bool}`.
-- `get_entries` answers branch entry *ids* + `leafId` instead of pi's
-  `SessionEntry` objects (karen's AgentSession emits no entry events).
+- `get_entries` answers the session's entries (with `since` slicing after a
+  named entry); M7 turned the earlier id-only shape into pi's entry objects.
 - Not ported: the thinking-level commands, auto-retry, pi's bash side
-  channel, fork/clone/switch/export-html/session-stats, `get_commands` and
-  the extension UI sub-protocol (karen has no extensions or TUI yet), and
-  image inputs on `prompt`/`steer`/`follow_up`.
+  channel, export-html, `get_commands` and the extension UI sub-protocol
+  (karen has no extensions or TUI yet), and image inputs on
+  `prompt`/`steer`/`follow_up`. Fork/clone/switch/session-stats arrived in M7
+  (see below).
 
 Verified against real DeepSeek over real stdio: header → `prompt` → full event
 stream → `get_last_assistant_text` = `"RPC-OK"`, model switching,
@@ -254,11 +259,73 @@ Verified against real DeepSeek: an AGENTS.md rule and an `APPEND_SYSTEM.md`
 rule both showed up in the reply, and `/token-skill please` made the model
 answer with the skill's mandated token.
 
+## M7: session navigation (tree, fork, clone, switch)
+
+`src/karen_coding_agent/navigation.py` holds the pure helpers (pi's
+`SessionManager.getTree` plus the fork-selector views) and `AgentSession`
+gained the operations pi's `navigateTree`/runtime fork/clone/switch perform.
+
+- **Tree** (`session_tree()`, `render_tree`): every entry becomes a node,
+  children oldest-first, entries whose parent is not in the file become roots
+  (pi's orphan rule). `/tree` renders it — `●` current tip, `○` other branch
+  tips, `·` interior nodes, `[label]` for labelled entries. Lines show the
+  id's **last** 8 characters (karen's uuid7 ids share a long timestamp
+  prefix, so the head does not distinguish entries); ids resolve by full id,
+  unique prefix or unique suffix.
+- **`navigate_tree(targetId)`** moves the branch tip inside the same session
+  file, exactly like pi: a no-op at the current tip; a user message moves the
+  tip to its parent and returns the text as `editorText` for editing; any
+  other entry becomes the tip. `summarize=True` condenses the abandoned
+  branch (old tip back to the common ancestor) into a `branch_summary` entry
+  placed at the *target* position, with `label` attaching a tree label to it.
+  Context is rebuilt from the new ancestry; rewound entries stay in the file
+  and reappear as siblings/orphans in the tree.
+- **Fork / clone** (`fork()`, `clone()`): a fork copies the current branch
+  into a new session file and rebinds to it, recording the source as the new
+  header's `parent_session_id`; `position="before"` (pi's default) requires a
+  user message and returns its text as `selectedText`, `position="at"` copies
+  through the selected entry, and `clone()` is `at` on the tip. Deviation:
+  only entries on the *current* branch can be forked (karen-agent's fork
+  copies a branch path, pi's `createBranchedSession` copies any entry's
+  ancestry), so `user_messages_for_forking()` lists the current branch's
+  user messages — navigate to another branch first to fork off it.
+- **Switch** (`list_sessions()`, `switch_session(metadata)`): opens another
+  session file for the same cwd and rebinds; switching to the open session is
+  a no-op. **`session_stats()`** ports pi's `getSessionStats` (user/
+  assistant/tool-call/tool-result counts, token totals, cost) summed from the
+  entries — a fork copies entries, not karen's usage rows — omitting pi's
+  `contextUsage`.
+- **Names and labels**: `set_session_name` / `session_name` (pi's
+  `pi.session.name` value, empty names rejected) and `set_label`
+  (`pi.entry.label`). Because karen's fork only copies *configured lanes*,
+  `open()`/`_rebind()` now write the branch's `pi.lane.config`/`pi.lane.state`
+  pair (model, thinking level, tool names) when they are missing — the same
+  binding pi's runtime performs — leaving existing values untouched.
+- **REPL**: `/tree [--summarize] [id]`, `/fork [n|<id>]` (lists the forkable
+  user messages, then reprints the text to edit), `/clone`, `/sessions`,
+  `/resume <n|id>`, `/name [text]`, `/session`.
+- **RPC**: `get_tree`, `get_fork_messages`, `fork` (`entryId`, optional
+  `position`), `clone`, `switch_session` (`sessionPath`, absolute path or
+  bare id), `set_session_name`, `get_session_stats`; `get_entries` now
+  returns the entries themselves and honours `since`. `session_tree` and
+  `session_info_changed` are forwarded on the event stream, and every command
+  that replaces the session re-emits the JSONL header line.
+- Not ported: pi's `/import` (JSONL import), HTML export, and the interactive
+  full-screen tree/fork selector (karen's REPL takes ids and indices); the new
+  built-in command names shadow templates or skills of the same name.
+
+Verified against real DeepSeek: a two-turn session rendered its tree; a fork
+reproduced the first turn in a new file with `parent_session_id` set;
+`/tree --summarize` had the model write a real branch summary that appeared
+in the context as a `branchSummary` message; navigating onto a user message
+returned its text and emptied the context; clone and switch round-tripped;
+and the RPC surface answered `get_tree`/`fork`/`clone`/`switch_session`/
+`get_session_stats` over real stdio with a header per session.
+
 ## Roadmap
 
 Later milestones (tracked in the repo root README): extensions / MCP / TUI /
-image input / session navigation (fork, clone, tree, switch) / auto-retry
-(unscheduled).
+image input / auto-retry (unscheduled).
 
 ## Development
 

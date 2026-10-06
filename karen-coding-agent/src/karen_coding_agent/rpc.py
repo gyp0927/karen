@@ -13,17 +13,25 @@ Ported commands — the subset karen's AgentSession/Agent can serve:
     prompt, steer, follow_up, abort, clear_queue, new_session,
     get_state, set_model, set_steering_mode, set_follow_up_mode,
     get_available_models, get_messages, get_last_assistant_text,
-    get_entries, compact, set_auto_compaction
+    get_entries, get_tree, get_fork_messages, fork, clone,
+    switch_session, set_session_name, get_session_stats,
+    compact, set_auto_compaction
 
 Deviations from pi (all documented here and in the README):
-- the thinking-level commands, auto-retry, bash, fork/clone/switch,
-  session-stats/export-html, get_commands and the extension UI
-  sub-protocol are out of scope (karen has no extensions/TUI yet and no
-  bash-executor side channel).
+- the thinking-level commands, auto-retry, bash, export-html, get_commands
+  and the extension UI sub-protocol are out of scope (karen has no
+  extensions/TUI yet and no bash-executor side channel).
 - `images` on prompt/steer/follow_up are not accepted (karen's app layer
   does not wire image input yet).
-- `get_entries` returns branch entry ids instead of pi's SessionEntry
-  objects (karen's AgentSession emits no entry_appended events).
+- `get_entries` returns karen's session entries (ids, types and message
+  payloads) rather than pi's `SessionEntry` objects; `since` slices after
+  the named entry, like pi.
+- `get_session_stats` omits pi's `contextUsage` object.
+- `fork` accepts an optional `position` ("before", the default, or "at"),
+  so clone-like forks over other entry types work; `clone` is the same
+  operation pinned to the current tip.
+- `switch_session` matches `sessionPath` against this cwd's session files
+  by absolute path, and also accepts a bare session id.
 - `new_session` starts a brand-new session for the cwd; `parentSession`
   is not supported.
 - `prompt` reports `started`/`queued` at command time (pi resolves the
@@ -37,20 +45,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
 from karen_ai import TextContent, UserMessage
 from karen_agent.messages import message_field
-from karen_agent.session import BranchScan
 from karen_agent.session.jsonl import to_jsonable
 from karen_agent.types import AgentMessage
 
 from .agent_session import AgentSession
 from .json_events import to_json_event
+from .navigation import TreeNode
 
 _UNSET = object()
+
+#: Session lifecycle events the RPC stream forwards (pi forwards every session
+#: event; karen's `session_opened` is covered by the JSONL header line).
+_FORWARDED_SESSION_EVENTS = (
+    "compaction_start",
+    "compaction_end",
+    "overflow_retry",
+    "overflow_give_up",
+    "session_tree",
+    "session_info_changed",
+)
 
 
 def _success(command_id: Optional[str], command: str, data: Any = _UNSET) -> Dict[str, Any]:
@@ -169,7 +189,7 @@ class RpcServer:
             self.is_compacting = True
         elif event_type == "compaction_end":
             self.is_compacting = False
-        if event_type in ("compaction_start", "compaction_end", "overflow_retry", "overflow_give_up"):
+        if event_type in _FORWARDED_SESSION_EVENTS:
             self._out(event)
 
     def _emit_header(self) -> None:
@@ -289,11 +309,71 @@ class RpcServer:
             text = _last_assistant_text(self.session.agent.state.messages)
             return _success(command_id, "get_last_assistant_text", {"text": text})
         if command_type == "get_entries":
-            branch = await self.session.session.branch(self.session.branch_name)
-            entries = await branch.find_entries(BranchScan(order="oldestFirst"))
-            ids = [entry.id for entry in entries if entry.type in ("message", "compaction")]
-            tip = await branch.get_tip_id()
-            return _success(command_id, "get_entries", {"entries": ids, "leafId": tip})
+            entries = await self.session.entries()
+            since = raw.get("since")
+            if since is not None:
+                index = next((i for i, entry in enumerate(entries) if entry.id == since), -1)
+                if index == -1:
+                    return _error(command_id, "get_entries", f"Entry not found: {since}")
+                entries = entries[index + 1 :]
+            return _success(
+                command_id,
+                "get_entries",
+                {
+                    "entries": [to_jsonable(entry) for entry in entries],
+                    "leafId": await self.session.branch_tip_id(),
+                },
+            )
+        if command_type == "get_tree":
+            tree = await self.session.session_tree()
+            return _success(
+                command_id,
+                "get_tree",
+                {
+                    "tree": [self._tree_node(node) for node in tree],
+                    "leafId": await self.session.branch_tip_id(),
+                },
+            )
+        if command_type == "get_fork_messages":
+            messages = await self.session.user_messages_for_forking()
+            return _success(command_id, "get_fork_messages", {"messages": messages})
+        if command_type == "fork":
+            position = raw.get("position", "before")
+            if position not in ("before", "at"):
+                return _error(command_id, "fork", f"Invalid fork position: {position!r}")
+            result = await self.session.fork(raw.get("entryId"), position=position)
+            self._emit_header()
+            return _success(
+                command_id,
+                "fork",
+                {"text": result["selectedText"], "cancelled": result["cancelled"]},
+            )
+        if command_type == "clone":
+            try:
+                await self.session.clone()
+            except ValueError as error:
+                return _error(command_id, "clone", str(error))
+            self._emit_header()
+            return _success(command_id, "clone", {"cancelled": False})
+        if command_type == "switch_session":
+            session_ref = raw.get("sessionPath")
+            if not session_ref:
+                return _error(command_id, "switch_session", "sessionPath is required")
+            metadata = await self._find_session(str(session_ref))
+            if metadata is None:
+                return _error(command_id, "switch_session", f"Session not found: {session_ref}")
+            await self.session.switch_session(metadata)
+            self._emit_header()
+            return _success(command_id, "switch_session", {"cancelled": False})
+        if command_type == "set_session_name":
+            name = str(raw.get("name", "")).strip()
+            if not name:
+                return _error(command_id, "set_session_name", "Session name cannot be empty")
+            await self.session.set_session_name(name)
+            return _success(command_id, "set_session_name")
+        if command_type == "get_session_stats":
+            stats = await self.session.session_stats()
+            return _success(command_id, "get_session_stats", stats)
         if command_type == "compact":
             compacted = await self.session.run_compaction(
                 "manual", custom_instructions=raw.get("customInstructions")
@@ -303,6 +383,28 @@ class RpcServer:
             self.auto_compaction_enabled = bool(raw.get("enabled"))
             return _success(command_id, "set_auto_compaction")
         return _error(command_id, str(command_type), f"Unknown command: {command_type}")
+
+    @staticmethod
+    def _tree_node(node: TreeNode) -> Dict[str, Any]:
+        """Serialise one tree node the way pi's `SessionTreeNode` JSON does."""
+        data: Dict[str, Any] = {
+            "entry": to_jsonable(node.entry),
+            "children": [RpcServer._tree_node(child) for child in node.children],
+        }
+        if node.label:
+            data["label"] = node.label
+        return data
+
+    async def _find_session(self, session_ref: str):
+        """Resolve a session file path or bare session id for `switch_session`."""
+        wanted = os.path.normcase(os.path.abspath(session_ref))
+        for metadata in await self.session.list_sessions():
+            path = getattr(metadata, "path", None)
+            if metadata.id == session_ref:
+                return metadata
+            if path and os.path.normcase(os.path.abspath(path)) == wanted:
+                return metadata
+        return None
 
     async def _cmd_prompt(self, command_id: Optional[str], raw: Dict[str, Any]) -> Dict[str, Any]:
         text = str(raw.get("message", ""))
