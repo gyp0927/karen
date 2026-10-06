@@ -7,6 +7,7 @@ from karen_ai import Usage, create_models
 from karen_ai.providers import faux_assistant_message, faux_model, register_faux_provider
 from karen_agent.compaction import CompactionSettings
 from karen_agent.session import BranchScan
+from karen_agent.session.jsonl import JSONL_FORMAT_VERSION
 from karen_coding_agent import AgentSession
 
 
@@ -42,6 +43,23 @@ async def _messages(session):
 # ---------------------------------------------------------------------------
 # persistence + resume
 # ---------------------------------------------------------------------------
+
+
+async def test_session_header_matches_the_disk_line(tmp_path):
+    models, registration = _models_with_faux([])
+    session = await _open(tmp_path, models, registration)
+
+    header = session.session_header()
+    assert header["kind"] == "header"
+    assert header["v"] == JSONL_FORMAT_VERSION
+    assert header["id"] == session.session.metadata.id
+    session_files = list((tmp_path / "sessions").rglob("*.jsonl"))
+    assert len(session_files) == 1
+    import json
+
+    first_line = json.loads(session_files[0].read_text(encoding="utf-8").splitlines()[0])
+    assert header == first_line
+    await session.close()
 
 
 async def test_prompt_persists_every_message(tmp_path):

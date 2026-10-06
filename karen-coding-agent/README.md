@@ -55,13 +55,26 @@ and only fresh post-run messages are checked.
 
 ```bash
 karen [--cwd PATH] [--model ID] [--new]     # interactive REPL
-karen -p "summarize this repo"              # headless print mode
+karen -p "summarize this repo"              # headless text mode: final reply on stdout
+karen "one" "two"                           # headless: prompts run sequentially
+karen --mode json "prompt"                  # headless JSON event stream
 printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive it)
 ```
 
-- Streams replies, prints tool calls (`[tool ->] write(path='a.py', ...)`)
-  and a context-token estimate after every turn. In print mode tool chatter
-  goes to stderr, leaving stdout for the reply.
+- Interactive mode streams replies live and prints tool calls
+  (`[tool ->] write(path='a.py', ...)`) plus a context-token estimate after
+  every turn.
+- Headless modes (pi's `runPrintMode`; M3): **text** (default) prints only the
+  final assistant message's text to stdout — tool chatter and session notices
+  go to stderr — and exits 1 when the final message is an error or aborted;
+  **json** (`--mode json`) emits the session header line followed by one JSON
+  event per line (pi's `json-event.ts` shape: `message_update` carries only
+  cumulative `usage` + the delta sub-event with `partial` stripped,
+  `toolcall_start` gains `id`/`toolName`) and stays machine-parseable end to
+  end. Deviations from pi: no TTY auto-detection (karen's REPL is designed to
+  be piped), positional prompts imply print mode instead of becoming an
+  interactive initial message, and `@file`/image arguments are not supported
+  yet.
 - Sessions live under `~/.karen/sessions` (override with
   `KAREN_SESSIONS_ROOT`), resumed per working directory; `/new` starts fresh.
 - Slash commands: `/help`, `/new`, `/compact [focus]`, `/templates`,
@@ -109,9 +122,8 @@ answer from the tool results.
 
 ## Roadmap
 
-Later milestones (tracked in the repo root README): print/JSON
-machine-readable output (M3), settings file (M4), RPC mode / extensions /
-MCP / TUI (unscheduled).
+Later milestones (tracked in the repo root README): settings file (M4), RPC
+mode / extensions / MCP / TUI (unscheduled).
 
 ## Development
 

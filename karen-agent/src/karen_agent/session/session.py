@@ -233,6 +233,12 @@ class StorageBackedSession(Session):
         self._state = "open"  # "open" | "closing" | "closed"
         self._close_task: Optional[asyncio.Future] = None
 
+    @property
+    def storage(self) -> Storage:
+        """The underlying storage (a `JsonlStorage` for file-backed sessions,
+        which exposes the session file's `header`)."""
+        return self._storage
+
     # --- mutations ------------------------------------------------------------
 
     async def begin_mutation(self) -> SessionMutation:

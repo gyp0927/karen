@@ -60,6 +60,7 @@ from karen_agent.session import (
     set_value,
 )
 from karen_agent.session.context import build_session_context
+from karen_agent.session.jsonl import to_jsonable
 from karen_agent.session.types import CompactionEntry
 from .tools import create_default_tools
 
@@ -190,6 +191,19 @@ class AgentSession:
 
     def estimate_tokens(self) -> int:
         return estimate_context_tokens(self.agent.state.messages).tokens
+
+    def session_header(self) -> Optional[Dict[str, Any]]:
+        """The JSONL session header dict, or None for non-JSONL storage.
+
+        `karen --mode json` emits it as the first stdout line, like pi's
+        `session.sessionManager.getHeader()`.
+        """
+        if self.session is None:
+            return None
+        header = getattr(self.session.storage, "header", None)
+        if header is None:
+            return None
+        return to_jsonable(header)
 
     # -- agent passthrough -------------------------------------------------------
 

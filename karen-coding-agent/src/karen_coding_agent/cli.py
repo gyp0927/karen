@@ -1,19 +1,26 @@
-"""`karen` — the CLI coding assistant (M1: interactive REPL + print mode).
+"""`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
 
-Headless (print mode):
-    karen -p "summarize this repo" [--cwd PATH]
+Headless (print mode, pi's runPrintMode):
+    karen -p "summarize this repo" [--cwd PATH]   # final reply text on stdout
+    karen "one prompt" "another prompt"           # prompts run sequentially
+    karen --mode json "prompt"                    # JSON event stream on stdout
 
 Piping into the REPL works too (that's how the smokes drive it):
     printf 'hello\n/quit\n' | karen --new
+
+Deviation from pi: karen does not auto-switch to print mode when stdin/stdout
+is not a TTY (the REPL is designed to be pipe-driven), and positional prompts
+imply print mode instead of becoming an interactive initial message.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,6 +30,7 @@ from karen_ai.providers import deepseek_provider
 from karen_agent import format_prompt_template_invocation, load_prompt_templates, parse_command_args
 
 from .agent_session import AgentSession
+from .json_events import to_json_event
 
 DEFAULT_MODEL_ID = "deepseek-v4-pro"
 DEFAULT_CREDENTIALS = Path.home() / ".karen" / "credentials.json"
@@ -96,12 +104,13 @@ class KarenCli:
     """Terminal front-end over `AgentSession`: event printing + the REPL."""
 
     def __init__(self, cwd: str, model_id: str, fresh: bool, quiet_tools: bool = False,
-                 provider: str = "deepseek") -> None:
+                 provider: str = "deepseek", output_mode: str = "text") -> None:
         self.cwd = cwd
         self.provider = provider
         self.model_id = model_id
         self.fresh = fresh
-        self.quiet_tools = quiet_tools  # print mode: tool chatter goes to stderr
+        self.quiet_tools = quiet_tools  # headless: tool chatter goes to stderr
+        self.output_mode = output_mode  # "text" (final reply) | "json" (event stream)
         self.models, self.auth_source = build_models()
         if provider == "deepseek":
             self.models.set_provider(deepseek_provider())
@@ -122,7 +131,14 @@ class KarenCli:
         print(text, file=sys.stderr if self.quiet_tools else sys.stdout)
 
     def _on_agent_event(self, event, signal) -> None:
-        if event.type == "message_update" and event.assistant_message_event.type == "text_delta":
+        if self.output_mode == "json":
+            print(json.dumps(to_json_event(event), ensure_ascii=False), flush=True)
+            return
+        if (
+            not self.quiet_tools
+            and event.type == "message_update"
+            and event.assistant_message_event.type == "text_delta"
+        ):
             print(event.assistant_message_event.delta, end="", flush=True)
         elif event.type == "tool_execution_start":
             self.tool_counts[event.tool_name] = self.tool_counts.get(event.tool_name, 0) + 1
@@ -130,7 +146,7 @@ class KarenCli:
         elif event.type == "tool_execution_end" and event.is_error:
             text = "".join(getattr(c, "text", "") for c in event.result.content)
             self._tool_line(f"[tool <-] {event.tool_name} ERROR: {text[:200]}")
-        elif event.type == "agent_end":
+        elif event.type == "agent_end" and not self.quiet_tools:
             print()
             final = self.session.agent.state.messages[-1] if self.session else None
             if getattr(final, "stop_reason", None) == "error":
@@ -138,20 +154,25 @@ class KarenCli:
 
     def _on_session_event(self, event) -> None:
         event_type = event.get("type")
+        if self.output_mode == "json":
+            # the session header line covers session_opened
+            if event_type != "session_opened":
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+            return
         if event_type == "session_opened":
             kind = "resumed" if event["resumed"] else "new"
-            print(f"{kind} session {event['session_id']}")
+            self._tool_line(f"{kind} session {event['session_id']}")
         elif event_type == "compaction_start":
-            print(f"compacting ({event['reason']}; the model writes a summary)...")
+            self._tool_line(f"compacting ({event['reason']}; the model writes a summary)...")
         elif event_type == "compaction_end":
             if event["compacted"]:
-                print(f"compacted ~{event['tokens_before']} tokens")
+                self._tool_line(f"compacted ~{event['tokens_before']} tokens")
             elif event.get("detail") == "nothing_to_compact":
-                print("nothing to compact")
+                self._tool_line("nothing to compact")
             else:
                 print(f"compaction failed: {event.get('detail')}", file=sys.stderr)
         elif event_type == "overflow_retry":
-            print("[context overflow: compacted; retrying the turn]")
+            self._tool_line("[context overflow: compacted; retrying the turn]")
         elif event_type == "overflow_give_up":
             print(
                 "[context overflow recovery failed after one compact-and-retry attempt; "
@@ -176,18 +197,44 @@ class KarenCli:
         self.tool_counts = {}
         restored = len(self.session.agent.state.messages) - 1  # minus the seeded system message
         if restored:
-            print(f"context restored: {restored} messages, ~{self.session.estimate_tokens()} tokens")
+            self._tool_line(f"context restored: {restored} messages, ~{self.session.estimate_tokens()} tokens")
 
     # -- modes ------------------------------------------------------------------
 
-    async def run_print(self, prompt_text: str) -> int:
-        """Headless single prompt: stream the reply, exit."""
+    async def run_print(self, prompts) -> int:
+        """Headless mode (pi's runPrintMode): run the prompt(s) sequentially.
+
+        text mode: stdout gets the final assistant message's text only (exit 1
+        on an error/aborted final message). json mode: stdout gets the session
+        header followed by one JSON event per line (exit 1 only on exceptions).
+        """
         await self._open_session(self.fresh)
+        if self.output_mode == "json":
+            header = self.session.session_header()
+            if header is not None:
+                print(json.dumps(header, ensure_ascii=False), flush=True)
+        exit_code = 0
         try:
-            await self.session.prompt(prompt_text)
-        finally:
-            await self.session.close()
-        return 0
+            for prompt in prompts:
+                await self.session.prompt(prompt)
+        except Exception as error:
+            print(str(error), file=sys.stderr)
+            exit_code = 1
+        if exit_code == 0 and self.output_mode == "text":
+            messages = self.session.agent.state.messages
+            final = messages[-1] if messages else None
+            if getattr(final, "role", None) == "assistant":
+                if final.stop_reason in ("error", "aborted"):
+                    print(final.error_message or f"Request {final.stop_reason}", file=sys.stderr)
+                    exit_code = 1
+                else:
+                    for block in final.content:
+                        text = getattr(block, "text", None)
+                        if text is not None:
+                            sys.stdout.write(f"{text}\n")
+            sys.stdout.flush()
+        await self.session.close()
+        return exit_code
 
     async def repl(self) -> int:
         await self._open_session(self.fresh)
@@ -241,17 +288,22 @@ class KarenCli:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="karen", description="karen — AI coding assistant")
-    parser.add_argument("-p", "--print", dest="print_prompt", metavar="PROMPT",
-                        help="headless mode: run one prompt, print the reply, exit")
+    parser.add_argument("-p", "--print", dest="print_flag", action="store_true",
+                        help="headless print mode: run the prompt(s), print the reply, exit")
+    parser.add_argument("--mode", choices=["text", "json"], default="text",
+                        help="headless output mode: text (default, final reply only) or json (event stream)")
     parser.add_argument("--cwd", default=os.getcwd(), help="working directory for tools and session resume")
     parser.add_argument("--model", default=os.environ.get("KAREN_MODEL", DEFAULT_MODEL_ID))
     parser.add_argument("--provider", default=os.environ.get("KAREN_PROVIDER", "deepseek"))
     parser.add_argument("--new", action="store_true", help="start a fresh session instead of resuming")
+    parser.add_argument("messages", nargs="*", metavar="PROMPT",
+                        help="prompt(s) for headless mode; several run sequentially")
     args = parser.parse_args(argv)
+    headless = args.print_flag or bool(args.messages) or args.mode == "json"
     cli = KarenCli(cwd=os.path.abspath(args.cwd), model_id=args.model, fresh=args.new,
-                   quiet_tools=bool(args.print_prompt), provider=args.provider)
-    if args.print_prompt is not None:
-        return asyncio.run(cli.run_print(args.print_prompt))
+                   quiet_tools=headless, provider=args.provider, output_mode=args.mode)
+    if headless:
+        return asyncio.run(cli.run_print(args.messages))
     return asyncio.run(cli.repl())
 
 

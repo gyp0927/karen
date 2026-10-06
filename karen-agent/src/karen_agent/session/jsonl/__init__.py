@@ -1,5 +1,6 @@
 """JSONL file-backed session storage (pi's `harness/session/jsonl/`)."""
 
+from .codec import to_jsonable
 from .fork import ClosedForkInput, JsonlForkInput, OpenForkInput, run_jsonl_fork
 from .repo import JsonlSessionRepo, session_directory_name, session_file_name
 from .storage import JsonlStorage
@@ -27,4 +28,5 @@ __all__ = [
     "run_jsonl_fork",
     "session_directory_name",
     "session_file_name",
+    "to_jsonable",
 ]

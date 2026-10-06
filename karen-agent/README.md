@@ -360,7 +360,10 @@ fork = await repo.fork(session.metadata, BranchForkOptions(branch="main", entry_
 - **Wire format**: pi's format v4 — camelCase keys, header line with `v`/`kind`/`id`/
   `storageVersion`/`createdAt`/`cwd`, single-write transactions as bare objects. Loaded
   messages are coerced back into karen-ai models via the `Message` role union; unknown
-  shapes stay plain dicts.
+  shapes stay plain dicts. `to_jsonable` (exported from `karen_agent.session.jsonl`)
+  normalizes any pydantic model to this wire form, and `Session.storage` exposes the
+  underlying storage (e.g. `JsonlStorage.header`) — both used by karen-coding-agent's
+  `--mode json` event stream.
 - **Crash safety**: appends are line-atomic; a torn final line is discarded and the file
   repaired on open; snapshot rewrites (fork) publish via temp-file + rename.
 - **Not ported** (out of M1 scope): the durable runtime operation state machine
