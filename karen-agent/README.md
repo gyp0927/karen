@@ -102,6 +102,11 @@ summary (verified against DeepSeek).
 
 ## Demo CLI (M4)
 
+> The productized successor of this demo is
+> [`karen-coding-agent`](../karen-coding-agent) (the `karen` command):
+> the same loop/tools/session/compaction stack, rebuilt as an application
+> package on the `Agent` class. The demo stays as a minimal example.
+
 [`examples/karen_cli.py`](examples/karen_cli.py) puts the whole stack behind an
 interactive terminal agent:
 

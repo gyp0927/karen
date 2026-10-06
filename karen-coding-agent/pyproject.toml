@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "karen-coding-agent"
+version = "0.1.0"
+description = "The karen coding-agent app — CLI coding assistant built on karen-agent, the karen equivalent of @earendil-works/pi's packages/coding-agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "karen-agent",
+    "karen-ai",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+karen = "karen_coding_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/karen_coding_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
