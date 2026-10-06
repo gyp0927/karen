@@ -62,6 +62,12 @@ def test_parse_skill_invocation():
     assert karen_cli.parse_command("/greet", {"greet"}, {"greet"})[0] == "template"
 
 
+def test_parse_retry_command():
+    assert karen_cli.parse_command("/retry", set()) == ("retry", None, "")
+    assert karen_cli.parse_command("/retry off", set()) == ("retry", None, "off")
+    assert karen_cli.parse_command("/retry on", set()) == ("retry", None, "on")
+
+
 # ---------------------------------------------------------------------------
 # format_args_preview
 # ---------------------------------------------------------------------------
@@ -160,6 +166,79 @@ def test_print_mode_error_reply_exits_1(tmp_path, monkeypatch, capsys):
     assert exit_code == 1
     assert captured.out == ""
     assert "boom" in captured.err
+
+
+def _write_settings(tmp_path, retry):
+    directory = tmp_path / ".karen"
+    directory.mkdir(exist_ok=True)
+    (directory / "settings.json").write_text(json.dumps({"retry": retry}), encoding="utf-8")
+
+
+def test_print_mode_auto_retries_a_transient_failure(tmp_path, monkeypatch, capsys):
+    _write_settings(tmp_path, {"baseDelayMs": 1, "maxAgentDelayMs": 1})
+    monkeypatch.setattr(
+        karen_cli,
+        "build_models",
+        _faux_factory(
+            [
+                faux_assistant_message([], stop_reason="error", error_message="Error 503 Service Unavailable"),
+                faux_assistant_message("recovered"),
+            ]
+        ),
+    )
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+
+    exit_code = karen_cli.main(
+        ["-p", "ping", "--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == "recovered\n"
+    assert "[retrying (attempt 1/3)" in captured.err
+    assert "[retry succeeded on attempt 1]" in captured.err
+    # the failing run is not reported as a failure
+    assert "[run failed" not in captured.err
+
+
+def test_retry_settings_disable_auto_retry(tmp_path, monkeypatch, capsys):
+    _write_settings(tmp_path, {"enabled": False})
+    monkeypatch.setattr(
+        karen_cli,
+        "build_models",
+        _faux_factory(
+            [
+                faux_assistant_message([], stop_reason="error", error_message="Error 503 Service Unavailable"),
+                faux_assistant_message("never used"),
+            ]
+        ),
+    )
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+
+    exit_code = karen_cli.main(
+        ["-p", "ping", "--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "[retrying" not in captured.err
+    assert captured.out == ""
+    assert "Error 503 Service Unavailable" in captured.err  # print mode reports the failure itself
+
+
+def test_repl_retry_command_toggles_and_reports(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/retry\n/retry off\n/retry on\n/retry maybe\n/quit\n"))
+
+    exit_code = karen_cli.main(["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "auto-retry: on (maxRetries 3, baseDelayMs 2000)" in captured.out
+    assert "auto-retry: off (maxRetries 3, baseDelayMs 2000)" in captured.out
+    assert captured.out.count("auto-retry: on") == 2  # initial report and the toggle back
+    assert "usage: /retry [on|off]" in captured.err
 
 
 def test_json_mode_emits_header_and_event_stream(tmp_path, monkeypatch, capsys):

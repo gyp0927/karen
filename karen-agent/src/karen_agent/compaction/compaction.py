@@ -4,10 +4,12 @@ Deviations from pi, consistent with M1/M2:
 
 - pi's chord ``Context`` parameter is dropped; an optional ``signal`` keyword
   threads the abort signal into summary requests instead.
-- pi wraps summary calls in ``retryAssistantCall`` (pi-ai's assistant-call
-  retry layer), which karen-ai does not have; karen-ai adapters already retry
-  transient HTTP errors via ``max_retries`` request options.
 - ``details`` payloads are plain camelCase JSON dicts, per the M2 convention.
+
+Summary calls go through ``retry_assistant_call`` exactly like pi's
+``completeSimpleWithRetries``: callers pass an optional ``retry`` policy and
+``callbacks``, and every provider request of one compaction (history summary
+and turn-prefix summary alike) is retried inside that call.
 """
 
 from __future__ import annotations
@@ -21,10 +23,13 @@ from karen_ai import (
     AssistantMessage,
     Context,
     Model,
+    RetryCallbacks,
+    RetryPolicy,
     SimpleStreamOptions,
     TextContent,
     Usage,
     UserMessage,
+    retry_assistant_call,
 )
 from karen_ai.types import KarenBase, ThinkingLevel
 from karen_ai.utils import content_text
@@ -62,6 +67,8 @@ __all__ = [
     "ContextUsageEstimate",
     "CutPointResult",
     "GeneratedSummary",
+    "RetryCallbacks",
+    "RetryPolicy",
     "SummaryGenerationOptions",
     "SummaryRequest",
     "SUMMARIZATION_SYSTEM_PROMPT",
@@ -112,14 +119,21 @@ async def complete_summary(
     options: SimpleStreamOptions,
     *,
     signal: Optional[AbortSignal] = None,
+    retry: Optional[RetryPolicy] = None,
+    callbacks: Optional[RetryCallbacks] = None,
 ) -> AssistantMessage:
     """Default request boundary used by ``compact`` / ``generate_summary_*``.
 
-    pi wraps this in ``retryAssistantCall``; karen-ai has no assistant-call
-    retry layer, so transient HTTP errors surface from the adapter's own
-    ``max_retries`` handling.
+    pi's `completeSimpleWithRetries`: summaries are standalone requests, so the
+    retry policy and its callbacks apply to this single provider call.
     """
-    return await models.complete_simple(model, ai_context, create_summary_request_options(options, signal=signal))
+    request_options = create_summary_request_options(options, signal=signal)
+    return await retry_assistant_call(
+        lambda: models.complete_simple(model, ai_context, request_options),
+        retry,
+        signal=request_options.signal,
+        callbacks=callbacks,
+    )
 
 
 class CompactionSettings(KarenBase):
@@ -484,6 +498,8 @@ async def generate_summary(
     thinking_level: Optional[str] = None,
     *,
     signal: Optional[AbortSignal] = None,
+    retry: Optional[RetryPolicy] = None,
+    callbacks: Optional[RetryCallbacks] = None,
 ) -> Result[str, CompactionError]:
     """Generate or update a conversation summary for compaction."""
     result = await generate_summary_with_usage(
@@ -495,6 +511,8 @@ async def generate_summary(
         previous_summary,
         thinking_level,
         signal=signal,
+        retry=retry,
+        callbacks=callbacks,
     )
     if isinstance(result, Err):
         return err(result.error)
@@ -511,11 +529,15 @@ async def generate_summary_with_usage(
     thinking_level: Optional[str] = None,
     *,
     signal: Optional[AbortSignal] = None,
+    retry: Optional[RetryPolicy] = None,
+    callbacks: Optional[RetryCallbacks] = None,
 ) -> Result[GeneratedSummary, CompactionError]:
     """Generate or update a conversation summary and return its provider usage."""
 
     async def request(ai_context: Context, options: SimpleStreamOptions) -> AssistantMessage:
-        return await complete_summary(models, model, ai_context, options, signal=signal)
+        return await complete_summary(
+            models, model, ai_context, options, signal=signal, retry=retry, callbacks=callbacks
+        )
 
     return await generate_summary_with_request(
         current_messages,
@@ -748,11 +770,15 @@ async def compact(
     thinking_level: Optional[str] = None,
     *,
     signal: Optional[AbortSignal] = None,
+    retry: Optional[RetryPolicy] = None,
+    callbacks: Optional[RetryCallbacks] = None,
 ) -> Result[CompactResult, CompactionError]:
     """Generate compaction summary data from prepared session history."""
 
     async def request(ai_context: Context, options: SimpleStreamOptions) -> AssistantMessage:
-        return await complete_summary(models, model, ai_context, options, signal=signal)
+        return await complete_summary(
+            models, model, ai_context, options, signal=signal, retry=retry, callbacks=callbacks
+        )
 
     return await compact_with_request(
         preparation,

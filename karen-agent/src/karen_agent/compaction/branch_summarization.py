@@ -2,7 +2,10 @@
 
 Generates the summary stored when a session navigates away from a branch.
 Same deviations as `compaction.py`: no chord Context (explicit ``signal``
-keyword), no assistant-call retry layer, details are plain camelCase dicts.
+keyword), details are plain camelCase dicts. Summary requests go through
+``retry_assistant_call`` (pi's `completeSimpleWithRetries`), so callers pass
+an optional ``retry`` policy and ``callbacks`` through
+:class:`GenerateBranchSummaryOptions`.
 """
 
 from __future__ import annotations
@@ -10,7 +13,19 @@ from __future__ import annotations
 import time
 from typing import Any, List, Optional
 
-from karen_ai import AbortSignal, AssistantMessage, Context, Model, SimpleStreamOptions, TextContent, Usage, UserMessage
+from karen_ai import (
+    AbortSignal,
+    AssistantMessage,
+    Context,
+    Model,
+    RetryCallbacks,
+    RetryPolicy,
+    SimpleStreamOptions,
+    TextContent,
+    Usage,
+    UserMessage,
+    retry_assistant_call,
+)
 from karen_ai.types import KarenBase
 from karen_ai.utils import content_text
 from pydantic import ConfigDict
@@ -108,6 +123,10 @@ class GenerateBranchSummaryOptions(KarenBase):
     replace_instructions: Optional[bool] = None
     #: Tokens reserved for prompt and model output. Defaults to 16384.
     reserve_tokens: Optional[int] = None
+    #: Optional retry policy for transient summarization errors.
+    retry: Optional[RetryPolicy] = None
+    #: Optional callbacks for retry reporting.
+    callbacks: Optional[RetryCallbacks] = None
 
 
 DEFAULT_BRANCH_RESERVE_TOKENS = 16384
@@ -246,10 +265,12 @@ async def generate_branch_summary(
     preparation = prepare_branch_entries(entries, context_window - reserve_tokens)
 
     async def request(ai_context: Context, request_options: SimpleStreamOptions) -> AssistantMessage:
-        return await options.models.complete_simple(
-            options.model,
-            ai_context,
-            create_summary_request_options(request_options, signal=signal),
+        options_for_request = create_summary_request_options(request_options, signal=signal)
+        return await retry_assistant_call(
+            lambda: options.models.complete_simple(options.model, ai_context, options_for_request),
+            options.retry,
+            signal=options_for_request.signal,
+            callbacks=options.callbacks,
         )
 
     return await generate_branch_summary_with_request(

@@ -4,7 +4,16 @@ from .estimate import estimate_context_tokens
 from .overflow import get_overflow_patterns, is_context_overflow, is_recoverable_length
 from .json_parse import parse_json_with_repair, parse_streaming_json, repair_json
 from .provider_env import get_provider_env_value
-from .retry import ProviderHttpError, retry_provider_request
+from .retry import (
+    DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+    ProviderHttpError,
+    RetryCallbacks,
+    RetryPolicy,
+    is_retryable_assistant_error,
+    retry_assistant_call,
+    retry_delay_ms,
+    retry_provider_request,
+)
 from .sanitize import sanitize_surrogates
 from .sse import ServerSentEvent, iterate_sse_messages
 from .text import content_text, get_system_message_text, render_system_message_update
@@ -23,6 +32,12 @@ __all__ = [
     "get_provider_env_value",
     "ProviderHttpError",
     "retry_provider_request",
+    "DEFAULT_MAX_AGENT_RETRY_DELAY_MS",
+    "RetryCallbacks",
+    "RetryPolicy",
+    "is_retryable_assistant_error",
+    "retry_assistant_call",
+    "retry_delay_ms",
     "sanitize_surrogates",
     "ServerSentEvent",
     "iterate_sse_messages",

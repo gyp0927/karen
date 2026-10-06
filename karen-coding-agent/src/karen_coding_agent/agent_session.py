@@ -1,17 +1,17 @@
 """Application-level agent session for the karen coding agent.
 
 Wires karen_agent's `Agent` to durable session persistence, automatic
-compaction (threshold + overflow recovery), session navigation (tree, fork,
-clone, switch — M7), and the hook registry — the karen equivalent of pi
-coding-agent's `core/agent-session.ts`, greatly simplified: no settings
-manager, session projections, context edits, retries, or extension events yet
-(those are later milestones).
+compaction (threshold + overflow recovery), auto-retry of transient provider
+failures (M8), session navigation (tree, fork, clone, switch — M7), and the
+hook registry — the karen equivalent of pi coding-agent's `core/agent-session.ts`,
+greatly simplified: no settings manager, session projections, context edits, or
+extension events yet (those are later milestones).
 
 Persistence model: every message is persisted as its `message_end` event
-arrives (crash-safe, like pi). Overflow recovery rewinds the branch tip to
-persistently omit the failed attempt (pi's `_omitRecoveryAttempt`) before the
-recovery compaction; orphaned entries stay in the JSONL file but are
-unreachable from the tip, exactly like branch navigation.
+arrives (crash-safe, like pi). Recovery rewinds the branch tip to persistently
+omit the failed attempt (pi's `_omitRecoveryAttempt`) before the recovery
+compaction or the retry's backoff; orphaned entries stay in the JSONL file but
+are unreachable from the tip, exactly like branch navigation.
 """
 
 from __future__ import annotations
@@ -22,8 +22,18 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from karen_ai import Model, Models, SystemMessage
+from karen_ai import (
+    AbortController,
+    AbortError,
+    Model,
+    Models,
+    RetryCallbacks,
+    RetryPolicy,
+    SystemMessage,
+    abortable_sleep,
+)
 from karen_ai.utils.overflow import is_context_overflow, is_recoverable_length
+from karen_ai.utils.retry import is_retryable_assistant_error, retry_delay_ms
 from karen_ai.utils.text import get_system_message_text
 from karen_agent import (
     AfterToolEvent,
@@ -81,6 +91,7 @@ from karen_agent.session.context import build_session_context
 from karen_agent.session.jsonl import to_jsonable
 from karen_agent.session.types import CompactionEntry
 from .navigation import TreeNode, build_tree, entry_text, forkable_user_messages
+from .settings import DEFAULT_RETRY_POLICY
 from .tools import create_default_tools
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".karen" / "sessions"
@@ -117,6 +128,14 @@ def _add_usage(totals: Dict[str, float], usage) -> None:
 #: {"type": "compaction_end", "reason": ..., "compacted": bool, "detail"?: str, "tokens_before"?: int}
 #: {"type": "overflow_retry"}   — overflow compacted; the turn is being retried
 #: {"type": "overflow_give_up"} — recovery attempt exhausted; keeping the failure
+#: {"type": "auto_retry_start", "attempt": int, "maxAttempts": int, "delayMs": int,
+#:  "errorMessage": str}       — a transient failure is about to be retried
+#: {"type": "auto_retry_end", "success": bool, "attempt": int, "finalError"?: str}
+#: {"type": "summarization_retry_scheduled", "attempt": int, "maxAttempts": int,
+#:  "delayMs": int, "errorMessage": str} — same, for a compaction/branch summary call
+#: {"type": "summarization_retry_attempt_start", "source": "compaction"|"branchSummary",
+#:  "reason"?: "manual" | "threshold" | "overflow"}
+#: {"type": "summarization_retry_finished"}
 #: {"type": "session_tree", "new_leaf_id": str | None, "old_leaf_id": str | None,
 #:  "summary_entry_id": str | None, "editor_text": str | None}
 #: {"type": "session_info_changed", "name": str}
@@ -142,6 +161,7 @@ class AgentSession:
         shell_command_prefix: Optional[str] = None,
         hooks: Optional[HookRegistry] = None,
         compaction_settings: Optional[CompactionSettings] = None,
+        retry_policy: Optional[RetryPolicy] = None,
         stream_fn: Optional[StreamFn] = None,
         listener: Optional[SessionListener] = None,
     ) -> None:
@@ -176,6 +196,9 @@ class AgentSession:
                 )
             )
         self.settings = compaction_settings or CompactionSettings()
+        #: Assistant-call retry policy (pi's `settings.retry`); toggled live by
+        #: `set_auto_retry_enabled`.
+        self.retry = retry_policy if retry_policy is not None else DEFAULT_RETRY_POLICY
         self.hooks = hooks if hooks is not None else HookRegistry(_report_hook_error)
         self._listener = listener
         self._stream_fn = stream_fn or models_stream_fn(models)
@@ -192,6 +215,9 @@ class AgentSession:
         self._overflow_recovery_attempted = False
         self._run_entries: List[str] = []
         self._pre_run_tip: Optional[str] = None
+        self._retry_attempt = 0
+        self._retry_controller: Optional[AbortController] = None
+        self._abort_requested = False
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -436,6 +462,8 @@ class AgentSession:
                     model=self.model,
                     custom_instructions=custom_instructions,
                     replace_instructions=replace_instructions,
+                    retry=self.retry,
+                    callbacks=self._summarization_retry_callbacks({"source": "branchSummary"}),
                 )
                 result = await generate_branch_summary(collected.entries, options)
                 if isinstance(result, Err):
@@ -569,8 +597,21 @@ class AgentSession:
     # -- agent passthrough -------------------------------------------------------
 
     def subscribe(self, listener):
-        """Subscribe to agent events; returns an unsubscribe function."""
-        return self.agent.subscribe(listener)
+        """Subscribe to agent events; returns an unsubscribe function.
+
+        The forwarded `agent_end` carries `willRetry` (pi sets the same flag
+        before dispatching it), so consumers can tell a run that failed and is
+        about to be retried from one that is really over.
+        """
+
+        def forwarded(event, signal):
+            if getattr(event, "type", None) == "agent_end":
+                event = event.model_copy(
+                    update={"will_retry": self.will_retry_after_agent_end(event)}
+                )
+            return listener(event, signal)
+
+        return self.agent.subscribe(forwarded)
 
     def steer(self, message: AgentMessage) -> None:
         self.agent.steer(message)
@@ -579,6 +620,8 @@ class AgentSession:
         self.agent.follow_up(message)
 
     def abort(self) -> None:
+        self._abort_requested = True
+        self.abort_retry()
         self.agent.abort()
 
     async def wait_for_idle(self) -> None:
@@ -596,18 +639,24 @@ class AgentSession:
     # -- prompting ---------------------------------------------------------------
 
     async def prompt(self, text: str, images=None, auto_compact: bool = True) -> None:
-        """Run one user prompt to completion, including overflow recovery and
-        threshold auto-compaction (pi's post-run `_checkCompaction` driver;
-        `auto_compact=False` skips the threshold check — the RPC mode's
-        `set_auto_compaction` switch routes through here)."""
+        """Run one user prompt to completion, including auto-retry of transient
+        provider failures, overflow recovery and threshold auto-compaction (pi's
+        post-run `_handlePostAgentRun` driver; `auto_compact=False` skips the
+        compaction and overflow branches — the RPC mode's `set_auto_compaction`
+        switch routes through here — while auto-retry keeps running, like pi)."""
         self._overflow_recovery_attempted = False
+        self._abort_requested = False
         await self.agent.prompt(text, images)
-        if auto_compact:
-            await self._post_run()
+        await self._post_run(auto_compact)
 
-    async def _post_run(self) -> None:
+    async def _post_run(self, auto_compact: bool = True) -> None:
         while True:
             final = self._last_assistant_message()
+            if await self._retry_or_keep_failure(final):
+                await self.agent.continue_()
+                continue
+            if not auto_compact:
+                return
             action = self._overflow_action(final)
             if action == "retry" and not self._overflow_recovery_attempted:
                 self._overflow_recovery_attempted = True
@@ -681,16 +730,162 @@ class AgentSession:
 
         await self.session.mutate(rewind)
 
+    # -- auto-retry ---------------------------------------------------------------
+
+    async def _retry_or_keep_failure(self, message: Optional[AgentMessage]) -> bool:
+        """pi's `_handlePostAgentRun` retry branch: schedule a retry for a
+        transiently failed turn (returns True when the caller should continue
+        the agent), otherwise report an exhausted retry budget."""
+        if self._is_retryable_error(message) and await self._prepare_retry(message):
+            return True
+        if (
+            message is not None
+            and message_field(message, "stop_reason", "stopReason") == "error"
+            and self._retry_attempt > 0
+        ):
+            attempt = self._retry_attempt
+            self._retry_attempt = 0
+            self._emit(
+                {
+                    "type": "auto_retry_end",
+                    "success": False,
+                    "attempt": attempt,
+                    "finalError": message_field(message, "error_message", "errorMessage"),
+                }
+            )
+        return False
+
+    def _is_retryable_error(self, message: Optional[AgentMessage]) -> bool:
+        """Whether a failed assistant message is worth retrying. Context
+        overflow is handled by compaction instead (pi's `_isRetryableError`)."""
+        if message is None:
+            return False
+        if is_context_overflow(message, self.model.context_window or None):
+            return False
+        return is_retryable_assistant_error(message)
+
+    async def _prepare_retry(self, message: AgentMessage) -> bool:
+        """Back off, omit the failed attempt, and let the caller re-run the turn.
+
+        Returns False when auto-retry is disabled, the budget is exhausted, or
+        the backoff was cancelled — the failure is then kept as the run's result.
+        """
+        if not self.retry.enabled:
+            return False
+        self._retry_attempt += 1
+        if self._retry_attempt > self.retry.max_retries:
+            # Preserve the completed attempt count so post-run handling can emit the final failure.
+            self._retry_attempt -= 1
+            return False
+        delay_ms = retry_delay_ms(self.retry, self._retry_attempt)
+        self._emit(
+            {
+                "type": "auto_retry_start",
+                "attempt": self._retry_attempt,
+                "maxAttempts": self.retry.max_retries,
+                "delayMs": delay_ms,
+                "errorMessage": message_field(message, "error_message", "errorMessage") or "Unknown error",
+            }
+        )
+        # Keep the failed attempt in raw history while durably omitting it from model projection.
+        await self._omit_final_attempt()
+        self._retry_controller = AbortController()
+        try:
+            await abortable_sleep(delay_ms / 1000, self._retry_controller.signal)
+        except AbortError:
+            # Aborted during the backoff: emit the end event so listeners can clean up.
+            self._finish_cancelled_retry()
+            return False
+        finally:
+            self._retry_controller = None
+        return True
+
+    def _finish_cancelled_retry(self) -> None:
+        if self._retry_attempt == 0:
+            return
+        attempt = self._retry_attempt
+        self._retry_attempt = 0
+        self._emit(
+            {
+                "type": "auto_retry_end",
+                "success": False,
+                "attempt": attempt,
+                "finalError": "Retry cancelled",
+            }
+        )
+
+    def abort_retry(self) -> None:
+        """Cancel an in-progress retry backoff (pi's `abortRetry`)."""
+        if self._retry_controller is not None:
+            self._retry_controller.abort()
+
+    @property
+    def is_retrying(self) -> bool:
+        """Whether an auto-retry is currently in progress."""
+        return self._retry_controller is not None
+
+    @property
+    def auto_retry_enabled(self) -> bool:
+        return self.retry.enabled
+
+    def set_auto_retry_enabled(self, enabled: bool) -> None:
+        self.retry.enabled = enabled
+
+    def will_retry_after_agent_end(self, event) -> bool:
+        """pi's `_willRetryAfterAgentEnd`: whether the run that just ended is
+        about to be retried, for the `willRetry` flag on the forwarded event."""
+        if (
+            self._abort_requested
+            or not self.retry.enabled
+            or self._retry_attempt >= self.retry.max_retries
+        ):
+            return False
+        for message in reversed(getattr(event, "messages", None) or []):
+            if message_field(message, "role") == "assistant":
+                return self._is_retryable_error(message)
+        return False
+
+    def _summarization_retry_callbacks(self, source: Dict[str, Any]) -> RetryCallbacks:
+        """Retry reporting shared by compaction and branch-summary calls (pi's
+        `_summarizationRetryCallbacks`); `source` recreates the indicator."""
+        return RetryCallbacks(
+            on_retry_scheduled=lambda attempt, max_attempts, delay_ms, error_message: self._emit(
+                {
+                    "type": "summarization_retry_scheduled",
+                    "attempt": attempt,
+                    "maxAttempts": max_attempts,
+                    "delayMs": delay_ms,
+                    "errorMessage": error_message,
+                }
+            ),
+            on_retry_attempt_start=lambda: self._emit(
+                {"type": "summarization_retry_attempt_start", **source}
+            ),
+            on_retry_finished=lambda *args: self._emit({"type": "summarization_retry_finished"}),
+        )
+
     # -- persistence --------------------------------------------------------------
 
     async def _on_agent_event(self, event, signal) -> None:
         event_type = getattr(event, "type", None)
         if event_type == "agent_start":
+            self._abort_requested = False
             self._run_entries = []
             branch = await self.session.branch(self.branch_name)
             self._pre_run_tip = await branch.get_tip_id()
         elif event_type == "message_end":
             await self._persist_message(event.message)
+            message = event.message
+            if message_field(message, "role") == "assistant":
+                # Reset the retry counter immediately on a successful assistant
+                # response, so it cannot accumulate across a turn's LLM calls.
+                if (
+                    message_field(message, "stop_reason", "stopReason") != "error"
+                    and self._retry_attempt > 0
+                ):
+                    attempt = self._retry_attempt
+                    self._retry_attempt = 0
+                    self._emit({"type": "auto_retry_end", "success": True, "attempt": attempt})
 
     async def _persist_message(self, message: AgentMessage) -> None:
         entry_id = self.session.id_generator.next()
@@ -752,7 +947,14 @@ class AgentSession:
             return False
         self._emit({"type": "compaction_start", "reason": reason})
         result = await _compact_impl(
-            preparation, self.models, self.model, custom_instructions=custom_instructions
+            preparation,
+            self.models,
+            self.model,
+            custom_instructions=custom_instructions,
+            retry=self.retry,
+            callbacks=self._summarization_retry_callbacks(
+                {"source": "compaction", "reason": reason}
+            ),
         )
         if isinstance(result, Err):
             self._emit(

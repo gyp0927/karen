@@ -492,3 +492,117 @@ async def test_complete_summary_default_boundary():
     assert options.max_tokens == 5
     assert options.cache_retention == "none"
     assert options.session_id
+
+
+# ---------------------------------------------------------------------------
+# assistant-call retry (pi's completeSimpleWithRetries)
+# ---------------------------------------------------------------------------
+
+
+class FlakyModels:
+    """Fails the first `failures` calls with a transient error, then succeeds."""
+
+    def __init__(self, failures=1, error="Error 503 Service Unavailable", text="summary"):
+        self.failures = failures
+        self.error = error
+        self.text = text
+        self.calls = 0
+
+    async def complete_simple(self, model, context, options=None):
+        self.calls += 1
+        if self.calls <= self.failures:
+            failed = faux_assistant_message("", stop_reason="error")
+            failed.error_message = self.error
+            return failed
+        return faux_assistant_message(self.text)
+
+
+def _one_message_preparation():
+    return CompactionPreparation(
+        messages_to_summarize=[_user("x")],
+        turn_prefix_messages=[],
+        retained_tail=[],
+        is_split_turn=False,
+        tokens_before=1,
+        file_ops=create_file_ops(),
+        settings=CompactionSettings(),
+    )
+
+
+def _retry_policy(max_retries=3):
+    from karen_ai import RetryPolicy
+
+    return RetryPolicy(enabled=True, max_retries=max_retries, base_delay_ms=1, max_agent_delay_ms=1)
+
+
+def retry_callbacks(events):
+    """Collect retry callback invocations into `events` as tagged tuples."""
+    from karen_ai import RetryCallbacks
+
+    return RetryCallbacks(
+        on_retry_scheduled=lambda attempt, max_attempts, delay_ms, error: events.append(
+            ("scheduled", attempt, max_attempts, delay_ms, error)
+        ),
+        on_retry_attempt_start=lambda: events.append(("attempt_start",)),
+        on_retry_finished=lambda success, attempt, final_error=None: events.append(
+            ("finished", success, attempt, final_error)
+        ),
+    )
+
+
+async def test_compact_retries_transient_summary_errors():
+    from karen_agent.compaction import compact
+
+    models = FlakyModels(failures=1)
+    events = []
+    result = await compact(
+        _one_message_preparation(),
+        models,
+        faux_model(),
+        retry=_retry_policy(),
+        callbacks=retry_callbacks(events),
+    )
+    assert isinstance(result, Ok)
+    assert "summary" in result.value.summary
+    assert models.calls == 2
+    assert [event[0] for event in events] == ["scheduled", "attempt_start", "finished"]
+    assert events[0] == ("scheduled", 1, 3, 1, "Error 503 Service Unavailable")
+    assert events[2] == ("finished", True, 1, None)
+
+
+async def test_compact_without_a_policy_fails_on_the_first_error():
+    from karen_agent.compaction import compact
+
+    models = FlakyModels(failures=1)
+    result = await compact(_one_message_preparation(), models, faux_model())
+    assert isinstance(result, Err)
+    assert result.error.code == "summarization_failed"
+    assert models.calls == 1
+
+
+async def test_compact_gives_up_when_the_retry_budget_is_exhausted():
+    from karen_agent.compaction import compact
+
+    models = FlakyModels(failures=99)
+    events = []
+    result = await compact(
+        _one_message_preparation(),
+        models,
+        faux_model(),
+        retry=_retry_policy(max_retries=2),
+        callbacks=retry_callbacks(events),
+    )
+    assert isinstance(result, Err)
+    assert models.calls == 3  # initial call + 2 retries
+    assert events[-1] == ("finished", False, 2, "Error 503 Service Unavailable")
+
+
+async def test_compact_does_not_retry_account_limit_errors():
+    from karen_agent.compaction import compact
+
+    models = FlakyModels(failures=99, error="insufficient_quota: billing hard limit reached")
+    result = await compact(
+        _one_message_preparation(), models, faux_model(), retry=_retry_policy()
+    )
+    assert isinstance(result, Err)
+    assert models.calls == 1

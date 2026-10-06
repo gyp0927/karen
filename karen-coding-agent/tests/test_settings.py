@@ -16,6 +16,7 @@ from karen_coding_agent.settings import (
     load_settings,
     merge_default_tools,
     resolve_default_tool_names,
+    retry_policy_from_wire,
 )
 from karen_coding_agent.tools import create_default_tools
 from test_cli import _faux_factory
@@ -162,6 +163,60 @@ def test_compaction_settings_from_wire_partial_and_tolerant():
     assert settings.reserve_tokens == 1000
     assert settings.enabled is False
     assert settings.keep_recent_tokens == CompactionSettings().keep_recent_tokens
+
+
+# ---------------------------------------------------------------------------
+# retry mapping
+# ---------------------------------------------------------------------------
+
+
+def test_retry_policy_from_wire_absent_and_partial():
+    assert retry_policy_from_wire(None) is None
+    empty = retry_policy_from_wire({})
+    assert (empty.enabled, empty.max_retries, empty.base_delay_ms, empty.max_agent_delay_ms) == (
+        True,
+        3,
+        2000,
+        60000,
+    )
+    partial = retry_policy_from_wire({"baseDelayMs": 50})
+    assert (partial.enabled, partial.max_retries, partial.base_delay_ms, partial.max_agent_delay_ms) == (
+        True,
+        3,
+        50,
+        60000,
+    )
+
+
+def test_retry_policy_from_wire_reads_every_field():
+    policy = retry_policy_from_wire(
+        {"enabled": False, "maxRetries": 5, "baseDelayMs": 10, "maxAgentDelayMs": 20}
+    )
+    assert (policy.enabled, policy.max_retries, policy.base_delay_ms, policy.max_agent_delay_ms) == (
+        False,
+        5,
+        10,
+        20,
+    )
+
+
+def test_retry_policy_from_wire_drops_wrong_types():
+    policy = retry_policy_from_wire(
+        {"enabled": "yes", "maxRetries": 2.5, "baseDelayMs": True, "maxAgentDelayMs": "60000"}
+    )
+    assert (policy.enabled, policy.max_retries, policy.base_delay_ms, policy.max_agent_delay_ms) == (
+        True,
+        3,
+        2000,
+        60000,
+    )
+
+
+def test_retry_settings_merge_and_reach_the_session(tmp_path, isolated_global):
+    _write(tmp_path / ".karen" / "settings.json", {"retry": {"maxRetries": 7}})
+    loaded = load_settings(str(tmp_path))
+    assert loaded.settings.retry == {"maxRetries": 7}
+    assert retry_policy_from_wire(loaded.settings.retry).max_retries == 7
 
 
 # ---------------------------------------------------------------------------

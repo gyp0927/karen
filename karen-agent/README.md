@@ -89,8 +89,9 @@ if not isinstance(result, Err):
 
 M3 deviations from pi, all documented at the port sites: no chord `Context`
 parameter (an explicit `signal=` keyword threads aborts into summary requests);
-pi-ai's assistant-call retry layer (`retryAssistantCall`/`RetryPolicy`) is not
-ported — karen-ai adapters retry transient HTTP errors via `max_retries`; the
+summary requests take an optional `retry`/`callbacks` pair and go through
+karen-ai's `retry_assistant_call` (pi's `completeSimpleWithRetries`), so a
+dropped stream no longer loses a whole compaction; the
 hook registry drops pi's lanes/effect-gates/telemetry spans (events are exactly
 the `HookMap` payloads, handlers take just the event); template loading uses
 synchronous `pathlib` I/O and PyYAML. Prompt constants are byte-identical to pi.
@@ -184,11 +185,14 @@ application-defined provenance values. The coding-agent app builds its
 functions (karen-coding-agent M6).
 
 `karen_agent.config` ports `harness/config.ts`: `validate_tool_names`,
-`validate_retry_policy`, `validate_compaction_settings`, and `RetryPolicy` +
-`DEFAULT_RETRY_POLICY` (3 retries, 1s base delay, 60s agent-delay cap).
+`validate_retry_policy`, `validate_compaction_settings`, and
+`DEFAULT_RETRY_POLICY` (3 retries, 1s base delay, 60s agent-delay cap);
+`RetryPolicy` and `DEFAULT_MAX_AGENT_RETRY_DELAY_MS` are re-exported from
+karen-ai's retry module.
 
-M5 deviations: `RetryPolicy` is declared and validated but not yet consumed by
-the loop (karen-ai adapters retry via `max_retries`); pi's `RangeError`/`TypeError`
+M5 deviations: `RetryPolicy` is consumed by the compaction summary requests,
+not by the loop (the application layer owns turn-level retries — pi's
+coding-agent `AgentSession`; karen-coding-agent M8); pi's `RangeError`/`TypeError`
 become Python `ValueError`/`TypeError`; skill loading uses synchronous `pathlib`
 I/O, PyYAML (parser error text differs), and pathspec's `GitIgnoreSpec` in place
 of the `ignore` npm package; no chord `Context` parameter.

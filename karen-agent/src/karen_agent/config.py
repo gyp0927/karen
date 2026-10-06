@@ -1,17 +1,20 @@
 """Harness configuration defaults and validation (pi's `harness/config.ts`).
 
-Note: karen-ai adapters retry transient HTTP errors via ``max_retries`` and the
-loop does not consume ``RetryPolicy`` (pi uses it in `retryAssistantCall` and
-the durable runtime, neither of which karen ports). The policy type and its
-validation are ported for harness/app-level configuration parity.
+``RetryPolicy`` and ``DEFAULT_MAX_AGENT_RETRY_DELAY_MS`` are re-exported from
+karen-ai (pi-ai's `utils/retry.ts`), where the classifier and the policy-driven
+retry loop live; the harness app-level default (``DEFAULT_RETRY_POLICY``)
+matches pi's `DEFAULT_RETRY_POLICY`. The summary calls in
+``karen_agent.compaction`` consume the policy through
+``karen_ai.utils.retry_assistant_call``; the agent loop itself leaves retries
+to the application layer (pi coding-agent's `AgentSession`).
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, List, Optional
+from typing import Any, List
 
-from karen_ai.types import KarenBase
+from karen_ai.utils.retry import DEFAULT_MAX_AGENT_RETRY_DELAY_MS, RetryPolicy
 
 from .compaction import CompactionSettings
 
@@ -24,19 +27,7 @@ __all__ = [
     "validate_compaction_settings",
 ]
 
-#: pi-ai's retry.ts default cap for provider-requested retry delays.
-DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60_000
-
 _MAX_SAFE_INTEGER = 2**53 - 1
-
-
-class RetryPolicy(KarenBase):
-    """Assistant-call retry policy (pi-ai's `RetryPolicy`)."""
-
-    enabled: bool
-    max_retries: int
-    base_delay_ms: int
-    max_agent_delay_ms: Optional[int] = None
 
 
 DEFAULT_RETRY_POLICY = RetryPolicy(

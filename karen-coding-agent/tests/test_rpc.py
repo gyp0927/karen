@@ -376,6 +376,101 @@ async def _two_turn_server(tmp_path):
     return session, server, lines
 
 
+# ---------------------------------------------------------------------------
+# auto-retry
+# ---------------------------------------------------------------------------
+
+
+def _retry_policy(**overrides):
+    from karen_ai import RetryPolicy
+
+    values = {"enabled": True, "max_retries": 3, "base_delay_ms": 1, "max_agent_delay_ms": 1}
+    values.update(overrides)
+    return RetryPolicy(**values)
+
+
+async def test_rpc_streams_retry_events_and_will_retry(tmp_path):
+    session = await _make_session(
+        tmp_path,
+        [
+            faux_assistant_message([], stop_reason="error", error_message="Error 503 Service Unavailable"),
+            faux_assistant_message("recovered"),
+        ],
+        retry_policy=_retry_policy(),
+    )
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+
+    await server.handle_command({"type": "prompt", "message": "hi"})
+    await server.wait_for_idle()
+
+    events = [json.loads(line) for line in lines if json.loads(line).get("type")]
+    starts = [event for event in events if event["type"] == "auto_retry_start"]
+    assert len(starts) == 1
+    assert starts[0]["attempt"] == 1 and starts[0]["maxAttempts"] == 3
+    assert starts[0]["errorMessage"] == "Error 503 Service Unavailable"
+    assert [event for event in events if event["type"] == "auto_retry_end"] == [
+        {"type": "auto_retry_end", "success": True, "attempt": 1}
+    ]
+    # the failing run's agent_end is marked as retryable, the final one is not
+    ends = [event for event in events if event["type"] == "agent_end"]
+    assert [event.get("willRetry") for event in ends] == [True, False]
+    assert events[-1]["type"] == "agent_end" and events[-1]["willRetry"] is False
+    await session.close()
+
+
+async def test_rpc_set_auto_retry_and_abort_retry(tmp_path):
+    session = await _make_session(
+        tmp_path,
+        [
+            faux_assistant_message([], stop_reason="error", error_message="Error 503 Service Unavailable"),
+            faux_assistant_message("never used"),
+        ],
+        retry_policy=_retry_policy(base_delay_ms=30_000, max_agent_delay_ms=30_000),
+    )
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+
+    disabled = await server.handle_command({"type": "set_auto_retry", "enabled": False})
+    assert disabled["success"] and session.auto_retry_enabled is False
+    enabled = await server.handle_command({"type": "set_auto_retry", "enabled": True})
+    assert enabled["success"] and session.auto_retry_enabled is True
+
+    await server.handle_command({"type": "prompt", "message": "hi"})
+    await _wait_for_event(lines, "auto_retry_start")
+    await _wait_until(lambda: session.is_retrying)  # the backoff starts right after the event
+    aborted = await server.handle_command({"type": "abort_retry"})
+    await server.wait_for_idle()
+
+    assert aborted["success"]
+    assert session.is_retrying is False
+    ends = [json.loads(line) for line in lines if json.loads(line).get("type") == "auto_retry_end"]
+    assert ends == [
+        {"type": "auto_retry_end", "success": False, "attempt": 1, "finalError": "Retry cancelled"}
+    ]
+    await session.close()
+
+
+async def _wait_for_event(lines, event_type, timeout: float = 5.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if any(json.loads(line).get("type") == event_type for line in lines):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{event_type} was never streamed")
+
+
+async def _wait_until(predicate, timeout: float = 5.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never became true")
+
+
 def _headers(lines):
     return [json.loads(line) for line in lines if json.loads(line).get("kind") == "header"]
 

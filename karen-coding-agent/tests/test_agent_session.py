@@ -1,6 +1,9 @@
 """Offline end-to-end tests for AgentSession, driven by the scripted faux
 provider through the real event protocol — no network or credentials."""
 
+import asyncio
+import time
+
 import pytest
 
 from karen_ai import Usage, create_models
@@ -38,6 +41,16 @@ async def _entries(session):
 
 async def _messages(session):
     return [entry.message for entry in await _entries(session) if entry.type == "message"]
+
+
+async def _wait_for_event(events, event_type, timeout=5.0):
+    """Wait until a session event of `event_type` has been emitted."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(event.get("type") == event_type for event in events):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{event_type} was never emitted")
 
 
 # ---------------------------------------------------------------------------
@@ -553,4 +566,226 @@ async def test_switch_session_reopens_another_session(tmp_path):
     ]
     # the clone survives on disk
     assert second_id in [m.id for m in await session.list_sessions()]
+    await session.close()
+
+
+# ---------------------------------------------------------------------------
+# auto-retry
+# ---------------------------------------------------------------------------
+
+
+def _retry_policy(**overrides):
+    from karen_ai import RetryPolicy
+
+    values = {"enabled": True, "max_retries": 3, "base_delay_ms": 1, "max_agent_delay_ms": 1}
+    values.update(overrides)
+    return RetryPolicy(**values)
+
+
+def _transient_failure(text="Error 503 Service Unavailable"):
+    return faux_assistant_message([], stop_reason="error", error_message=text)
+
+
+async def test_auto_retry_recovers_from_a_transient_error(tmp_path):
+    responses = [_transient_failure(), faux_assistant_message("recovered answer")]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path, models, registration, retry_policy=_retry_policy(), listener=events.append
+    )
+
+    await session.prompt("hello")
+
+    started = [e for e in events if e["type"] == "auto_retry_start"]
+    ended = [e for e in events if e["type"] == "auto_retry_end"]
+    assert len(started) == 1
+    assert started[0]["attempt"] == 1
+    assert started[0]["maxAttempts"] == 3
+    assert started[0]["errorMessage"] == "Error 503 Service Unavailable"
+    assert ended == [{"type": "auto_retry_end", "success": True, "attempt": 1}]
+    messages = await _messages(session)
+    assert messages[-1].content[0].text == "recovered answer"
+    # the failed attempt is durably omitted from the reachable transcript
+    assert all(getattr(m, "stop_reason", None) != "error" for m in messages)
+    assert registration.get_pending_response_count() == 0
+    await session.close()
+
+
+async def test_auto_retry_gives_up_after_the_budget(tmp_path):
+    responses = [_transient_failure(f"Error 503 #{index}") for index in range(3)]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path,
+        models,
+        registration,
+        retry_policy=_retry_policy(max_retries=2),
+        listener=events.append,
+    )
+
+    await session.prompt("hello")
+
+    assert [e["attempt"] for e in events if e["type"] == "auto_retry_start"] == [1, 2]
+    assert [e for e in events if e["type"] == "auto_retry_end"] == [
+        {"type": "auto_retry_end", "success": False, "attempt": 2, "finalError": "Error 503 #2"}
+    ]
+    # the final failure is kept: the budget was already spent
+    messages = await _messages(session)
+    assert getattr(messages[-1], "stop_reason", None) == "error"
+    assert registration.get_pending_response_count() == 0
+    await session.close()
+
+
+async def test_auto_retry_skips_account_limit_errors(tmp_path):
+    responses = [
+        faux_assistant_message([], stop_reason="error", error_message="insufficient_quota: billing"),
+        faux_assistant_message("never used"),
+    ]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path, models, registration, retry_policy=_retry_policy(), listener=events.append
+    )
+
+    await session.prompt("hello")
+
+    assert [e for e in events if e["type"] in ("auto_retry_start", "auto_retry_end")] == []
+    messages = await _messages(session)
+    assert getattr(messages[-1], "stop_reason", None) == "error"
+    await session.close()
+
+
+async def test_auto_retry_can_be_disabled(tmp_path):
+    responses = [_transient_failure(), faux_assistant_message("never used")]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path,
+        models,
+        registration,
+        retry_policy=_retry_policy(enabled=False),
+        listener=events.append,
+    )
+    assert session.auto_retry_enabled is False
+
+    await session.prompt("hello")
+
+    assert [e for e in events if e["type"] == "auto_retry_start"] == []
+    assert getattr((await _messages(session))[-1], "stop_reason", None) == "error"
+    await session.close()
+
+
+async def test_set_auto_retry_enabled_toggles_the_policy(tmp_path):
+    models, registration = _models_with_faux([])
+    session = await _open(tmp_path, models, registration)
+    assert session.auto_retry_enabled is True
+    session.set_auto_retry_enabled(False)
+    assert session.auto_retry_enabled is False
+    session.set_auto_retry_enabled(True)
+    assert session.retry.enabled is True
+    await session.close()
+
+
+async def test_agent_end_carries_will_retry(tmp_path):
+    responses = [_transient_failure(), faux_assistant_message("recovered answer")]
+    models, registration = _models_with_faux(responses)
+    session = await _open(tmp_path, models, registration, retry_policy=_retry_policy())
+    ends = []
+    session.subscribe(
+        lambda event, signal: ends.append(event) if getattr(event, "type", None) == "agent_end" else None
+    )
+
+    await session.prompt("hello")
+
+    assert [e.will_retry for e in ends] == [True, False]
+    await session.close()
+
+
+async def test_abort_retry_cancels_the_backoff(tmp_path):
+    responses = [_transient_failure(), faux_assistant_message("never used")]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path,
+        models,
+        registration,
+        retry_policy=_retry_policy(base_delay_ms=30_000, max_agent_delay_ms=30_000),
+        listener=events.append,
+    )
+
+    task = asyncio.ensure_future(session.prompt("hello"))
+    await _wait_for_event(events, "auto_retry_start")
+    assert session.is_retrying is True
+    session.abort_retry()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert session.is_retrying is False
+    assert [e for e in events if e["type"] == "auto_retry_end"] == [
+        {"type": "auto_retry_end", "success": False, "attempt": 1, "finalError": "Retry cancelled"}
+    ]
+    # the cancelled turn left no assistant response behind
+    assert getattr((await _messages(session))[-1], "stop_reason", None) != "stop"
+    await session.close()
+
+
+async def test_summarization_retries_are_reported(tmp_path):
+    responses = [
+        faux_assistant_message("first answer"),
+        _transient_failure("overloaded_error"),  # first summary attempt fails
+        faux_assistant_message("summary text"),  # the retried attempt succeeds
+    ]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path,
+        models,
+        registration,
+        retry_policy=_retry_policy(),
+        compaction_settings=CompactionSettings(keep_recent_tokens=10),
+        listener=events.append,
+    )
+    await session.prompt("first")
+    events.clear()
+
+    assert await session.run_compaction("manual") is True
+
+    types = [e["type"] for e in events]
+    assert types[:4] == [
+        "compaction_start",
+        "summarization_retry_scheduled",
+        "summarization_retry_attempt_start",
+        "summarization_retry_finished",
+    ]
+    scheduled = events[1]
+    assert scheduled["attempt"] == 1
+    assert scheduled["errorMessage"] == "overloaded_error"
+    assert events[2]["source"] == "compaction"
+    assert events[2]["reason"] == "manual"
+    assert types[-1] == "compaction_end"
+    assert events[-1]["compacted"] is True
+    await session.close()
+
+
+async def test_compaction_retry_respects_a_disabled_policy(tmp_path):
+    responses = [
+        faux_assistant_message("first answer"),
+        _transient_failure("overloaded_error"),
+    ]
+    models, registration = _models_with_faux(responses)
+    events = []
+    session = await _open(
+        tmp_path,
+        models,
+        registration,
+        retry_policy=_retry_policy(enabled=False),
+        compaction_settings=CompactionSettings(keep_recent_tokens=10),
+        listener=events.append,
+    )
+    await session.prompt("first")
+    events.clear()
+
+    assert await session.run_compaction("manual") is False
+
+    assert [e for e in events if e["type"].startswith("summarization_retry")] == []
+    assert events[-1]["compacted"] is False
     await session.close()

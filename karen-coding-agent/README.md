@@ -45,13 +45,15 @@ await session.close()
   or replace any compaction.
 - **Lifecycle events** for the UI via `listener`: `session_opened` (with the
   `new`/`fork`/`clone`/`switch` reason), `compaction_start`/`compaction_end`,
-  `overflow_retry`, `overflow_give_up`, `session_tree`, `session_info_changed`.
+  `overflow_retry`, `overflow_give_up`, the `auto_retry_*` and
+  `summarization_retry_*` events (M8), `session_tree`,
+  `session_info_changed`.
 
 Simplifications vs pi (documented at the port sites): no settings manager on
 the session itself (the CLI loads the settings files, see M4), no session
-projections, context edits, auto-retry, or extension events; pi's
-retention/staleness guards are dropped because karen sessions are append-only
-and only fresh post-run messages are checked.
+projections, context edits, or extension events; pi's retention/staleness
+guards are dropped because karen sessions are append-only and only fresh
+post-run messages are checked.
 
 ### The `karen` CLI
 
@@ -80,15 +82,18 @@ printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive i
   yet.
 - Sessions live under `~/.karen/sessions` (override with
   `KAREN_SESSIONS_ROOT`), resumed per working directory; `/new` starts fresh.
-- Slash commands: `/help`, `/new`, `/compact [focus]`, `/tree [--summarize]
-  [id]`, `/fork [n|<id>]`, `/clone`, `/sessions`, `/resume <n|id>`,
+- Slash commands: `/help`, `/new`, `/compact [focus]`, `/retry [on|off]`,
+  `/tree [--summarize] [id]`, `/fork [n|<id>]`, `/clone`, `/sessions`,
+  `/resume <n|id>`,
   `/name [text]`, `/session`, `/templates`, `/skills`, `/quit` (the session
-  navigation set arrived in M7); `/<template> args...` invokes a prompt
+  navigation set arrived in M7, `/retry` in M8); `/<template> args...` invokes
+  a prompt
   template from `.karen/prompts` (project) or `~/.karen/prompts` (user), with
   `$1`/`$@`/`${@:N:L}` substitution, or a skill from `.karen/skills` /
   `~/.karen/skills` (see M6). Built-in command names win over templates and
   skills of the same name, like pi's built-in slash commands.
-- Ctrl-C aborts the running turn (`agent.abort()` + `wait_for_idle()`).
+- Ctrl-C aborts the running turn (`agent.abort()` + `wait_for_idle()`), and
+  also cancels a retry backoff that is in progress (M8).
 
 Credentials come from `~/.karen/credentials.json` (override with
 `KAREN_CREDENTIALS_PATH`) or provider environment variables; the default
@@ -148,6 +153,7 @@ Ported subset (camelCase wire keys, like pi):
   "shellPath": "C:/Program Files/Git/bin/bash.exe",
   "shellCommandPrefix": "shopt -s expand_aliases",
   "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 },
+  "retry": { "enabled": true, "maxRetries": 3, "baseDelayMs": 2000, "maxAgentDelayMs": 60000 },
   "prompts": ["~/extra-prompts"],
   "defaultTools": ["-powershell"]
 }
@@ -160,9 +166,12 @@ Ported subset (camelCase wire keys, like pi):
   directories (lowest precedence); `defaultTools` selects the session's tool
   set (`["read", "grep"]` replaces the defaults, `["-powershell", "+ls"]`
   modifies them).
+- `retry` (M8) is pi's coding-agent retry block — per-field fallbacks are
+  `enabled: true`, `maxRetries: 3`, `baseDelayMs: 2000`,
+  `maxAgentDelayMs: 60000`; wrong types fall back instead of failing.
 - `~` is expanded in path settings. Writes (pi's `/settings` command) and the
-  rest of pi's Settings (TUI, extensions, analytics, retry, themes, …) are
-  not ported.
+  rest of pi's Settings (TUI, extensions, analytics, themes, `retry.provider`,
+  …) are not ported.
 
 ## M5: RPC mode
 
@@ -189,9 +198,9 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
   `new_session`, `get_state`, `set_model`, `set_steering_mode`,
   `set_follow_up_mode`, `get_available_models`, `get_messages`,
   `get_last_assistant_text`, `get_entries`, `compact`,
-  `set_auto_compaction`. Unknown commands and malformed lines are answered
-  with `success:false` (`command:"parse"` for JSON errors) — the loop keeps
-  running; stdin EOF exits 0.
+  `set_auto_compaction`, `set_auto_retry`, `abort_retry`. Unknown commands and
+  malformed lines are answered with `success:false` (`command:"parse"` for
+  JSON errors) — the loop keeps running; stdin EOF exits 0.
 - **`prompt` while a run is active** is queued as a steering message and
   answered `{"disposition":"queued"}` (pi's default `streamingBehavior:
   "steer"`); when idle it answers `{"disposition":"started"}` and the run's
@@ -202,16 +211,15 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
   supported. `get_state` reports model, thinkingLevel, isStreaming,
   isCompacting, steeringMode/followUpMode, sessionId/sessionFile,
   autoCompactionEnabled, messageCount and pendingMessageCount.
-- **`set_auto_compaction`** gates the post-run threshold check only; overflow
-  recovery (compact-and-retry) always runs. Manual `compact` answers
-  `{"compacted": bool}`.
+- **`set_auto_compaction`** gates the post-run threshold check and the
+  overflow recovery; auto-retry (M8) keeps running, like pi's independent
+  flags. Manual `compact` answers `{"compacted": bool}`.
 - `get_entries` answers the session's entries (with `since` slicing after a
   named entry); M7 turned the earlier id-only shape into pi's entry objects.
-- Not ported: the thinking-level commands, auto-retry, pi's bash side
-  channel, export-html, `get_commands` and the extension UI sub-protocol
-  (karen has no extensions or TUI yet), and image inputs on
-  `prompt`/`steer`/`follow_up`. Fork/clone/switch/session-stats arrived in M7
-  (see below).
+- Not ported: the thinking-level commands, pi's bash side channel,
+  export-html, `get_commands` and the extension UI sub-protocol (karen has no
+  extensions or TUI yet), and image inputs on `prompt`/`steer`/`follow_up`.
+  Fork/clone/switch/session-stats arrived in M7, retry control in M8 (below).
 
 Verified against real DeepSeek over real stdio: header → `prompt` → full event
 stream → `get_last_assistant_text` = `"RPC-OK"`, model switching,
@@ -322,10 +330,67 @@ returned its text and emptied the context; clone and switch round-tripped;
 and the RPC surface answered `get_tree`/`fork`/`clone`/`switch_session`/
 `get_session_stats` over real stdio with a header per session.
 
+## M8: auto-retry
+
+A transient provider failure (overloaded, rate limit, 5xx, dropped
+connection, …) no longer ends the turn: the failed attempt is dropped, the
+backoff is awaited, and the turn is re-run — pi's `AgentSession` auto-retry.
+
+- **karen-ai** gained the assistant-call layer of pi-ai's `utils/retry.ts`
+  next to the existing provider-request retry: `RetryPolicy`
+  (`enabled`/`maxRetries`/`baseDelayMs`/`maxAgentDelayMs`), `retry_delay_ms`
+  (`baseDelayMs * 2^(attempt-1)`, capped at 60s), `RetryCallbacks`
+  (`onRetryScheduled`/`onRetryAttemptStart`/`onRetryFinished`, sync or
+  async), `retry_assistant_call(produce, policy, signal=…, callbacks=…)` and
+  `is_retryable_assistant_error(message)` with pi's verbatim pattern lists —
+  account/billing/quota limits (`insufficient_quota`, "Monthly usage limit
+  reached", `GoUsageLimitError`, …) are **not** retried, so deterministic
+  failures still fail fast. An abort during the backoff is normalized to an
+  aborted message with the error message stripped.
+- **karen-agent**: `compact()`, `generate_summary*()` and
+  `GenerateBranchSummaryOptions` take `retry`/`callbacks` and run every
+  summary request through `retry_assistant_call` (pi's
+  `completeSimpleWithRetries`), so one dropped stream no longer loses a whole
+  compaction. `RetryPolicy`/`DEFAULT_MAX_AGENT_RETRY_DELAY_MS` are now
+  karen-ai's (karen-agent's `config.py` re-exports them).
+- **AgentSession**: after each run the last assistant message is classified
+  (context overflow is excluded — compaction owns that); a retryable failure
+  emits `auto_retry_start {attempt, maxAttempts, delayMs, errorMessage}`,
+  durably omits the failed attempt (same branch-tip rewind as overflow
+  recovery), sleeps the backoff, then re-runs the turn. A later successful
+  response emits `auto_retry_end {success: true, attempt}`; an exhausted
+  budget keeps the failure and emits `{success: false, attempt, finalError}`.
+  `abort_retry()` (also called by `abort()`, so Ctrl-C works during a
+  backoff) cancels the sleep and emits `finalError: "Retry cancelled"`;
+  `is_retrying`, `auto_retry_enabled` and `set_auto_retry_enabled()` expose
+  the state. Forwarded `agent_end` events carry pi's `willRetry` flag, so a
+  run that is about to be retried is not reported as a failure.
+- **Summaries report their own retries** via
+  `summarization_retry_scheduled`/`summarization_retry_attempt_start` (with
+  `source: "compaction" | "branchSummary"`)/`summarization_retry_finished`.
+- **REPL**: failures print `[retrying (attempt n/max) in Xs: …]` (stderr in
+  headless mode), successful retries `[retry succeeded on attempt n]`, and
+  `/retry [on|off]` shows or toggles the policy. `--mode json` prints the
+  retry events; **RPC** forwards them and answers `set_auto_retry` /
+  `abort_retry`.
+- **Settings**: the `retry` block (pi's coding-agent defaults: enabled, 3
+  retries, 2s base delay, 60s cap) configures the session's policy.
+- Not ported: pi's per-request `retry.provider` knobs (karen-ai adapters take
+  those per request), the TUI retry indicator, and `_runAutoCompaction`'s
+  `willRetry` reshuffling (karen's overflow recovery is a separate path).
+
+Verified against real DeepSeek with injected transient errors ("Error 503
+Service Unavailable"): a failing turn was retried and answered by the real
+model with the failed attempt gone from the transcript; a manual compaction
+whose summary call failed once produced `summarization_retry_*` events and a
+real summary; the next turn answered from that summary; and a 30s backoff was
+cancelled by `abort_retry` with `finalError: "Retry cancelled"`. A real
+project `settings.json` drove `/retry` (maxRetries 5, baseDelayMs 250).
+
 ## Roadmap
 
 Later milestones (tracked in the repo root README): extensions / MCP / TUI /
-image input / auto-retry (unscheduled).
+image input (unscheduled).
 
 ## Development
 

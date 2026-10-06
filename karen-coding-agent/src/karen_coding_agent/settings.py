@@ -12,9 +12,11 @@ not ported.
 
 Ported subset (camelCase wire keys, like pi): `defaultProvider`,
 `defaultModel`, `shellPath`, `shellCommandPrefix`, `sessionDir`,
-`compaction` (`enabled`/`reserveTokens`/`keepRecentTokens`), `prompts`,
+`compaction` (`enabled`/`reserveTokens`/`keepRecentTokens`), `retry`
+(`enabled`/`maxRetries`/`baseDelayMs`/`maxAgentDelayMs`), `prompts`,
 `defaultTools`. The rest of pi's Settings is TUI/extensions/analytics scope
-and intentionally not ported.
+and intentionally not ported — including `retry.provider` (the provider-adapter
+retry knobs; karen-ai adapters take those per request).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from karen_ai import DEFAULT_MAX_AGENT_RETRY_DELAY_MS, RetryPolicy
 from karen_agent.compaction import CompactionSettings
 
 #: Global settings file (pi: `~/.pi/agent/settings.json`).
@@ -52,6 +55,7 @@ class Settings:
     shell_command_prefix: Optional[str] = None
     session_dir: Optional[str] = None
     compaction: Optional[Dict[str, Any]] = None  # raw camelCase dict
+    retry: Optional[Dict[str, Any]] = None  # raw camelCase dict
     prompts: Optional[List[str]] = None
     default_tools: Optional[List[str]] = None
 
@@ -161,6 +165,7 @@ def _settings_from_wire(merged: Dict[str, Any]) -> Settings:
         shell_command_prefix=_as_str(merged.get("shellCommandPrefix")),
         session_dir=_expand_user(_as_str(merged.get("sessionDir"))),
         compaction=_as_dict(merged.get("compaction")),
+        retry=_as_dict(merged.get("retry")),
         prompts=[_expand_user(entry) for entry in _as_str_list(merged.get("prompts")) or []] or None,
         default_tools=_as_str_list(merged.get("defaultTools")),
     )
@@ -216,7 +221,46 @@ def compaction_settings_from_wire(value: Dict[str, Any]) -> CompactionSettings:
     return settings
 
 
+#: pi's coding-agent retry defaults (`SettingsManager`: 3 retries, 2s base).
+DEFAULT_RETRY_POLICY = RetryPolicy(
+    enabled=True,
+    max_retries=3,
+    base_delay_ms=2000,
+    max_agent_delay_ms=DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+)
+
+
+def _as_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
+def retry_policy_from_wire(value: Optional[Dict[str, Any]]) -> Optional[RetryPolicy]:
+    """Map a settings `retry` dict onto a RetryPolicy, falling back per field
+    to pi's coding-agent defaults (enabled, 3 retries, 2s base, 60s cap)."""
+    if value is None:
+        return None
+    enabled = value.get("enabled")
+    max_retries = _as_count(value.get("maxRetries"))
+    base_delay_ms = _as_count(value.get("baseDelayMs"))
+    max_agent_delay_ms = _as_count(value.get("maxAgentDelayMs"))
+    return RetryPolicy(
+        enabled=enabled if isinstance(enabled, bool) else DEFAULT_RETRY_POLICY.enabled,
+        max_retries=max_retries if max_retries is not None else DEFAULT_RETRY_POLICY.max_retries,
+        base_delay_ms=base_delay_ms if base_delay_ms is not None else DEFAULT_RETRY_POLICY.base_delay_ms,
+        max_agent_delay_ms=(
+            max_agent_delay_ms
+            if max_agent_delay_ms is not None
+            else DEFAULT_RETRY_POLICY.max_agent_delay_ms
+        ),
+    )
+
+
 __all__ = [
+    "DEFAULT_RETRY_POLICY",
     "DEFAULT_SETTINGS_PATH",
     "PROJECT_SETTINGS_RELATIVE",
     "LoadedSettings",
@@ -226,4 +270,5 @@ __all__ = [
     "load_settings",
     "merge_default_tools",
     "resolve_default_tool_names",
+    "retry_policy_from_wire",
 ]

@@ -1,6 +1,6 @@
 """`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode;
 M5: RPC mode; M6: structured system prompt, context files and skills; M7:
-session navigation — tree, fork, clone, switch).
+session navigation — tree, fork, clone, switch; M8: auto-retry).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
@@ -56,6 +56,7 @@ from .settings import (
     compaction_settings_from_wire,
     load_settings,
     resolve_default_tool_names,
+    retry_policy_from_wire,
 )
 from .tools import create_default_tools
 
@@ -66,6 +67,7 @@ HELP_TEXT = """Commands:
   /help                 show this help
   /new                  start a fresh session
   /compact [focus]      compact the context now (optional extra instructions)
+  /retry [on|off]       show or toggle auto-retry of transient provider failures
   /tree [id]            show the session tree; with an id, move the branch tip there
   /tree --summarize <id>  move there and summarize the abandoned branch
   /fork [n|id]          fork from a user message (lists them when no argument)
@@ -84,9 +86,9 @@ Anything else is sent to the model."""
 def parse_command(line: str, template_names, skill_names=()):
     """Route one input line. Returns (kind, name, arg_string).
 
-    kind: "quit" | "help" | "new" | "compact" | "tree" | "fork" | "clone"
-          | "sessions" | "resume" | "name" | "session" | "templates"
-          | "skills" | "template" | "skill" | "prompt"
+    kind: "quit" | "help" | "new" | "compact" | "retry" | "tree" | "fork"
+          | "clone" | "sessions" | "resume" | "name" | "session"
+          | "templates" | "skills" | "template" | "skill" | "prompt"
 
     Templates and skills share one `/name` namespace, like pi's slash commands;
     templates win when a name is defined as both.
@@ -105,6 +107,8 @@ def parse_command(line: str, template_names, skill_names=()):
         return "new", None, ""
     if name == "compact":
         return "compact", None, rest
+    if name == "retry":
+        return "retry", None, rest
     if name == "tree":
         return "tree", None, rest
     if name == "fork":
@@ -224,6 +228,9 @@ class KarenCli:
             text = "".join(getattr(c, "text", "") for c in event.result.content)
             self._tool_line(f"[tool <-] {event.tool_name} ERROR: {text[:200]}")
         elif event.type == "agent_end" and not self.quiet_tools:
+            # A run that is about to be retried is not a failure (pi's `willRetry`).
+            if getattr(event, "will_retry", None):
+                return
             print()
             final = self.session.agent.state.messages[-1] if self.session else None
             if getattr(final, "stop_reason", None) == "error":
@@ -255,6 +262,26 @@ class KarenCli:
                 "[context overflow recovery failed after one compact-and-retry attempt; "
                 "try reducing context or switching to a larger-context model]",
                 file=sys.stderr,
+            )
+        elif event_type == "auto_retry_start":
+            seconds = event["delayMs"] / 1000
+            self._tool_line(
+                f"[retrying (attempt {event['attempt']}/{event['maxAttempts']}) "
+                f"in {seconds:.1f}s: {event['errorMessage']}]"
+            )
+        elif event_type == "auto_retry_end":
+            if event["success"]:
+                self._tool_line(f"[retry succeeded on attempt {event['attempt']}]")
+            elif event.get("finalError") == "Retry cancelled":
+                pass  # Ctrl-C already reported the interruption
+            else:
+                # the failed turn itself is reported by the agent_end handler
+                print(f"[auto-retry gave up after {event['attempt']} attempt(s)]", file=sys.stderr)
+        elif event_type == "summarization_retry_scheduled":
+            seconds = event["delayMs"] / 1000
+            self._tool_line(
+                f"[retrying summary (attempt {event['attempt']}/{event['maxAttempts']}) "
+                f"in {seconds:.1f}s: {event['errorMessage']}]"
             )
 
     # -- session ---------------------------------------------------------------
@@ -317,6 +344,7 @@ class KarenCli:
         if settings.session_dir and not os.environ.get("KAREN_SESSIONS_ROOT"):
             sessions_root = settings.session_dir
         tools = self._select_default_tools(settings.default_tools)
+        retry_policy = retry_policy_from_wire(settings.retry)
         self.session = AgentSession(
             cwd=self.cwd,
             models=self.models,
@@ -331,6 +359,7 @@ class KarenCli:
             compaction_settings=compaction_settings_from_wire(settings.compaction)
             if settings.compaction is not None
             else None,
+            retry_policy=retry_policy,
         )
         await self.session.open()
         self.session.subscribe(self._on_agent_event)
@@ -477,6 +506,20 @@ class KarenCli:
         name = await self.session.session_name()
         print(f"session name: {name or '(unnamed)'}")
 
+    def _handle_retry(self, rest: str) -> None:
+        """`/retry [on|off]` — pi's `setAutoRetryEnabled` toggle."""
+        argument = rest.strip().lower()
+        if argument in ("on", "off"):
+            self.session.set_auto_retry_enabled(argument == "on")
+        elif argument:
+            print("usage: /retry [on|off]", file=sys.stderr)
+            return
+        policy = self.session.retry
+        print(
+            f"auto-retry: {'on' if policy.enabled else 'off'} "
+            f"(maxRetries {policy.max_retries}, baseDelayMs {policy.base_delay_ms})"
+        )
+
     async def _print_session_info(self) -> None:
         stats = await self.session.session_stats()
         name = await self.session.session_name()
@@ -577,6 +620,9 @@ class KarenCli:
                 continue
             if kind == "compact":
                 await self.session.run_compaction("manual", custom_instructions=rest or None)
+                continue
+            if kind == "retry":
+                self._handle_retry(rest)
                 continue
             if kind in ("tree", "fork", "clone", "sessions", "resume", "name", "session"):
                 try:

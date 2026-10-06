@@ -15,11 +15,11 @@ Ported commands — the subset karen's AgentSession/Agent can serve:
     get_available_models, get_messages, get_last_assistant_text,
     get_entries, get_tree, get_fork_messages, fork, clone,
     switch_session, set_session_name, get_session_stats,
-    compact, set_auto_compaction
+    compact, set_auto_compaction, set_auto_retry, abort_retry
 
 Deviations from pi (all documented here and in the README):
-- the thinking-level commands, auto-retry, bash, export-html, get_commands
-  and the extension UI sub-protocol are out of scope (karen has no
+- the thinking-level commands, bash, export-html, get_commands and the
+  extension UI sub-protocol are out of scope (karen has no
   extensions/TUI yet and no bash-executor side channel).
 - `images` on prompt/steer/follow_up are not accepted (karen's app layer
   does not wire image input yet).
@@ -37,8 +37,10 @@ Deviations from pi (all documented here and in the README):
 - `prompt` reports `started`/`queued` at command time (pi resolves the
   response after preflight); the authoritative outcome still arrives
   through the event stream.
-- `set_auto_compaction` gates the threshold auto-compaction driver;
-  overflow recovery always runs.
+- `set_auto_compaction` gates the threshold auto-compaction driver and the
+  overflow recovery; auto-retry keeps running (pi's flags are independent).
+- `set_auto_retry` toggles the assistant-call retry policy, `abort_retry`
+  cancels an in-progress retry backoff; both match pi's commands.
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ _FORWARDED_SESSION_EVENTS = (
     "compaction_end",
     "overflow_retry",
     "overflow_give_up",
+    "auto_retry_start",
+    "auto_retry_end",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
     "session_tree",
     "session_info_changed",
 )
@@ -382,6 +389,12 @@ class RpcServer:
         if command_type == "set_auto_compaction":
             self.auto_compaction_enabled = bool(raw.get("enabled"))
             return _success(command_id, "set_auto_compaction")
+        if command_type == "set_auto_retry":
+            self.session.set_auto_retry_enabled(bool(raw.get("enabled")))
+            return _success(command_id, "set_auto_retry")
+        if command_type == "abort_retry":
+            self.session.abort_retry()
+            return _success(command_id, "abort_retry")
         return _error(command_id, str(command_type), f"Unknown command: {command_type}")
 
     @staticmethod

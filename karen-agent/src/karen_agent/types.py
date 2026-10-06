@@ -232,6 +232,9 @@ class AgentEndEvent(KarenBase):
 
     type: Literal["agent_end"] = "agent_end"
     messages: List[AgentMessage]
+    #: Set by the application layer when the failed run it is ending will be
+    #: retried (pi's `AgentSession` adds `willRetry` to the forwarded event).
+    will_retry: Optional[bool] = None
 
 
 class TurnStartEvent(KarenBase):

@@ -259,3 +259,59 @@ async def test_generate_branch_summary_end_to_end_with_fake_models():
     _, _, options = models.calls[0]
     assert options.cache_retention == "none"
     assert options.session_id
+
+
+async def test_generate_branch_summary_retries_transient_errors():
+    from karen_ai import RetryCallbacks, RetryPolicy
+
+    class FlakyModels:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete_simple(self, model, context, options=None):
+            self.calls += 1
+            if self.calls == 1:
+                failed = faux_assistant_message("", stop_reason="error")
+                failed.error_message = "overloaded_error"
+                return failed
+            return faux_assistant_message("retried summary")
+
+    events = []
+    models = FlakyModels()
+    result = await generate_branch_summary(
+        [_entry("1", _user("hello"))],
+        GenerateBranchSummaryOptions(
+            models=models,
+            model=faux_model(context_window=100000),
+            retry=RetryPolicy(enabled=True, max_retries=2, base_delay_ms=1, max_agent_delay_ms=1),
+            callbacks=RetryCallbacks(
+                on_retry_scheduled=lambda *args: events.append(("scheduled",) + args),
+                on_retry_finished=lambda *args: events.append(("finished",) + args),
+            ),
+        ),
+    )
+    assert isinstance(result, Ok)
+    assert "retried summary" in result.value.summary
+    assert models.calls == 2
+    assert events[0] == ("scheduled", 1, 2, 1, "overloaded_error")
+    assert events[-1] == ("finished", True, 1)
+
+
+async def test_generate_branch_summary_without_a_policy_reports_the_first_failure():
+    class FailingModels:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete_simple(self, model, context, options=None):
+            self.calls += 1
+            failed = faux_assistant_message("", stop_reason="error")
+            failed.error_message = "overloaded_error"
+            return failed
+
+    models = FailingModels()
+    result = await generate_branch_summary(
+        [_entry("1", _user("hello"))],
+        GenerateBranchSummaryOptions(models=models, model=faux_model(context_window=100000)),
+    )
+    assert isinstance(result, Err)
+    assert models.calls == 1
