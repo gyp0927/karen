@@ -24,9 +24,17 @@ from .grep import GREP_DESCRIPTION, GREP_SCHEMA, create_grep_tool
 from .ls import LS_DESCRIPTION, LS_SCHEMA, create_ls_tool
 
 
-def create_default_tools(cwd: Optional[str] = None) -> List[AgentTool]:
-    """karen's default tool set, in pi's order (powershell only on Windows)."""
-    tools: List[AgentTool] = [create_read_tool(cwd), create_bash_tool(cwd)]
+def create_default_tools(cwd: Optional[str] = None, *, shell_path: Optional[str] = None,
+                         shell_command_prefix: Optional[str] = None) -> List[AgentTool]:
+    """karen's default tool set, in pi's order (powershell only on Windows).
+
+    `shell_path`/`shell_command_prefix` customize the bash tool (pi's
+    `shellPath`/`shellCommandPrefix` settings).
+    """
+    tools: List[AgentTool] = [
+        create_read_tool(cwd),
+        create_bash_tool(cwd, command_prefix=shell_command_prefix, shell_path=shell_path),
+    ]
     if sys.platform == "win32":
         from .powershell import create_powershell_tool
 

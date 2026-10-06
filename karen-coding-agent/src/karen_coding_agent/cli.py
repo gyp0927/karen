@@ -31,6 +31,13 @@ from karen_agent import format_prompt_template_invocation, load_prompt_templates
 
 from .agent_session import AgentSession
 from .json_events import to_json_event
+from .settings import (
+    LoadedSettings,
+    compaction_settings_from_wire,
+    load_settings,
+    resolve_default_tool_names,
+)
+from .tools import create_default_tools
 
 DEFAULT_MODEL_ID = "deepseek-v4-pro"
 DEFAULT_CREDENTIALS = Path.home() / ".karen" / "credentials.json"
@@ -93,9 +100,13 @@ def build_models():
     return create_models(), "environment"
 
 
-def load_all_templates(cwd: str):
+def load_all_templates(cwd: str, extra_paths=None):
     result = load_prompt_templates(
-        [str(Path(cwd) / ".karen" / "prompts"), str(Path.home() / ".karen" / "prompts")]
+        [
+            str(Path(cwd) / ".karen" / "prompts"),
+            str(Path.home() / ".karen" / "prompts"),
+            *(extra_paths or []),
+        ]
     )
     return result.prompt_templates, result.diagnostics
 
@@ -104,20 +115,28 @@ class KarenCli:
     """Terminal front-end over `AgentSession`: event printing + the REPL."""
 
     def __init__(self, cwd: str, model_id: str, fresh: bool, quiet_tools: bool = False,
-                 provider: str = "deepseek", output_mode: str = "text") -> None:
+                 provider: str = "deepseek", output_mode: str = "text",
+                 loaded_settings: "LoadedSettings | None" = None) -> None:
         self.cwd = cwd
         self.provider = provider
         self.model_id = model_id
         self.fresh = fresh
         self.quiet_tools = quiet_tools  # headless: tool chatter goes to stderr
         self.output_mode = output_mode  # "text" (final reply) | "json" (event stream)
+        self.loaded_settings = loaded_settings if loaded_settings is not None else load_settings(cwd)
+        self.settings = self.loaded_settings.settings
         self.models, self.auth_source = build_models()
         if provider == "deepseek":
             self.models.set_provider(deepseek_provider())
         self.model = self.resolve_model()
-        self.templates, self.template_diagnostics = load_all_templates(cwd)
+        self.templates, self.template_diagnostics = load_all_templates(cwd, self.settings.prompts)
         self.session: AgentSession | None = None
         self.tool_counts = {}
+        for diagnostic in self.loaded_settings.diagnostics:
+            print(
+                f"[settings warning: Invalid settings file {diagnostic.path}: {diagnostic.message}]",
+                file=sys.stderr,
+            )
 
     def resolve_model(self):
         model = self.models.get_model(self.provider, self.model_id)
@@ -182,15 +201,46 @@ class KarenCli:
 
     # -- session ---------------------------------------------------------------
 
+    def _select_default_tools(self, entries):
+        """Apply a settings `defaultTools` list (pi's resolveDefaultTools)."""
+        all_tools = create_default_tools(
+            self.cwd,
+            shell_path=self.settings.shell_path,
+            shell_command_prefix=self.settings.shell_command_prefix,
+        )
+        names = resolve_default_tool_names(entries, [tool.name for tool in all_tools])
+        by_name = {tool.name: tool for tool in all_tools}
+        selected = []
+        for name in names:
+            tool = by_name.get(name)
+            if tool is None:
+                print(f"[settings warning: unknown tool in defaultTools: {name}]", file=sys.stderr)
+                continue
+            selected.append(tool)
+        return selected
+
     async def _open_session(self, fresh: bool) -> None:
         if self.session is not None:
             await self.session.close()
+        settings = self.settings
+        sessions_root = None
+        if settings.session_dir and not os.environ.get("KAREN_SESSIONS_ROOT"):
+            sessions_root = settings.session_dir
         self.session = AgentSession(
             cwd=self.cwd,
             models=self.models,
             model=self.model,
             fresh=fresh,
             listener=self._on_session_event,
+            sessions_root=sessions_root,
+            tools=self._select_default_tools(settings.default_tools)
+            if settings.default_tools is not None
+            else None,
+            shell_path=settings.shell_path,
+            shell_command_prefix=settings.shell_command_prefix,
+            compaction_settings=compaction_settings_from_wire(settings.compaction)
+            if settings.compaction is not None
+            else None,
         )
         await self.session.open()
         self.session.subscribe(self._on_agent_event)
@@ -293,15 +343,32 @@ def main(argv=None) -> int:
     parser.add_argument("--mode", choices=["text", "json"], default="text",
                         help="headless output mode: text (default, final reply only) or json (event stream)")
     parser.add_argument("--cwd", default=os.getcwd(), help="working directory for tools and session resume")
-    parser.add_argument("--model", default=os.environ.get("KAREN_MODEL", DEFAULT_MODEL_ID))
-    parser.add_argument("--provider", default=os.environ.get("KAREN_PROVIDER", "deepseek"))
+    parser.add_argument("--model", default=None,
+                        help="model id (default: KAREN_MODEL, then settings defaultModel, then deepseek-v4-pro)")
+    parser.add_argument("--provider", default=None,
+                        help="model provider (default: KAREN_PROVIDER, then settings defaultProvider, then deepseek)")
     parser.add_argument("--new", action="store_true", help="start a fresh session instead of resuming")
     parser.add_argument("messages", nargs="*", metavar="PROMPT",
                         help="prompt(s) for headless mode; several run sequentially")
     args = parser.parse_args(argv)
+    cwd = os.path.abspath(args.cwd)
+    loaded_settings = load_settings(cwd)
+    provider = (
+        args.provider
+        or os.environ.get("KAREN_PROVIDER")
+        or loaded_settings.settings.default_provider
+        or "deepseek"
+    )
+    model_id = (
+        args.model
+        or os.environ.get("KAREN_MODEL")
+        or loaded_settings.settings.default_model
+        or DEFAULT_MODEL_ID
+    )
     headless = args.print_flag or bool(args.messages) or args.mode == "json"
-    cli = KarenCli(cwd=os.path.abspath(args.cwd), model_id=args.model, fresh=args.new,
-                   quiet_tools=headless, provider=args.provider, output_mode=args.mode)
+    cli = KarenCli(cwd=cwd, model_id=model_id, fresh=args.new,
+                   quiet_tools=headless, provider=provider, output_mode=args.mode,
+                   loaded_settings=loaded_settings)
     if headless:
         return asyncio.run(cli.run_print(args.messages))
     return asyncio.run(cli.repl())

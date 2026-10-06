@@ -120,10 +120,47 @@ Verified against real DeepSeek: print mode had the model call
 `find(pattern='src/**/*.py')` → `grep(pattern='TODO', path='src')` and
 answer from the tool results.
 
+## M4: settings files
+
+`src/karen_coding_agent/settings.py` ports the mechanism of pi's
+`core/settings-manager.ts`, scoped down to what karen can consume. Global
+`~/.karen/settings.json` (override with `KAREN_SETTINGS_PATH`) plus project
+`<cwd>/.karen/settings.json`; the project file deep-merges over the global
+one (nested objects merge recursively; `defaultTools` gets pi's special
+`+name`/`-name` modifier merge). Like pi, files are not schema-validated:
+unknown keys are ignored, wrong-typed values dropped, and a malformed file
+yields a startup `[settings warning: ...]` on stderr and is skipped.
+
+Ported subset (camelCase wire keys, like pi):
+
+```json
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-pro",
+  "sessionDir": "~/.karen/sessions",
+  "shellPath": "C:/Program Files/Git/bin/bash.exe",
+  "shellCommandPrefix": "shopt -s expand_aliases",
+  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 },
+  "prompts": ["~/extra-prompts"],
+  "defaultTools": ["-powershell"]
+}
+```
+
+- `defaultProvider`/`defaultModel` resolve after `--provider`/`--model` and
+  `KAREN_PROVIDER`/`KAREN_MODEL`, before the built-in defaults.
+- `sessionDir` applies when `KAREN_SESSIONS_ROOT` is not set; `shellPath` and
+  `shellCommandPrefix` configure the bash tool; `prompts` adds extra template
+  directories (lowest precedence); `defaultTools` selects the session's tool
+  set (`["read", "grep"]` replaces the defaults, `["-powershell", "+ls"]`
+  modifies them).
+- `~` is expanded in path settings. Writes (pi's `/settings` command) and the
+  rest of pi's Settings (TUI, extensions, analytics, retry, themes, …) are
+  not ported.
+
 ## Roadmap
 
-Later milestones (tracked in the repo root README): settings file (M4), RPC
-mode / extensions / MCP / TUI (unscheduled).
+Later milestones (tracked in the repo root README): RPC mode / extensions /
+MCP / TUI (unscheduled).
 
 ## Development
 

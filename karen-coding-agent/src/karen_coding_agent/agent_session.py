@@ -103,6 +103,8 @@ class AgentSession:
         branch_name: str = DEFAULT_BRANCH,
         system_prompt: Optional[str] = None,
         tools: Optional[List[AgentTool]] = None,
+        shell_path: Optional[str] = None,
+        shell_command_prefix: Optional[str] = None,
         hooks: Optional[HookRegistry] = None,
         compaction_settings: Optional[CompactionSettings] = None,
         stream_fn: Optional[StreamFn] = None,
@@ -118,7 +120,11 @@ class AgentSession:
         )
         self.repo = JsonlSessionRepo(self.sessions_root)
         self.session: Optional[Session] = None
-        self.tools = tools if tools is not None else create_default_tools(cwd)
+        self.tools = (
+            tools
+            if tools is not None
+            else create_default_tools(cwd, shell_path=shell_path, shell_command_prefix=shell_command_prefix)
+        )
         self.system_prompt_text = (
             system_prompt
             if system_prompt is not None
