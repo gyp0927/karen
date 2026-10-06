@@ -113,9 +113,14 @@ vllm = openai_compatible_provider(
 
 ## 与 pi-ai 的范围差异
 
-**已移植**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 登录/刷新）、凭证/目录存储、Models 注册表、create_provider、全部 API 适配器（anthropic-messages / openai-completions / openai-responses / openai-codex-responses / azure-openai-responses / bedrock-converse-stream / google-generative-ai / google-vertex / mistral-conversations / pi-messages）、42 个内置 provider（生成目录 + OAuth 流程）、通用兼容工厂、图像生成（openrouter-images）、classifier（typesafe / cloudflare-workers-ai system-one）、Codex WebSocket 传输（会话复用 + `previous_response_id` 续传 + SSE 回退）、`compat.ts` / `legacy-api-aliases.ts` 旧全局 API、`generate-models.ts` 生成管线、pi-telemetry 运行时、faux 测试 provider。
+**已移植**：类型系统、事件流、lazy_stream、transcript 回放、鉴权（api-key + OAuth 登录/刷新）、凭证/目录存储、Models 注册表、create_provider、全部 API 适配器（anthropic-messages / openai-completions / openai-responses / openai-codex-responses / azure-openai-responses / bedrock-converse-stream / google-generative-ai / google-vertex / mistral-conversations / pi-messages）、42 个内置 provider（生成目录 + OAuth 流程）、通用兼容工厂、图像生成（openrouter-images）、classifier（typesafe / cloudflare-workers-ai system-one）、Codex WebSocket 传输（会话复用 + `previous_response_id` 续传 + SSE 回退）、`compat.ts` / `legacy-api-aliases.ts` 旧全局 API、`generate-models.ts` 生成管线、pi-telemetry 运行时、faux 测试 provider、上下文溢出检测（`utils/overflow.ts`：`is_context_overflow` / `is_recoverable_length`，错误消息模式 + 静默溢出（usage 超窗口）+ length-stop 溢出三种检测）。
 
-**尚未移植**：无已知项。
+**未移植（均为有意排除）**：
+- `utils/assistant-message-frame.ts`（可回放的流式进度帧）：只服务于 pi 的 durable runtime 恢复，karen 没有该运行时，无消费者。
+- `utils/uuid.ts`（uuidv7）：功能等价物在 karen-agent 的 `session/ids.py`（session/ compaction 主键用它生成）。
+- `api/cloudflare.ts` / `api/cloudflare-ai-binding.ts`：Cloudflare Workers 运行时专属（`env.AI` 绑定），Python 无对应物。
+- `cli.ts`（交互式 OAuth 登录小工具）与 `bun-oauth.ts`：Node/Bun 专属入口。
+- `test/context-overflow.test.ts`：打真实 provider 的 live 溢出测试（需要约 20 家 API key）；karen 用 examples 冒烟代替。
 
 与 pi-ai 的**有意差异**：
 - `stream` 系列入口必须在运行中的事件循环里调用（`pi-ai` 同步返回流的设计在 Python 里通过后台 task 实现）。

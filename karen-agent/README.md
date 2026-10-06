@@ -118,7 +118,8 @@ printf 'hello\n/quit\n' | python examples/karen_cli.py --new   # scripted/piped
 - **Auto-compaction**: when estimated context tokens cross
   `context_window - reserve_tokens`, the model writes a structured summary that
   is persisted as a compaction entry and the context rebuilds from it.
-  `/compact [focus]` triggers it manually.
+  `/compact [focus]` triggers it manually. A context overflow instead compacts
+  with reason `"overflow"` and retries the turn once (see M7).
 - **Prompt templates**: `/templates` lists templates from `.karen/prompts`
   (project) and `~/.karen/prompts` (user); `/name args...` expands `$1`, `$@`,
   `${@:N:L}` and sends the result.
@@ -245,6 +246,37 @@ only a connect timeout (pi's `fetch` sets none).
 See [`examples/agent_env_proxy_smoke.py`](examples/agent_env_proxy_smoke.py) —
 keyless verification: env ops against the real local bash, and an `Agent`
 driven by `stream_proxy` against a scripted loopback proxy server.
+
+## Overflow detection & recovery (M7)
+
+M7 closes the last pi-ai gap: `karen_ai.utils.overflow` ports
+`utils/overflow.ts` — `is_context_overflow(message, context_window)` detects
+provider context-overflow errors (23 message patterns plus Cerebras' bodyless
+400/413, minus throttling/rate-limit lookalikes), silent overflow (a successful
+response whose `usage.input + cache_read` exceeds the context window, z.ai
+style), and length-stop overflow (Xiaomi MiMo's zero-output `"length"` stop on
+a filled context). `is_recoverable_length(message, desired_max_output)` flags
+truncated responses worth one compact-and-retry attempt. In pi, only the
+durable runtime and the coding-agent app consume this; karen has no durable
+runtime, so the consumer is the demo CLI, which now implements the overflow
+branch of pi's `AgentSession._checkCompaction`:
+
+- an overflow **error** or recoverable length stop drops the failed attempt
+  from the transcript (`_omit_final_attempt`, pi's `_omitRecoveryAttempt`),
+  compacts with reason `"overflow"`, and retries the turn once via
+  `agent_loop_continue`; a second overflow keeps the failure and gives up with
+  pi's "recovery failed after one compact-and-retry attempt" message;
+- a **silent overflow** on a successful response compacts with reason
+  `"overflow"` without retrying (a completed response cannot be continued);
+- the check skips aborted messages and messages from a different model (pi's
+  model-switch guard).
+
+Simplifications, documented at `_overflow_action`: the CLI transcript is
+append-only, so pi's projection/context-edit retention guards are trivially
+true and dropped; and only fresh post-run messages are checked, so pi's stale
+pre-compaction guard cannot trigger. This also retires the dead `"overflow"`
+literal the `before_compaction` hook declared since M3 — something can finally
+produce it.
 
 ## Built-in tools (M2)
 

@@ -2,7 +2,9 @@
 
 - agent loop with the built-in read/write/edit/bash tools, streaming output
 - sessions persisted under ~/.karen/sessions (resume per working directory)
-- automatic + manual compaction, persisted as compaction entries
+- automatic + manual compaction, persisted as compaction entries; a context
+  overflow (or recoverable length stop) triggers "overflow" compaction and one
+  bounded compact-and-retry attempt (pi's AgentSession overflow recovery)
 - prompt templates from .karen/prompts (project) and ~/.karen/prompts (user),
   invocable as /name args...
 - a HookRegistry wired into the loop's tool hooks (demo: a path guard +
@@ -26,6 +28,7 @@ from pathlib import Path
 
 from karen_ai import CreateModelsOptions, JsonFileCredentialStore, SystemMessage, UserMessage, create_models
 from karen_ai.providers import deepseek_provider
+from karen_ai.utils.overflow import is_context_overflow, is_recoverable_length
 from karen_agent import (
     AfterToolEvent,
     AgentContext,
@@ -38,6 +41,7 @@ from karen_agent import (
     PromptTemplate,
     ToolBlock,
     agent_loop,
+    agent_loop_continue,
     convert_to_llm,
     format_prompt_template_invocation,
     load_prompt_templates,
@@ -346,15 +350,9 @@ class KarenCli:
 
     # -- the agent turn -----------------------------------------------------------
 
-    async def run_turn(self, prompt_text: str) -> None:
-        prompt = UserMessage(content=prompt_text, timestamp=now_ms())
-        config = AgentLoopConfig(
-            model=self.model,
-            convert_to_llm=convert_to_llm,
-            before_tool_call=self._before_tool_call,
-            after_tool_call=self._after_tool_call,
-        )
-        stream = agent_loop([prompt], self.context, config, None, models_stream_fn(self.models))
+    async def _drive(self, stream):
+        """Consume one agent stream, printing text deltas and tool calls, and
+        return the run's NEW messages (prompt first on the initial drive)."""
         async for event in stream:
             if event.type == "message_update" and event.assistant_message_event.type == "text_delta":
                 print(event.assistant_message_event.delta, end="", flush=True)
@@ -365,14 +363,87 @@ class KarenCli:
                     text = "".join(getattr(c, "text", "") for c in event.result.content)
                     print(f"[tool <-] {event.tool_name} ERROR: {text[:200]}")
         print()
-        # stream.result() is the run's NEW messages (prompt first); the loop works
-        # on its own copy of the context, so extend ours to stay in sync.
-        new_messages = await stream.result()
-        final = new_messages[-1]
+        return await stream.result()
+
+    async def _persist_and_extend(self, messages) -> None:
+        await self.persist_messages(messages)
+        # the loop works on its own copy of the context, so extend ours to stay in sync
+        self.context.messages = [*self.context.messages, *messages]
+
+    @staticmethod
+    def _omit_final_attempt(messages):
+        """Drop the final assistant attempt (the failed message plus any tool
+        results it produced) — pi's `_omitRecoveryAttempt`."""
+        index = len(messages) - 1
+        while index > 0 and getattr(messages[index], "role", None) != "assistant":
+            index -= 1
+        return list(messages[:index])
+
+    def _overflow_action(self, message):
+        """pi's `AgentSession._checkCompaction` overflow branch: "retry"
+        (compact + retry the turn), "compact_only" (compact but keep the
+        completed response), or None.
+
+        Simplifications (the CLI transcript is append-only, so pi's
+        projection/context-edit retention guards are trivially true, and only
+        fresh post-run messages are checked, so pi's stale pre-compaction
+        guard cannot trigger): no projection comparison, no compaction-
+        boundary timestamp check.
+        """
+        if getattr(message, "role", None) != "assistant" or message.stop_reason == "aborted":
+            return None
+        # pi skips the check when the message came from a different model (the
+        # user switched to a larger-context model after the overflow).
+        if message.provider != self.model.provider or message.model != self.model.id:
+            return None
+        overflow = is_context_overflow(message, self.model.context_window or None)
+        recoverable = is_recoverable_length(message, self.model.max_tokens or 0)
+        if not (overflow or recoverable):
+            return None
+        # pi: willRetry = stopReason !== "stop" — agent.continue() cannot
+        # continue from a completed assistant response.
+        return "compact_only" if message.stop_reason == "stop" else "retry"
+
+    async def run_turn(self, prompt_text: str) -> None:
+        prompt = UserMessage(content=prompt_text, timestamp=now_ms())
+        config = AgentLoopConfig(
+            model=self.model,
+            convert_to_llm=convert_to_llm,
+            before_tool_call=self._before_tool_call,
+            after_tool_call=self._after_tool_call,
+        )
+        stream_fn = models_stream_fn(self.models)
+        new_messages = await self._drive(agent_loop([prompt], self.context, config, None, stream_fn))
+
+        # Overflow recovery: one bounded compact-and-retry attempt per prompt.
+        recovery_attempted = False
+        while True:
+            final = new_messages[-1] if new_messages else None
+            action = self._overflow_action(final)
+            if action == "retry" and not recovery_attempted:
+                recovery_attempted = True
+                # the failed attempt never reaches the transcript
+                await self._persist_and_extend(self._omit_final_attempt(new_messages))
+                if await self.run_compaction("overflow"):
+                    print("[context overflow: compacted; retrying the turn]")
+                    new_messages = await self._drive(agent_loop_continue(self.context, config, None, stream_fn))
+                    continue
+                new_messages = []
+                break
+            if action == "retry":  # recovery already attempted: keep the failure and give up
+                print(
+                    "[context overflow recovery failed after one compact-and-retry attempt; "
+                    "try reducing context or switching to a larger-context model]",
+                    file=sys.stderr,
+                )
+            await self._persist_and_extend(new_messages)
+            if action == "compact_only":
+                await self.run_compaction("overflow")
+            break
+
+        final = new_messages[-1] if new_messages else None
         if getattr(final, "stop_reason", None) == "error":
             print(f"[run failed: {final.error_message}]", file=sys.stderr)
-        await self.persist_messages(new_messages)
-        self.context.messages = [*self.context.messages, *new_messages]
         print(f"[context ~{self.estimate_tokens()} tokens; tools used: {self.tool_counts or '{}'}]")
         await self.maybe_auto_compact()
 

@@ -1,6 +1,7 @@
 """Utility helpers for karen-ai."""
 
 from .estimate import estimate_context_tokens
+from .overflow import get_overflow_patterns, is_context_overflow, is_recoverable_length
 from .json_parse import parse_json_with_repair, parse_streaming_json, repair_json
 from .provider_env import get_provider_env_value
 from .retry import ProviderHttpError, retry_provider_request
@@ -11,6 +12,9 @@ from .validation import validate_tool_arguments, validate_tool_call
 
 __all__ = [
     "estimate_context_tokens",
+    "is_context_overflow",
+    "is_recoverable_length",
+    "get_overflow_patterns",
     "validate_tool_arguments",
     "validate_tool_call",
     "parse_json_with_repair",
