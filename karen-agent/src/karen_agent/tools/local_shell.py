@@ -104,6 +104,23 @@ def resolve_shell_config(shell_path: Optional[str] = None) -> ShellConfig:
     return ShellConfig("sh", ["-c"])
 
 
+#: pi's POWERSHELL_ARGS (coding-agent `utils/shell.ts`).
+POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+
+
+def powershell_shell_config() -> ShellConfig:
+    """Resolve PowerShell on Windows, preferring PowerShell 7 (pi's getPowerShellConfig)."""
+    if sys.platform != "win32":
+        raise ExecutionError("shell_unavailable", "The powershell tool is only available on Windows.")
+    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if not shell:
+        raise ExecutionError(
+            "shell_unavailable",
+            "No PowerShell executable found. Install PowerShell or add powershell.exe/pwsh.exe to PATH.",
+        )
+    return ShellConfig(shell, list(POWERSHELL_ARGS))
+
+
 def validate_timeout(timeout: Optional[float]) -> None:
     """pi's bash schema + env validation for the timeout argument."""
     if timeout is None:
@@ -152,6 +169,7 @@ async def run_shell_command(
     inherit_env: bool = True,
     timeout: Optional[float] = None,
     shell_path: Optional[str] = None,
+    shell_config: Optional[ShellConfig] = None,
     capture: OutputCapture,
     spill: bool = False,
     signal: Optional[AbortSignal] = None,
@@ -172,7 +190,7 @@ async def run_shell_command(
         raise ExecutionError(
             "spawn_error", f"Working directory does not exist: {cwd_abs}\nCannot execute bash commands."
         )
-    config = resolve_shell_config(shell_path)
+    config = shell_config if shell_config is not None else resolve_shell_config(shell_path)
     merged_env = {**os.environ, **(env or {})} if inherit_env else dict(env or {})
 
     use_stdin = config.transport == "stdin"

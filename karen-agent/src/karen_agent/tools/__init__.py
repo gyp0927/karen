@@ -11,7 +11,14 @@ import os
 from typing import List, Optional
 
 from ..types import AgentTool
-from .bash import BASH_DESCRIPTION, BASH_SCHEMA, BashExecution, BashPrepare, create_bash_tool
+from .bash import (
+    BASH_DESCRIPTION,
+    BASH_SCHEMA,
+    BashExecution,
+    BashPrepare,
+    create_bash_tool,
+    create_shell_tool,
+)
 from .edit import EDIT_DESCRIPTION, EDIT_SCHEMA, create_edit_tool, prepare_edit_arguments
 from .edit_diff import (
     AppliedEditsResult,
@@ -83,6 +90,7 @@ __all__ = [
     "ShellConfig",
     "apply_edits_to_normalized_content",
     "create_bash_tool",
+    "create_shell_tool",
     "create_builtin_tools",
     "create_edit_tool",
     "create_read_tool",

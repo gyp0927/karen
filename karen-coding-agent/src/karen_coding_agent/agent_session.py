@@ -61,13 +61,13 @@ from karen_agent.session import (
 )
 from karen_agent.session.context import build_session_context
 from karen_agent.session.types import CompactionEntry
-from karen_agent.tools import create_builtin_tools
+from .tools import create_default_tools
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".karen" / "sessions"
 DEFAULT_BRANCH = "main"
 DEFAULT_SYSTEM_PROMPT = """You are karen, an AI coding assistant.
 The working directory is {cwd}; relative tool paths resolve against it.
-Use the read/write/edit/bash tools to inspect and modify files.
+Use the read/write/edit tools to inspect and modify files, bash{powershell} to run commands, and find/grep/ls to search.
 Keep answers concise."""
 
 
@@ -117,9 +117,13 @@ class AgentSession:
         )
         self.repo = JsonlSessionRepo(self.sessions_root)
         self.session: Optional[Session] = None
-        self.tools = tools if tools is not None else create_builtin_tools(cwd)
+        self.tools = tools if tools is not None else create_default_tools(cwd)
         self.system_prompt_text = (
-            system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT.format(cwd=cwd)
+            system_prompt
+            if system_prompt is not None
+            else DEFAULT_SYSTEM_PROMPT.format(
+                cwd=cwd, powershell="/powershell" if sys.platform == "win32" else ""
+            )
         )
         self.settings = compaction_settings or CompactionSettings()
         self.hooks = hooks if hooks is not None else HookRegistry(_report_hook_error)

@@ -308,6 +308,11 @@ context = AgentContext(messages=[], tools=create_builtin_tools("/path/to/project
   on POSIX), combined stdout+stderr, tail truncation (last 2000 lines/50KB)
   with full output spilled to a temp file, timeout and abort kill the whole
   process tree, streaming partial results via `on_update`.
+  `create_shell_tool` generalizes the factory for other shells (custom
+  `name`/`label`/`description`/`parameters`, `command_prefix`, explicit
+  `shell_config`); `local_shell.powershell_shell_config()` provides pi's
+  PowerShell invocation on Windows (used by karen-coding-agent's
+  `powershell` tool).
 
 Error messages, truncation footers, and result `details` shapes match pi
 byte-for-byte (camelCase keys). Differences from pi, all consequences of

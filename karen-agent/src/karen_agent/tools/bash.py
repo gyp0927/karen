@@ -22,6 +22,7 @@ from ..utils.truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size
 from .local_shell import (
     MAX_TIMEOUT_SECONDS,
     ExecutionError,
+    ShellConfig,
     format_js_number,
     run_shell_command,
     validate_timeout,
@@ -66,14 +67,25 @@ def _details_from_view(view: ShellOutputView) -> Optional[Dict[str, Any]]:
     return details
 
 
-def create_bash_tool(
+def create_shell_tool(
     cwd: Optional[str] = None,
     *,
+    name: str = "bash",
+    label: Optional[str] = None,
+    description: Optional[str] = None,
+    parameters: Optional[Dict[str, Any]] = None,
     command_prefix: Optional[str] = None,
     prepare: Optional[BashPrepare] = None,
     shell_path: Optional[str] = None,
+    shell_config: Optional["ShellConfig"] = None,
 ) -> AgentTool:
-    """Create the `bash` tool. `cwd` defaults to the process cwd at call time."""
+    """Create a shell execution tool (pi coding-agent's createShellToolDefinition).
+
+    Defaults build the `bash` tool; pass `name`/`label`/`description`/
+    `parameters` and an explicit `shell_config` (e.g.
+    `local_shell.powershell_shell_config()`) for other shells. `cwd` defaults
+    to the process cwd at call time.
+    """
 
     async def execute(tool_call_id: str, params: Dict[str, Any], signal, on_update) -> AgentToolResult:
         command = params["command"]
@@ -120,6 +132,7 @@ def create_bash_tool(
                 inherit_env=execution.inherit_env,
                 timeout=timeout,
                 shell_path=shell_path,
+                shell_config=shell_config,
                 capture=capture,
                 spill=True,
                 signal=signal,
@@ -168,11 +181,24 @@ def create_bash_tool(
         )
 
     return AgentTool(
-        name="bash",
-        label="bash",
-        description=BASH_DESCRIPTION,
-        parameters=BASH_SCHEMA,
+        name=name,
+        label=label or name,
+        description=description or BASH_DESCRIPTION,
+        parameters=parameters if parameters is not None else BASH_SCHEMA,
         execute=execute,
+    )
+
+
+def create_bash_tool(
+    cwd: Optional[str] = None,
+    *,
+    command_prefix: Optional[str] = None,
+    prepare: Optional[BashPrepare] = None,
+    shell_path: Optional[str] = None,
+) -> AgentTool:
+    """Create the `bash` tool. `cwd` defaults to the process cwd at call time."""
+    return create_shell_tool(
+        cwd, command_prefix=command_prefix, prepare=prepare, shell_path=shell_path
     )
 
 
@@ -183,4 +209,5 @@ __all__ = [
     "BashPrepare",
     "MAX_TIMEOUT_SECONDS",
     "create_bash_tool",
+    "create_shell_tool",
 ]

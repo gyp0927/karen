@@ -191,7 +191,8 @@ class KarenCli:
 
     async def repl(self) -> int:
         await self._open_session(self.fresh)
-        print(f"model: {self.provider}/{self.model.id} | cwd: {self.cwd} | tools: read write edit bash")
+        tool_names = " ".join(tool.name for tool in self.session.tools)
+        print(f"model: {self.provider}/{self.model.id} | cwd: {self.cwd} | tools: {tool_names}")
         print("type /help for commands")
         if self.template_diagnostics:
             for diagnostic in self.template_diagnostics:

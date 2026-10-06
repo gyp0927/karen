@@ -75,11 +75,43 @@ Credentials come from `~/.karen/credentials.json` (override with
 model is `deepseek/deepseek-v4-pro` (override with `--model` or
 `KAREN_MODEL`).
 
+## M2: find/grep/ls/powershell tools
+
+`src/karen_coding_agent/tools/` ports pi coding-agent's `core/tools/`
+application-level tools, and `create_default_tools(cwd)` is now
+`AgentSession`'s default tool set in pi's order: **read, bash, powershell
+(Windows only), edit, write, grep, find, ls**.
+
+- **find / grep** (`find.py`, `grep.py`): pi shells out to `fd`/`rg` binaries
+  downloaded on demand from GitHub releases; karen walks and searches
+  **in-process** (`walk.py` + `globs.py`) with the same semantics — pi's
+  glob dialects (fd-style full-path patterns get an implicit `**/` prefix),
+  gitignore-aware pruning (`.git` always pruned, hidden files included,
+  deepest `.gitignore`/`.ignore` wins, `.ignore` outranks `.gitignore` in the
+  same directory), `path:line: text` match / `path-line- text` context
+  format, long-line truncation to 500 chars, binary files searched only up
+  to the first NUL byte, and pi's exact notices/details
+  (`resultLimitReached`/`matchLimitReached`/`linesTruncated`/`truncation`).
+  Known deviations: ignore files *above* the search root and the global
+  gitignore are not consulted, `.fdignore` is not read, results are sorted
+  case-insensitively (fd/rg order is unspecified), and regex syntax is
+  Python `re`.
+- **ls** (`ls.py`): pure-Python like pi's pure-JS original.
+- **powershell** (`powershell.py`, Windows only): karen-agent's
+  `create_shell_tool` over PowerShell with pi's
+  `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` invocation
+  and UTF-8 output prefix (`pwsh.exe` preferred, `powershell.exe` fallback).
+  pi's `PI_*` session env vars and spawn hooks are not ported yet.
+
+Verified against real DeepSeek: print mode had the model call
+`find(pattern='src/**/*.py')` → `grep(pattern='TODO', path='src')` and
+answer from the tool results.
+
 ## Roadmap
 
-Later milestones (tracked in the repo root README): find/grep/ls/powershell
-tools (M2), print/JSON machine-readable output (M3), settings file (M4), RPC
-mode / extensions / MCP / TUI (unscheduled).
+Later milestones (tracked in the repo root README): print/JSON
+machine-readable output (M3), settings file (M4), RPC mode / extensions /
+MCP / TUI (unscheduled).
 
 ## Development
 

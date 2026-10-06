@@ -2,12 +2,19 @@
 
 import asyncio
 import os
+import sys
+from pathlib import Path
 
 import pytest
 from karen_ai import AbortController
 
-from karen_agent.tools import BashExecution, create_bash_tool
-from karen_agent.tools.local_shell import resolve_shell_config
+from karen_agent.tools import BashExecution, create_bash_tool, create_shell_tool
+from karen_agent.tools.local_shell import (
+    POWERSHELL_ARGS,
+    ExecutionError,
+    powershell_shell_config,
+    resolve_shell_config,
+)
 
 try:
     _SHELL = resolve_shell_config()
@@ -160,3 +167,42 @@ async def test_bash_missing_cwd(tmp_path):
     with pytest.raises(RuntimeError) as excinfo:
         await _run(create_bash_tool(str(tmp_path / "missing")), {"command": "true"})
     assert "Cannot execute bash commands." in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# create_shell_tool generalization + powershell_shell_config (karen-coding-agent M2)
+# ---------------------------------------------------------------------------
+
+
+async def test_create_shell_tool_custom_identity_and_parameters(tmp_path):
+    schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "PowerShell command to execute"},
+            "timeout": {"type": "number"},
+        },
+        "required": ["command"],
+    }
+    tool = create_shell_tool(
+        str(tmp_path), name="powershell", label="powershell", description="Run PowerShell", parameters=schema
+    )
+    assert tool.name == "powershell"
+    assert tool.label == "powershell"
+    assert tool.description == "Run PowerShell"
+    assert tool.parameters["properties"]["command"]["description"] == "PowerShell command to execute"
+    # still runs on the default bash config when no shell_config is passed
+    result = await _run(tool, {"command": "echo via-custom-shell"})
+    assert result.content[0].text == "via-custom-shell\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="powershell_shell_config is Windows-only")
+def test_powershell_shell_config_finds_executable():
+    config = powershell_shell_config()
+    assert config.args == POWERSHELL_ARGS
+    assert Path(config.shell).name.lower() in {"pwsh.exe", "powershell.exe"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="only raises off Windows")
+def test_powershell_shell_config_raises_off_windows():
+    with pytest.raises(ExecutionError):
+        powershell_shell_config()
