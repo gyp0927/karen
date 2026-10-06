@@ -1,10 +1,11 @@
 """RPC-mode protocol tests: command dispatch, event stream shaping, and
 `new_session` rebinding — driven offline with the faux provider over
-in-memory lines (the real stdin/stdout loop is covered by the smoke test).
+in-memory lines, plus one child-process test over real stdin/stdout pipes.
 """
 
 import asyncio
 import json
+import sys
 
 from karen_ai import create_models
 from karen_ai.providers import faux_assistant_message, faux_model, register_faux_provider
@@ -138,6 +139,100 @@ async def test_rpc_malformed_lines_are_reported(tmp_path):
     state = _response(lines, None, "get_state")
     assert state["success"] is True
     await session.close()
+
+
+# ---------------------------------------------------------------------------
+# the real stdio loop: child process, real pipes
+# ---------------------------------------------------------------------------
+
+#: Drives `run_rpc_mode` in a child process over its actual stdin/stdout, so
+#: the blocking stdin reader and the flushing stdout emitter are exercised.
+_RPC_CHILD_SCRIPT = """
+import asyncio, tempfile, sys
+from karen_ai import create_models
+from karen_ai.providers import faux_assistant_message, register_faux_provider
+from karen_coding_agent import AgentSession
+from karen_coding_agent.rpc import run_rpc_mode
+
+
+async def main():
+    models = create_models()
+    registration = register_faux_provider(responses=[faux_assistant_message("pong")])
+    models.set_provider(registration.provider)
+    tmp = tempfile.mkdtemp(prefix="karen-rpc-child-")
+    session = AgentSession(
+        cwd=tmp,
+        models=models,
+        model=registration.get_model(),
+        sessions_root=tmp,
+        fresh=True,
+    )
+    await session.open()
+    try:
+        return await run_rpc_mode(session)
+    finally:
+        await session.close()
+
+
+sys.exit(asyncio.run(main()))
+"""
+
+
+async def test_rpc_stdio_loop_over_real_pipes():
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _RPC_CHILD_SCRIPT,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def read_line(timeout: float = 60) -> dict:
+        raw = await asyncio.wait_for(proc.stdout.readline(), timeout)
+        assert raw, f"child closed stdout (stderr: {await _drain_stderr(proc)})"
+        return json.loads(raw.decode("utf-8"))
+
+    async def command(obj: dict) -> dict:
+        proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+        while True:
+            line = await read_line()
+            if line.get("type") == "response" and line.get("id") == obj.get("id"):
+                return line
+
+    try:
+        header = await read_line()
+        assert header.get("kind") == "header" and header.get("id")
+
+        started = await command({"type": "prompt", "message": "ping", "id": "p1"})
+        assert started["success"] and started["data"]["disposition"] == "started"
+
+        # events stream between the response and the next command's response
+        events = []
+        while True:
+            line = await read_line()
+            events.append(line.get("type"))
+            if line.get("type") == "agent_end":
+                break
+        assert "message_update" in events and events[-1] == "agent_end"
+
+        text = await command({"type": "get_last_assistant_text", "id": "t1"})
+        assert text["data"]["text"] == "pong"
+
+        proc.stdin.close()
+        assert await asyncio.wait_for(proc.wait(), 30) == 0
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+async def _drain_stderr(proc) -> str:
+    try:
+        return (await asyncio.wait_for(proc.stderr.read(), 5)).decode("utf-8", "replace")
+    except asyncio.TimeoutError:  # pragma: no cover - diagnostics only
+        return "<stderr read timed out>"
 
 
 # ---------------------------------------------------------------------------
