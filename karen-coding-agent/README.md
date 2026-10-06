@@ -46,8 +46,9 @@ await session.close()
 - **Lifecycle events** for the UI via `listener`: `session_opened`,
   `compaction_start`/`compaction_end`, `overflow_retry`, `overflow_give_up`.
 
-Simplifications vs pi (documented at the port sites): no settings manager,
-session projections, context edits, auto-retry, or extension events; pi's
+Simplifications vs pi (documented at the port sites): no settings manager on
+the session itself (the CLI loads the settings files, see M4), no session
+projections, context edits, auto-retry, or extension events; pi's
 retention/staleness guards are dropped because karen sessions are append-only
 and only fresh post-run messages are checked.
 
@@ -58,6 +59,7 @@ karen [--cwd PATH] [--model ID] [--new]     # interactive REPL
 karen -p "summarize this repo"              # headless text mode: final reply on stdout
 karen "one" "two"                           # headless: prompts run sequentially
 karen --mode json "prompt"                  # headless JSON event stream
+karen --mode rpc                            # JSON command protocol on stdin/stdout (M5)
 printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive it)
 ```
 
@@ -157,10 +159,63 @@ Ported subset (camelCase wire keys, like pi):
   rest of pi's Settings (TUI, extensions, analytics, retry, themes, …) are
   not ported.
 
+## M5: RPC mode
+
+`src/karen_coding_agent/rpc.py` ports pi's `modes/rpc/` protocol onto karen's
+`AgentSession`: commands are one JSON object per line on stdin, responses and
+events are one JSON object per line on stdout.
+
+```bash
+karen --mode rpc [--new] [--cwd PATH]
+printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_state","id":"2"}' \
+  | karen --mode rpc --new
+```
+
+- **stdout** starts with the session header line (same as `--mode json`) and
+  then carries only two kinds of lines:
+  - responses: `{"id", "type":"response", "command", "success":true, "data":{…}}`
+    or `{"…", "success":false, "error":"…"}`; `id` echoes the command's id
+    (`null` for parse errors);
+  - events: the `--mode json` shapes (`agent_start`, `message_update` with
+    delta sub-events, `tool_execution_start/end`, `agent_end`, …) plus
+    `compaction_start`/`compaction_end`/`overflow_retry`/`overflow_give_up`.
+  Everything else (session notices, hook errors) goes to stderr.
+- **Commands**: `prompt`, `steer`, `follow_up`, `abort`, `clear_queue`,
+  `new_session`, `get_state`, `set_model`, `set_steering_mode`,
+  `set_follow_up_mode`, `get_available_models`, `get_messages`,
+  `get_last_assistant_text`, `get_entries`, `compact`,
+  `set_auto_compaction`. Unknown commands and malformed lines are answered
+  with `success:false` (`command:"parse"` for JSON errors) — the loop keeps
+  running; stdin EOF exits 0.
+- **`prompt` while a run is active** is queued as a steering message and
+  answered `{"disposition":"queued"}` (pi's default `streamingBehavior:
+  "steer"`); when idle it answers `{"disposition":"started"}` and the run's
+  progress arrives on the event stream. Deviation: karen reports the
+  disposition at command time, where pi resolves its response after preflight.
+- **`new_session`** opens a brand-new session for the cwd (closing the old
+  one) and emits the new header line; pi's `parentSession` (fork) is not
+  supported. `get_state` reports model, thinkingLevel, isStreaming,
+  isCompacting, steeringMode/followUpMode, sessionId/sessionFile,
+  autoCompactionEnabled, messageCount and pendingMessageCount.
+- **`set_auto_compaction`** gates the post-run threshold check only; overflow
+  recovery (compact-and-retry) always runs. Manual `compact` answers
+  `{"compacted": bool}`.
+- `get_entries` answers branch entry *ids* + `leafId` instead of pi's
+  `SessionEntry` objects (karen's AgentSession emits no entry events).
+- Not ported: the thinking-level commands, auto-retry, pi's bash side
+  channel, fork/clone/switch/export-html/session-stats, `get_commands` and
+  the extension UI sub-protocol (karen has no extensions or TUI yet), and
+  image inputs on `prompt`/`steer`/`follow_up`.
+
+Verified against real DeepSeek over real stdio: header → `prompt` → full event
+stream → `get_last_assistant_text` = `"RPC-OK"`, model switching,
+`new_session` rebinding (second header), unknown-command/parse-error
+responses, and a clean exit 0 on EOF.
+
 ## Roadmap
 
-Later milestones (tracked in the repo root README): RPC mode / extensions /
-MCP / TUI (unscheduled).
+Later milestones (tracked in the repo root README): extensions / MCP / TUI /
+image input / fork and branch-navigation RPC commands (unscheduled).
 
 ## Development
 

@@ -363,7 +363,7 @@ fork = await repo.fork(session.metadata, BranchForkOptions(branch="main", entry_
   shapes stay plain dicts. `to_jsonable` (exported from `karen_agent.session.jsonl`)
   normalizes any pydantic model to this wire form, and `Session.storage` exposes the
   underlying storage (e.g. `JsonlStorage.header`) — both used by karen-coding-agent's
-  `--mode json` event stream.
+  `--mode json` event stream and its RPC mode.
 - **Crash safety**: appends are line-atomic; a torn final line is discarded and the file
   repaired on open; snapshot rewrites (fork) publish via temp-file + rename.
 - **Not ported** (out of M1 scope): the durable runtime operation state machine

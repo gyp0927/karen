@@ -1,4 +1,5 @@
-"""`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode).
+"""`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode;
+M5: RPC mode).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
@@ -7,6 +8,7 @@ Headless (print mode, pi's runPrintMode):
     karen -p "summarize this repo" [--cwd PATH]   # final reply text on stdout
     karen "one prompt" "another prompt"           # prompts run sequentially
     karen --mode json "prompt"                    # JSON event stream on stdout
+    karen --mode rpc                              # JSON command protocol (see rpc.py)
 
 Piping into the REPL works too (that's how the smokes drive it):
     printf 'hello\n/quit\n' | karen --new
@@ -31,6 +33,7 @@ from karen_agent import format_prompt_template_invocation, load_prompt_templates
 
 from .agent_session import AgentSession
 from .json_events import to_json_event
+from .rpc import run_rpc_mode
 from .settings import (
     LoadedSettings,
     compaction_settings_from_wire,
@@ -340,8 +343,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="karen", description="karen — AI coding assistant")
     parser.add_argument("-p", "--print", dest="print_flag", action="store_true",
                         help="headless print mode: run the prompt(s), print the reply, exit")
-    parser.add_argument("--mode", choices=["text", "json"], default="text",
-                        help="headless output mode: text (default, final reply only) or json (event stream)")
+    parser.add_argument("--mode", choices=["text", "json", "rpc"], default="text",
+                        help="headless output mode: text (default, final reply only), "
+                             "json (event stream), or rpc (interactive JSON command protocol)")
     parser.add_argument("--cwd", default=os.getcwd(), help="working directory for tools and session resume")
     parser.add_argument("--model", default=None,
                         help="model id (default: KAREN_MODEL, then settings defaultModel, then deepseek-v4-pro)")
@@ -365,6 +369,28 @@ def main(argv=None) -> int:
         or loaded_settings.settings.default_model
         or DEFAULT_MODEL_ID
     )
+    if args.mode == "rpc":
+        # RPC mode is interactive: commands arrive on stdin over a long-lived
+        # session, so positional prompts don't apply and stdout is reserved
+        # for the JSON stream.
+        cli = KarenCli(cwd=cwd, model_id=model_id, fresh=args.new, quiet_tools=True,
+                       provider=provider, output_mode="rpc", loaded_settings=loaded_settings)
+        session = None
+
+        async def _run_rpc() -> int:
+            nonlocal session
+            await cli._open_session(args.new)
+            session = cli.session
+            return await run_rpc_mode(session)
+
+        try:
+            return asyncio.run(_run_rpc())
+        finally:
+            async def _close() -> None:
+                if session is not None:
+                    await session.close()
+
+            asyncio.run(_close())
     headless = args.print_flag or bool(args.messages) or args.mode == "json"
     cli = KarenCli(cwd=cwd, model_id=model_id, fresh=args.new,
                    quiet_tools=headless, provider=provider, output_mode=args.mode,

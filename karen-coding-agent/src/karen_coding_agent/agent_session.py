@@ -229,14 +229,26 @@ class AgentSession:
     async def wait_for_idle(self) -> None:
         await self.agent.wait_for_idle()
 
+    def set_model(self, model: Model) -> None:
+        """Switch models mid-session (pi's `AgentSession.setModel`).
+
+        Applies to the next turn onwards: the loop reads `state.model` for
+        each request, and compaction/overflow checks read `self.model`.
+        """
+        self.model = model
+        self.agent.state.model = model
+
     # -- prompting ---------------------------------------------------------------
 
-    async def prompt(self, text: str, images=None) -> None:
+    async def prompt(self, text: str, images=None, auto_compact: bool = True) -> None:
         """Run one user prompt to completion, including overflow recovery and
-        threshold auto-compaction (pi's post-run `_checkCompaction` driver)."""
+        threshold auto-compaction (pi's post-run `_checkCompaction` driver;
+        `auto_compact=False` skips the threshold check — the RPC mode's
+        `set_auto_compaction` switch routes through here)."""
         self._overflow_recovery_attempted = False
         await self.agent.prompt(text, images)
-        await self._post_run()
+        if auto_compact:
+            await self._post_run()
 
     async def _post_run(self) -> None:
         while True:
