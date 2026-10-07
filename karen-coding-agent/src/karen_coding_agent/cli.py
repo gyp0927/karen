@@ -52,11 +52,15 @@ from .resources import (
 )
 from .rpc import run_rpc_mode
 from .settings import (
+    DEFAULT_SETTINGS_PATH,
     LoadedSettings,
     compaction_settings_from_wire,
+    image_auto_resize,
+    image_block_images,
     load_settings,
     resolve_default_tool_names,
     retry_policy_from_wire,
+    update_settings,
 )
 from .tools import create_default_tools
 
@@ -76,6 +80,9 @@ HELP_TEXT = """Commands:
   /resume <n|id>        switch to a listed session
   /name [text]          show or set the session name
   /session              show session info (id, name, file, messages, tokens, cost)
+  /thinking [level|cycle]  show or set the reasoning level for the current model
+  /export [jsonl|html] [path]  export the session (default: html)
+  /settings [show | global|project key=value ...]  inspect or edit settings files
   /templates            list available prompt templates
   /skills               list available skills
   /quit                 exit
@@ -123,6 +130,12 @@ def parse_command(line: str, template_names, skill_names=()):
         return "name", None, rest
     if name == "session":
         return "session", None, ""
+    if name == "thinking":
+        return "thinking", None, rest
+    if name == "export":
+        return "export", None, rest
+    if name == "settings":
+        return "settings", None, rest
     if name == "templates":
         return "templates", None, ""
     if name == "skills":
@@ -192,13 +205,16 @@ class KarenCli:
         self.skill_diagnostics = skills_result.diagnostics
         self.session: AgentSession | None = None
         self.tool_counts = {}
+        self._print_settings_diagnostics()
+        for diagnostic in self.skill_diagnostics:
+            print(f"[skill warning: {diagnostic.code} {diagnostic.path}: {diagnostic.message}]", file=sys.stderr)
+
+    def _print_settings_diagnostics(self) -> None:
         for diagnostic in self.loaded_settings.diagnostics:
             print(
                 f"[settings warning: Invalid settings file {diagnostic.path}: {diagnostic.message}]",
                 file=sys.stderr,
             )
-        for diagnostic in self.skill_diagnostics:
-            print(f"[skill warning: {diagnostic.code} {diagnostic.path}: {diagnostic.message}]", file=sys.stderr)
 
     def resolve_model(self):
         model = self.models.get_model(self.provider, self.model_id)
@@ -292,6 +308,8 @@ class KarenCli:
             self.cwd,
             shell_path=self.settings.shell_path,
             shell_command_prefix=self.settings.shell_command_prefix,
+            # pi captures `autoResizeImages` when it builds the read tool too.
+            auto_resize_images=image_auto_resize(self.settings.images),
         )
         all_names = [tool.name for tool in all_tools]
         # no settings entry at all -> pi's built-in default tool set
@@ -356,6 +374,8 @@ class KarenCli:
             system_prompt_sections=self._build_prompt_sections(tools),
             shell_path=settings.shell_path,
             shell_command_prefix=settings.shell_command_prefix,
+            auto_resize_images=image_auto_resize(settings.images),
+            block_images=image_block_images(settings.images),
             compaction_settings=compaction_settings_from_wire(settings.compaction)
             if settings.compaction is not None
             else None,
@@ -520,6 +540,105 @@ class KarenCli:
             f"(maxRetries {policy.max_retries}, baseDelayMs {policy.base_delay_ms})"
         )
 
+    async def _handle_thinking(self, rest: str) -> None:
+        """`/thinking [level]` — show or set the reasoning level (pi's thinking commands)."""
+        argument = rest.strip().lower()
+        available = self.session.get_available_thinking_levels()
+        if not argument:
+            print(f"thinking: {self.session.agent.state.thinking_level} (available: {', '.join(available)})")
+            return
+        if argument == "cycle":
+            level = await self.session.cycle_thinking_level()
+            if level is None:
+                print("this model does not support thinking", file=sys.stderr)
+                return
+            print(f"thinking: {level}")
+            return
+        if argument not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+            print(f"usage: /thinking [{'|'.join(available)}|cycle]", file=sys.stderr)
+            return
+        await self.session.set_thinking_level(argument)
+        print(f"thinking: {self.session.agent.state.thinking_level}")
+
+    async def _handle_export(self, rest: str) -> None:
+        """`/export [jsonl|html] [path]` — write the session out (pi's export commands)."""
+        parts = rest.split()
+        fmt = parts[0].lower() if parts else "html"
+        output = parts[1] if len(parts) > 1 else None
+        if fmt in ("jsonl", "json"):
+            path = await self.session.export_to_jsonl(output)
+        elif fmt == "html":
+            path = await self.session.export_to_html(output)
+        else:
+            print("usage: /export [jsonl|html] [path]", file=sys.stderr)
+            return
+        print(f"exported: {path}")
+
+    def _handle_settings(self, rest: str) -> None:
+        """`/settings [show]` or `/settings scope key=value ...` — inspect/edit settings files.
+
+        Values parse as JSON when possible (so `maxRetries=5`,
+        `enabled=true`, `compaction={"enabled":false}` all work), else as bare
+        strings. Nested objects merge into the file, like pi's nested-field
+        persistence.
+        """
+        parts = rest.split()
+        if not parts or parts[0] == "show":
+            settings = load_settings(self.cwd)
+            if settings.diagnostics:
+                for diagnostic in settings.diagnostics:
+                    print(f"[settings warning ({diagnostic.scope}): {diagnostic.message}]", file=sys.stderr)
+            global_path = os.environ.get("KAREN_SETTINGS_PATH") or str(DEFAULT_SETTINGS_PATH)
+            project_path = str(Path(self.cwd) / ".karen" / "settings.json")
+            for label, path in (("global", global_path), ("project", project_path)):
+                print(f"{label}: {path}")
+                try:
+                    print(Path(path).read_text(encoding="utf-8-sig").rstrip())
+                except OSError:
+                    print("  (missing)")
+            return
+
+        scope = parts[0]
+        if scope not in ("global", "project"):
+            print("usage: /settings [show | global|project key=value ...]", file=sys.stderr)
+            return
+
+        updates = {}
+        for token in parts[1:]:
+            key, separator, raw_value = token.partition("=")
+            if not separator or not key:
+                print(f"usage: /settings {scope} key=value ...", file=sys.stderr)
+                return
+            try:
+                updates[key] = json.loads(raw_value)
+            except json.JSONDecodeError:
+                updates[key] = raw_value
+        if not updates:
+            print(f"usage: /settings {scope} key=value ...", file=sys.stderr)
+            return
+        path = update_settings(updates, scope=scope, cwd=self.cwd)
+        print(f"updated {path}: {', '.join(f'{k}={v!r}' for k, v in updates.items())}")
+        self._apply_live_settings()
+
+    def _apply_live_settings(self) -> None:
+        """Re-read settings and apply the ones a live session honors immediately.
+
+        pi's settings manager is read on every use, so `images.autoResize` and
+        `images.blockImages` take effect without a restart; the rest (model,
+        shell, compaction) is applied when the session is next opened. Keeping
+        `self.settings` current is part of that: `/new` builds its tool set and
+        session from the snapshot, so patching only the live session would let
+        the next session silently revert the write.
+        """
+        self.loaded_settings = load_settings(self.cwd)
+        settings = self.loaded_settings.settings
+        self.settings = settings
+        self.templates, self.template_diagnostics = load_all_templates(self.cwd, settings.prompts)
+        self._print_settings_diagnostics()
+        if self.session is not None:
+            self.session.auto_resize_images = image_auto_resize(settings.images)
+            self.session.block_images = image_block_images(settings.images)
+
     async def _print_session_info(self) -> None:
         stats = await self.session.session_stats()
         name = await self.session.session_name()
@@ -630,6 +749,24 @@ class KarenCli:
                 except Exception as error:  # bad ids, failed forks — keep the REPL alive
                     print(f"[error: {error}]", file=sys.stderr)
                 continue
+            if kind == "thinking":
+                try:
+                    await self._handle_thinking(rest)
+                except Exception as error:  # bad level, transcript write failure
+                    print(f"[error: {error}]", file=sys.stderr)
+                continue
+            if kind == "export":
+                try:
+                    await self._handle_export(rest)
+                except (OSError, ValueError) as error:  # unwritable path — keep the REPL alive
+                    print(f"[error: {error}]", file=sys.stderr)
+                continue
+            if kind == "settings":
+                try:
+                    self._handle_settings(rest)
+                except (OSError, ValueError) as error:  # malformed file, unwritable path
+                    print(f"[error: {error}]", file=sys.stderr)
+                continue
             if kind == "template":
                 template = next(t for t in self.templates if t.name == name)
                 line = format_prompt_template_invocation(template, parse_command_args(rest))
@@ -662,10 +799,23 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", default=None,
                         help="model provider (default: KAREN_PROVIDER, then settings defaultProvider, then deepseek)")
     parser.add_argument("--new", action="store_true", help="start a fresh session instead of resuming")
+    parser.add_argument("--export", metavar="FILE", dest="export_file",
+                        help="export a session file to HTML and exit (an optional PROMPT arg is the output path)")
     parser.add_argument("messages", nargs="*", metavar="PROMPT",
                         help="prompt(s) for headless mode; several run sequentially")
     args = parser.parse_args(argv)
     cwd = os.path.abspath(args.cwd)
+    if args.export_file:
+        # pi's `--export <file> [output]`: no model or credentials needed.
+        from .session_export import export_html_from_file
+
+        try:
+            result = export_html_from_file(args.export_file, args.messages[0] if args.messages else None)
+        except Exception as error:  # missing/unreadable file, bad output path
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+        print(f"Exported to: {result}")
+        return 0
     loaded_settings = load_settings(cwd)
     provider = (
         args.provider

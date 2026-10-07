@@ -4,8 +4,11 @@ in-memory lines, plus one child-process test over real stdin/stdout pipes.
 """
 
 import asyncio
+import base64
 import json
+import re
 import sys
+from pathlib import Path
 
 from karen_ai import create_models
 from karen_ai.providers import faux_assistant_message, faux_model, register_faux_provider
@@ -13,9 +16,11 @@ from karen_coding_agent import AgentSession
 from karen_coding_agent.rpc import RpcServer, RpcSession, run_rpc_mode
 
 
-async def _make_session(tmp_path, responses, **kwargs):
+async def _make_session(tmp_path, responses, model_kwargs=None, **kwargs):
     models = create_models()
-    registration = register_faux_provider(responses=responses)
+    registration = register_faux_provider(
+        models=[faux_model(**model_kwargs)] if model_kwargs else None, responses=responses
+    )
     models.set_provider(registration.provider)
     kwargs.setdefault("sessions_root", str(tmp_path / "sessions"))
     kwargs.setdefault("fresh", True)
@@ -82,12 +87,93 @@ async def test_rpc_prompt_is_queued_when_busy(tmp_path):
     first = await server.handle_command({"type": "prompt", "message": "one"})
     assert first["data"]["disposition"] == "started"
     await _wait_for_busy(session)
+    # pi requires an explicit streamingBehavior for a mid-run prompt
     second = await server.handle_command({"type": "prompt", "message": "two"})
-    assert second["data"]["disposition"] == "queued"  # steered into the active run
+    assert second["success"] is False
+    assert second["error"] == (
+        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+    )
+    # an invalid behavior is rejected too
+    bogus = await server.handle_command({"type": "prompt", "message": "two", "streamingBehavior": "nope"})
+    assert bogus["success"] is False and "streamingBehavior" in bogus["error"]
+    # with steer it is folded into the active run, not dropped
+    third = await server.handle_command({"type": "prompt", "message": "two", "streamingBehavior": "steer"})
+    assert third["data"]["disposition"] == "queued"
     await server.wait_for_idle()
-    # the steered message was folded into the running turn, not dropped
     user_texts = [m.content[0].text for m in session.agent.state.messages if m.role == "user"]
     assert user_texts == ["one", "two"]
+    await session.close()
+
+
+async def test_rpc_prompt_follow_up_queues_after_the_run(tmp_path):
+    session = await _make_session(tmp_path, [faux_assistant_message("one"), faux_assistant_message("two")])
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lambda _l: None)
+
+    assert (await server.handle_command({"type": "prompt", "message": "one"}))["data"]["disposition"] == "started"
+    await _wait_for_busy(session)
+    queued = await server.handle_command(
+        {"type": "prompt", "message": "two", "streamingBehavior": "followUp"}
+    )
+    assert queued["data"]["disposition"] == "queued"
+    await server.wait_for_idle()
+    user_texts = [m.content[0].text for m in session.agent.state.messages if m.role == "user"]
+    assert user_texts == ["one", "two"]
+    await session.close()
+
+
+async def test_rpc_back_to_back_prompts_reject_the_second_with_the_busy_error(tmp_path):
+    """Spawning the prompt task must count as busy before the task has run.
+
+    `create_task` does not yield, so a burst of prompts used to answer every one
+    of them `started` while all but the first died in a swallowed RuntimeError.
+    """
+    session = await _make_session(tmp_path, [faux_assistant_message("one"), faux_assistant_message("two")])
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+
+    first = await server.handle_command({"type": "prompt", "message": "first", "id": "p1"})
+    second = await server.handle_command({"type": "prompt", "message": "second", "id": "p2"})
+
+    assert first["data"]["disposition"] == "started"
+    assert second["success"] is False
+    assert second["error"] == (
+        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+    )
+    # and the same command with a behavior is queued, not lost
+    third = await server.handle_command({"type": "prompt", "message": "third", "streamingBehavior": "steer"})
+    assert third["data"]["disposition"] == "queued"
+
+    await server.wait_for_idle()
+    texts = [m.content[0].text for m in session.agent.state.messages if m.role == "user"]
+    assert texts == ["first", "third"]
+    await session.close()
+
+
+async def test_rpc_buffered_prompt_lines_are_queued_not_dropped(tmp_path):
+    """The run-loop path: two prompt lines buffered at once, second one steered."""
+    session = await _make_session(tmp_path, [faux_assistant_message("one"), faux_assistant_message("two")])
+    lines = []
+    server = RpcServer(
+        RpcSession(session),
+        input_iter=[
+            json.dumps({"type": "prompt", "message": "first", "id": "p1"}),
+            json.dumps({"type": "prompt", "message": "second", "streamingBehavior": "steer", "id": "p2"}),
+        ],
+        emit=lines.append,
+    )
+
+    assert await server.run() == 0
+    responses = {
+        obj["id"]: obj
+        for obj in (json.loads(line) for line in lines)
+        if obj.get("type") == "response" and obj.get("command") == "prompt"
+    }
+    assert responses["p1"]["data"]["disposition"] == "started"
+    assert responses["p2"]["data"]["disposition"] == "queued"
+
+    await server.wait_for_idle()
+    texts = [m.content[0].text for m in session.agent.state.messages if m.role == "user"]
+    assert texts == ["first", "second"]  # pi's contract: nothing vanishes
     await session.close()
 
 
@@ -618,3 +704,215 @@ async def test_rpc_set_session_name_and_session_stats(tmp_path):
     assert set(data["tokens"]) == {"input", "output", "cacheRead", "cacheWrite", "total"}
     assert isinstance(data["cost"], (int, float))
     await session.close()
+
+
+# ---------------------------------------------------------------------------
+# side-channel bash: `bash` / `abort_bash`
+# ---------------------------------------------------------------------------
+
+
+async def test_rpc_bash_records_the_run_and_reports_it(tmp_path):
+    session = await _make_session(tmp_path, [])
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+
+    resp = await server.handle_command({"type": "bash", "command": "echo hi there", "id": "b1"})
+
+    assert resp["success"] is True and resp["command"] == "bash"
+    assert resp["data"]["exitCode"] == 0 and "hi there" in resp["data"]["output"]
+    assert resp["data"]["cancelled"] is False
+    # the command id rides on the streamed update (pi's bash_execution_update)
+    updates = [json.loads(line) for line in lines if json.loads(line).get("type") == "bash_execution_update"]
+    assert updates and all(update["id"] == "b1" for update in updates)
+    assert "".join(update["delta"] for update in updates).strip() == "hi there"
+    # and the run landed in the transcript
+    messages = (await server.handle_command({"type": "get_messages"}))["data"]["messages"]
+    bash = [m for m in messages if m["role"] == "bashExecution"]
+    assert bash and bash[-1]["command"] == "echo hi there"
+    await session.close()
+
+
+async def test_rpc_bash_updates_are_deltas_not_snapshots(tmp_path):
+    """pi's `onChunk` hands over the fresh chunk; appending the deltas has to
+    reproduce the output exactly (a cumulative snapshot would duplicate it)."""
+    session = await _make_session(tmp_path, [])
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+
+    resp = await server.handle_command(
+        {"type": "bash", "command": "printf 'first\\n'; sleep 0.4; printf 'second\\n'", "id": "b1"}
+    )
+
+    assert resp["data"]["output"] == "first\nsecond\n"
+    updates = [json.loads(line) for line in lines if json.loads(line).get("type") == "bash_execution_update"]
+    assert len(updates) >= 2  # the command printed in two separate chunks
+    assert "".join(update["delta"] for update in updates) == "first\nsecond\n"
+    await session.close()
+
+
+async def test_rpc_bash_exclude_from_context_and_missing_command(tmp_path):
+    session = await _make_session(tmp_path, [])
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lambda _l: None)
+
+    excluded = await server.handle_command(
+        {"type": "bash", "command": "echo hidden", "excludeFromContext": True}
+    )
+    assert excluded["success"] is True
+    messages = (await server.handle_command({"type": "get_messages"}))["data"]["messages"]
+    bash = [m for m in messages if m["role"] == "bashExecution"][-1]
+    assert bash.get("excludeFromContext", bash.get("exclude_from_context")) is True
+
+    missing = await server.handle_command({"type": "bash"})
+    assert missing["success"] is False and "command is required" in missing["error"]
+    await session.close()
+
+
+async def test_rpc_abort_bash_kills_the_running_command(tmp_path):
+    session = await _make_session(tmp_path, [])
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lambda _l: None)
+
+    task = asyncio.create_task(session.execute_bash("sleep 30"))
+    for _ in range(5000):
+        if session._bash_controllers:
+            break
+        await asyncio.sleep(0.001)
+    else:
+        raise AssertionError("the bash run never started")
+
+    aborted = await server.handle_command({"type": "abort_bash"})
+
+    assert aborted["success"] is True
+    result = await asyncio.wait_for(task, timeout=20)
+    assert result.cancelled is True and result.exit_code is None
+    assert session._bash_controllers == []
+    await session.close()
+
+
+# ---------------------------------------------------------------------------
+# export_html / thinking level / images / new_session settings
+# ---------------------------------------------------------------------------
+
+
+async def test_rpc_export_html_writes_the_report(tmp_path):
+    session, server, lines = await _two_turn_server(tmp_path)
+
+    lines.clear()
+    out = tmp_path / "report.html"
+    resp = await server.handle_command({"type": "export_html", "outputPath": str(out)})
+
+    assert resp["success"] is True and resp["data"]["path"] == str(out)
+    # the report is self-contained: the session is embedded as a base64 payload
+    html = out.read_text(encoding="utf-8")
+    match = re.search(r'atob\("([A-Za-z0-9+/=]+)"\)', html)
+    assert match, "no embedded session payload"
+    data = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+    assert data["header"]["id"] == session.session.metadata.id
+    assert "first question" in json.dumps(data["entries"])
+    # a default path is chosen when the caller gives none
+    default = (await server.handle_command({"type": "export_html"}))["data"]["path"]
+    assert default and default != str(out) and tmp_path in Path(default).parents
+    await session.close()
+
+
+async def test_rpc_thinking_level_commands(tmp_path):
+    session = await _make_session(tmp_path, [], model_kwargs={"reasoning": True})
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+
+    levels = (await server.handle_command({"type": "get_available_thinking_levels"}))["data"]["levels"]
+    assert "high" in levels and "off" in levels
+
+    set_level = await server.handle_command({"type": "set_thinking_level", "level": "high"})
+    assert set_level["success"] is True
+    state = (await server.handle_command({"type": "get_state"}))["data"]
+    assert state["thinkingLevel"] == "high"
+    # the change is forwarded to the wire, so a client can follow it
+    assert any(
+        json.loads(line).get("type") == "thinking_level_changed" and json.loads(line).get("level") == "high"
+        for line in lines
+    )
+
+    # an unknown level is clamped rather than rejected (pi's clampThinkingLevel)
+    clamped = await server.handle_command({"type": "set_thinking_level", "level": "ludicrous"})
+    assert clamped["success"] is True
+    assert (await server.handle_command({"type": "get_state"}))["data"]["thinkingLevel"] in levels
+
+    cycled = await server.handle_command({"type": "cycle_thinking_level"})
+    assert cycled["success"] is True and cycled["data"]["level"] in levels
+    assert (await server.handle_command({"type": "get_state"}))["data"]["thinkingLevel"] == cycled["data"]["level"]
+    await session.close()
+
+
+async def test_rpc_images_reach_the_prompt_and_the_queues(tmp_path):
+    session = await _make_session(
+        tmp_path,
+        [faux_assistant_message("one"), faux_assistant_message("two")],
+        model_kwargs={"input": ["text", "image"]},
+    )
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lambda _l: None)
+    image = [{"data": base64.b64encode(_png_bytes()).decode(), "mimeType": "image/png"}]
+
+    started = await server.handle_command({"type": "prompt", "message": "look", "images": image})
+    assert started["data"]["disposition"] == "started"
+    await _wait_for_busy(session)
+    assert (await server.handle_command({"type": "steer", "message": "steer", "images": image}))["data"]["disposition"] == "queued"
+    assert (await server.handle_command({"type": "follow_up", "message": "later", "images": image}))["data"]["disposition"] == "queued"
+
+    from karen_agent.messages import UserMessage
+
+    steering = [m for m in session.agent._steering_queue.drain() if isinstance(m, UserMessage)]
+    following = [m for m in session.agent._follow_up_queue.drain() if isinstance(m, UserMessage)]
+    for queued in (steering, following):
+        assert len(queued) == 1
+        assert any(getattr(block, "type", None) == "image" for block in queued[0].content)
+
+    # a malformed payload is an error response, not a crash
+    bad = await server.handle_command({"type": "steer", "message": "x", "images": [{"nope": 1}]})
+    assert bad["success"] is False and "base64" in bad["error"]
+
+    await server.wait_for_idle()
+    messages = (await server.handle_command({"type": "get_messages"}))["data"]["messages"]
+    user = [m for m in messages if m["role"] == "user"][0]
+    assert any(block.get("type") == "image" for block in user["content"])
+    await session.close()
+
+
+async def test_rpc_new_session_copies_the_session_settings(tmp_path):
+    session = await _make_session(
+        tmp_path,
+        [],
+        shell_path="/bin/sh",
+        shell_command_prefix="echo prefix",
+        auto_resize_images=False,
+        block_images=True,
+        retry_policy=_retry_policy(max_retries=7),
+    )
+    lines = []
+    server = RpcServer(RpcSession(session), input_iter=[], emit=lines.append)
+    server._subscribe()
+    previous_id = session.session.metadata.id
+
+    resp = await server.handle_command({"type": "new_session"})
+
+    assert resp["success"] is True and resp["data"] == {"cancelled": False}
+    new = server.session
+    assert new is not session and new.session.metadata.id != previous_id
+    assert new.shell_path == "/bin/sh" and new.shell_command_prefix == "echo prefix"
+    assert new.auto_resize_images is False and new.block_images is True
+    assert new.retry.max_retries == 7 and new.retry.enabled is True
+    assert new.model is session.model and new.system_prompt_text == session.system_prompt_text
+    assert _headers(lines)  # the new session's header went out
+    await new.close()
+
+
+def _png_bytes(width: int = 4, height: int = 4) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 20, 30)).save(buffer, "PNG")
+    return buffer.getvalue()

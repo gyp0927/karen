@@ -582,3 +582,127 @@ async def test_cli_name_and_session_info(tmp_path, monkeypatch, capsys):
     assert "messages: 2 (1 user, 1 assistant, 0 tool calls, 0 tool results)" in info
     assert "context: ~" in info
     await cli.session.close()
+
+
+# ---------------------------------------------------------------------------
+# images settings wiring + REPL resilience (M9 follow-ups)
+# ---------------------------------------------------------------------------
+
+
+async def test_cli_applies_image_settings_to_the_session(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"images": {"autoResize": False, "blockImages": True}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(settings_path))
+    cli = await _nav_cli(tmp_path, monkeypatch, [])
+    assert cli.session.auto_resize_images is False
+    assert cli.session.block_images is True
+    await cli.session.close()
+
+
+async def test_cli_settings_command_applies_images_live(tmp_path, monkeypatch, capsys):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(settings_path))
+    cli = await _nav_cli(tmp_path, monkeypatch, [])
+    assert cli.session.block_images is False
+    capsys.readouterr()
+
+    cli._handle_settings('global images={"blockImages":true}')
+
+    assert "updated" in capsys.readouterr().out
+    assert cli.session.block_images is True  # takes effect without a restart
+    await cli.session.close()
+
+
+async def test_cli_settings_write_survives_the_next_new(tmp_path, monkeypatch, capsys):
+    """pi reads its settings manager on every use, so a `/settings` write is not
+    a property of the open session: `/new` must rebuild from the file."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(settings_path))
+    cli = await _nav_cli(tmp_path, monkeypatch, [])
+    capsys.readouterr()
+
+    cli._handle_settings('global images={"autoResize":false,"blockImages":true}')
+    capsys.readouterr()
+
+    await cli._open_session(fresh=True)  # the REPL's `/new`
+
+    assert karen_cli.image_auto_resize(cli.settings.images) is False
+    assert cli.session.auto_resize_images is False
+    assert cli.session.block_images is True
+
+    # and the rebuilt tool set honours it: with auto-resize off the read tool
+    # hands the image through untouched
+    buffer = io.BytesIO()
+    Image.new("RGB", (4000, 3000), (10, 20, 30)).save(buffer, "PNG")
+    payload = buffer.getvalue()
+    (tmp_path / "big.png").write_bytes(payload)
+    read_tool = next(tool for tool in cli.session.tools if tool.name == "read")
+    result = await read_tool.execute("call-1", {"path": "big.png"}, None, None)
+    image = next(block for block in result.content if getattr(block, "type", None) == "image")
+    assert image.data == base64.b64encode(payload).decode()
+    await cli.session.close()
+
+
+def test_piped_repl_survives_a_broken_settings_file(tmp_path, monkeypatch, capsys):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(settings_path))
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory([faux_assistant_message("pong")]))
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/settings global defaultModel=x\n/quit\n"))
+
+    exit_code = karen_cli.main(["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "refusing to overwrite" in captured.err
+    assert settings_path.read_text(encoding="utf-8") == "{not json"  # left alone
+
+
+def test_piped_repl_survives_a_failed_export(tmp_path, monkeypatch, capsys):
+    blocker = tmp_path / "blocker.txt"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(karen_cli, "build_models", _faux_factory([faux_assistant_message("pong")]))
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO(f"/export html {blocker}/out.html\nhello\n/quit\n")
+    )
+
+    exit_code = karen_cli.main(["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "[error:" in captured.err
+    assert "pong" in captured.out  # the session kept working after the failure
+
+
+async def test_cli_read_tool_honors_image_settings(tmp_path, monkeypatch):
+    """`images.autoResize=false` reaches the read tool's image processor."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"images": {"autoResize": False}}), encoding="utf-8")
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(settings_path))
+    cli = await _nav_cli(tmp_path, monkeypatch, [])
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4000, 3000), (10, 20, 30)).save(buffer, "PNG")
+    payload = buffer.getvalue()
+    (tmp_path / "big.png").write_bytes(payload)
+
+    read_tool = next(tool for tool in cli.session.tools if tool.name == "read")
+    result = await read_tool.execute("call-1", {"path": "big.png"}, None, None)
+
+    image = next(block for block in result.content if getattr(block, "type", None) == "image")
+    assert image.data == base64.b64encode(payload).decode()  # untouched, not resized
+    await cli.session.close()

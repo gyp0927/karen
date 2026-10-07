@@ -13,6 +13,7 @@ dependencies = [
     "karen-agent",
     "karen-ai",
     "pathspec>=0.12",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]

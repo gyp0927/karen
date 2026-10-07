@@ -7,8 +7,10 @@ one (pi's `deepMergeSettings`: nested objects merge recursively, scalars and
 arrays replace, `defaultTools` gets the special `+name`/`-name` modifier
 merge). Like pi, files are **not schema-validated**: unknown keys are
 ignored, wrong-typed values are dropped, and an unreadable or malformed file
-produces a diagnostic and is skipped. Writes (pi's `/settings` commands) are
-not ported.
+produces a diagnostic and is skipped. Writes (`update_settings`, behind the
+CLI's `/settings` command) merge camelCase keys back into one scope's file
+atomically; pi's lock file and modified-field bookkeeping are dropped
+(karen runs single-process).
 
 Ported subset (camelCase wire keys, like pi): `defaultProvider`,
 `defaultModel`, `shellPath`, `shellCommandPrefix`, `sessionDir`,
@@ -56,6 +58,7 @@ class Settings:
     session_dir: Optional[str] = None
     compaction: Optional[Dict[str, Any]] = None  # raw camelCase dict
     retry: Optional[Dict[str, Any]] = None  # raw camelCase dict
+    images: Optional[Dict[str, Any]] = None  # raw camelCase dict
     prompts: Optional[List[str]] = None
     default_tools: Optional[List[str]] = None
 
@@ -166,6 +169,7 @@ def _settings_from_wire(merged: Dict[str, Any]) -> Settings:
         session_dir=_expand_user(_as_str(merged.get("sessionDir"))),
         compaction=_as_dict(merged.get("compaction")),
         retry=_as_dict(merged.get("retry")),
+        images=_as_dict(merged.get("images")),
         prompts=[_expand_user(entry) for entry in _as_str_list(merged.get("prompts")) or []] or None,
         default_tools=_as_str_list(merged.get("defaultTools")),
     )
@@ -206,6 +210,59 @@ def load_settings(
     return LoadedSettings(settings=_settings_from_wire(merged), diagnostics=diagnostics)
 
 
+# ---------------------------------------------------------------------------
+# writes (pi's `/settings` persistence, simplified)
+# ---------------------------------------------------------------------------
+
+
+def update_settings(
+    updates: Dict[str, Any],
+    *,
+    scope: str = "global",
+    cwd: Optional[str] = None,
+    global_path: Optional[str] = None,
+    project_path: Optional[str] = None,
+) -> Path:
+    """Merge `updates` into one settings file and write it back atomically.
+
+    `updates` uses the camelCase wire keys (like the files themselves). Nested
+    dict values deep-merge over the file's existing object for that key (pi's
+    nested-field persistence); scalars and arrays replace. Unknown keys are
+    kept (pi does not schema-validate writes either). The directory is created
+    on demand; the file is written via a temp file + `os.replace` so a crash
+    mid-write can't corrupt it. Returns the path written.
+
+    pi wraps this in a file lock and persists only fields marked modified;
+    karen runs single-process, so a straight read-modify-write is enough.
+
+    A file that exists but cannot be read or parsed is *not* overwritten —
+    pi's `save()` returns early when that scope had a load error, so a typo in
+    the file never costs the user their settings. `ValueError` is raised
+    instead (pi stays quiet; a CLI should say what happened).
+    """
+    if scope not in ("global", "project"):
+        raise ValueError(f"scope must be 'global' or 'project', got {scope!r}")
+    if scope == "global":
+        override = global_path or os.environ.get("KAREN_SETTINGS_PATH")
+        path = Path(override) if override else DEFAULT_SETTINGS_PATH
+    else:
+        if cwd is None and project_path is None:
+            raise ValueError("project scope requires cwd or project_path")
+        path = Path(project_path) if project_path else Path(cwd) / PROJECT_SETTINGS_RELATIVE
+
+    diagnostics: List[SettingsDiagnostic] = []
+    current = _read_settings_file(path, scope, diagnostics)
+    if diagnostics:
+        raise ValueError(f"refusing to overwrite {diagnostics[0].path}: {diagnostics[0].message}")
+    merged = _deep_merge(current or {}, updates)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+    return path
+
+
 def compaction_settings_from_wire(value: Dict[str, Any]) -> CompactionSettings:
     """Tolerantly map a settings `compaction` dict onto CompactionSettings."""
     settings = CompactionSettings()
@@ -238,6 +295,22 @@ def _as_count(value: Any) -> Optional[int]:
     return int(value)
 
 
+def image_auto_resize(value: Optional[Dict[str, Any]]) -> bool:
+    """pi's `getImageAutoResize`: `settings.images?.autoResize ?? true`."""
+    if not isinstance(value, dict):
+        return True
+    enabled = value.get("autoResize")
+    return enabled if isinstance(enabled, bool) else True
+
+
+def image_block_images(value: Optional[Dict[str, Any]]) -> bool:
+    """pi's `images.blockImages` (default false): strip images in convert_to_llm."""
+    if not isinstance(value, dict):
+        return False
+    blocked = value.get("blockImages")
+    return blocked if isinstance(blocked, bool) else False
+
+
 def retry_policy_from_wire(value: Optional[Dict[str, Any]]) -> Optional[RetryPolicy]:
     """Map a settings `retry` dict onto a RetryPolicy, falling back per field
     to pi's coding-agent defaults (enabled, 3 retries, 2s base, 60s cap)."""
@@ -267,8 +340,11 @@ __all__ = [
     "Settings",
     "SettingsDiagnostic",
     "compaction_settings_from_wire",
+    "image_auto_resize",
+    "image_block_images",
     "load_settings",
     "merge_default_tools",
     "resolve_default_tool_names",
     "retry_policy_from_wire",
+    "update_settings",
 ]

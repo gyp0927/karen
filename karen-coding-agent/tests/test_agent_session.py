@@ -715,6 +715,11 @@ async def test_abort_retry_cancels_the_backoff(tmp_path):
 
     task = asyncio.ensure_future(session.prompt("hello"))
     await _wait_for_event(events, "auto_retry_start")
+    # pi emits auto_retry_start before creating the abort controller, so the
+    # backoff may not be registered yet when the event lands — wait for it.
+    deadline = time.monotonic() + 5.0
+    while not session.is_retrying and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
     assert session.is_retrying is True
     session.abort_retry()
     await asyncio.wait_for(task, timeout=5)

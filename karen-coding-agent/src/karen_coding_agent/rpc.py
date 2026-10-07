@@ -15,14 +15,17 @@ Ported commands — the subset karen's AgentSession/Agent can serve:
     get_available_models, get_messages, get_last_assistant_text,
     get_entries, get_tree, get_fork_messages, fork, clone,
     switch_session, set_session_name, get_session_stats,
-    compact, set_auto_compaction, set_auto_retry, abort_retry
+    compact, set_auto_compaction, set_auto_retry, abort_retry,
+    set_thinking_level, cycle_thinking_level, get_available_thinking_levels,
+    bash, abort_bash, export_html
+
+`images` (a list of `{data, mimeType}`) is accepted on prompt/steer/follow_up;
+prompt normalizes them (convert/resize, failures dropped into text hints),
+steer/follow_up queue them raw — pi's exact split.
 
 Deviations from pi (all documented here and in the README):
-- the thinking-level commands, bash, export-html, get_commands and the
-  extension UI sub-protocol are out of scope (karen has no
-  extensions/TUI yet and no bash-executor side channel).
-- `images` on prompt/steer/follow_up are not accepted (karen's app layer
-  does not wire image input yet).
+- get_commands and the extension UI sub-protocol are out of scope (karen has
+  no extensions/TUI yet).
 - `get_entries` returns karen's session entries (ids, types and message
   payloads) rather than pi's `SessionEntry` objects; `since` slices after
   the named entry, like pi.
@@ -52,7 +55,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from karen_ai import TextContent, UserMessage
+from karen_ai import ImageContent, TextContent, UserMessage
 from karen_agent.messages import message_field
 from karen_agent.session.jsonl import to_jsonable
 from karen_agent.types import AgentMessage
@@ -77,6 +80,8 @@ _FORWARDED_SESSION_EVENTS = (
     "summarization_retry_finished",
     "session_tree",
     "session_info_changed",
+    "thinking_level_changed",
+    "bash_execution_update",
 )
 
 
@@ -100,9 +105,30 @@ def _queue_mode(value: Any) -> str:
     return value
 
 
-def _user_message(text: str) -> UserMessage:
-    """Same shape `Agent._normalize_prompt_input` builds for a string prompt."""
-    return UserMessage(content=[TextContent(text=text)], timestamp=_now_ms())
+def _parse_images(raw: Any) -> Optional[List[ImageContent]]:
+    """Validate an `images` payload ([{data, mimeType}, ...]) into ImageContent."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("images must be a list of {data, mimeType}")
+    images: List[ImageContent] = []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("data"), str):
+            raise ValueError("each image must be an object with a base64 `data` string")
+        mime = item.get("mimeType") or item.get("mime_type")
+        if not isinstance(mime, str):
+            raise ValueError("each image must have a `mimeType` string")
+        images.append(ImageContent(data=item["data"], mime_type=mime))
+    return images
+
+
+def _user_message(text: str, images: Optional[List[ImageContent]] = None) -> UserMessage:
+    """Same shape `Agent._normalize_prompt_input` builds for a string prompt
+    (pi queues steer/follow-up images raw, no normalization)."""
+    content: List[Any] = [TextContent(text=text)]
+    if images:
+        content.extend(images)
+    return UserMessage(content=content, timestamp=_now_ms())
 
 
 def _message_text(message: AgentMessage) -> str:
@@ -151,6 +177,11 @@ class RpcSession:
             system_prompt_sections=old.system_prompt_sections,
             tools=old.tools,
             hooks=old.hooks,
+            shell_path=old.shell_path,
+            shell_command_prefix=old.shell_command_prefix,
+            auto_resize_images=old.auto_resize_images,
+            block_images=old.block_images,
+            retry_policy=old.retry,
             compaction_settings=old.settings,
             stream_fn=old._stream_fn,
         )
@@ -164,9 +195,9 @@ class RpcServer:
 
     `run()` reads one line at a time from `input_iter` (async or sync
     iterable of str) and writes responses/events through `emit(line)`.
-    A `prompt` command may arrive while another is running: it is queued
-    (steered into the active run), reported `queued`, and the event
-    stream carries the outcome — pi resolves its response only after
+    A `prompt` command may arrive while another is running: it must carry a
+    `streamingBehavior` ("steer" or "followUp"), is reported `queued`, and the
+    event stream carries the outcome — pi resolves its response only after
     preflight, karen does not.
     """
 
@@ -242,10 +273,10 @@ class RpcServer:
         if command_type == "prompt":
             return await self._cmd_prompt(command_id, raw)
         if command_type == "steer":
-            self.session.steer(_user_message(str(raw.get("message", ""))))
+            self.session.steer(_user_message(str(raw.get("message", "")), _parse_images(raw.get("images"))))
             return _success(command_id, "steer", {"disposition": "queued"})
         if command_type == "follow_up":
-            self.session.follow_up(_user_message(str(raw.get("message", ""))))
+            self.session.follow_up(_user_message(str(raw.get("message", "")), _parse_images(raw.get("images"))))
             return _success(command_id, "follow_up", {"disposition": "queued"})
         if command_type == "abort":
             self.session.abort()
@@ -270,7 +301,7 @@ class RpcServer:
         if command_type == "get_state":
             agent = self.session.agent
             state = agent.state
-            header = self.session.session_header()
+            metadata = self.session.session.metadata
             return _success(
                 command_id,
                 "get_state",
@@ -281,8 +312,9 @@ class RpcServer:
                     "isCompacting": self.is_compacting,
                     "steeringMode": agent.steering_mode,
                     "followUpMode": agent.follow_up_mode,
-                    "sessionId": self.session.session.metadata.id,
-                    "sessionFile": (header or {}).get("id"),
+                    "sessionId": metadata.id,
+                    "sessionFile": getattr(metadata, "path", None),
+                    "sessionName": await self.session.session_name(),
                     "autoCompactionEnabled": self.auto_compaction_enabled,
                     "messageCount": len(state.messages),
                     "pendingMessageCount": len(agent.peek_queued_messages()),
@@ -395,6 +427,33 @@ class RpcServer:
         if command_type == "abort_retry":
             self.session.abort_retry()
             return _success(command_id, "abort_retry")
+        if command_type == "set_thinking_level":
+            await self.session.set_thinking_level(str(raw.get("level", "off")))
+            return _success(command_id, "set_thinking_level")
+        if command_type == "cycle_thinking_level":
+            level = await self.session.cycle_thinking_level()
+            if level is None:
+                return _success(command_id, "cycle_thinking_level", None)
+            return _success(command_id, "cycle_thinking_level", {"level": level})
+        if command_type == "get_available_thinking_levels":
+            levels = self.session.get_available_thinking_levels()
+            return _success(command_id, "get_available_thinking_levels", {"levels": levels})
+        if command_type == "bash":
+            command = raw.get("command")
+            if not command:
+                return _error(command_id, "bash", "command is required")
+            result = await self.session.execute_bash(
+                str(command),
+                exclude_from_context=bool(raw.get("excludeFromContext")),
+                command_id=command_id,
+            )
+            return _success(command_id, "bash", result.to_dict())
+        if command_type == "abort_bash":
+            self.session.abort_bash()
+            return _success(command_id, "abort_bash")
+        if command_type == "export_html":
+            path = await self.session.export_to_html(raw.get("outputPath"))
+            return _success(command_id, "export_html", {"path": path})
         return _error(command_id, str(command_type), f"Unknown command: {command_type}")
 
     @staticmethod
@@ -421,11 +480,34 @@ class RpcServer:
 
     async def _cmd_prompt(self, command_id: Optional[str], raw: Dict[str, Any]) -> Dict[str, Any]:
         text = str(raw.get("message", ""))
-        busy = self.session.agent._active_run is not None
+        images = _parse_images(raw.get("images"))
+        streaming_behavior = raw.get("streamingBehavior")
+        if streaming_behavior is not None and streaming_behavior not in ("steer", "followUp"):
+            return _error(
+                command_id, "prompt", f"Invalid streamingBehavior: {streaming_behavior!r} (expected 'steer' or 'followUp')"
+            )
+        # A prompt task that is spawned but has not run yet still counts as a run
+        # in flight: `create_task` does not yield to the loop, so without this a
+        # second buffered prompt would also be told `started` and then vanish into
+        # a RuntimeError that `_run_prompt` swallows. pi answers that prompt with
+        # the busy error instead (agent-session.ts prompt()).
+        task = self._prompt_task
+        busy = self.session.agent._active_run is not None or (task is not None and not task.done())
         if not busy:
-            self._prompt_task = asyncio.get_running_loop().create_task(self._run_prompt(text))
+            self._prompt_task = asyncio.get_running_loop().create_task(self._run_prompt(text, images))
             return _success(command_id, "prompt", {"disposition": "started"})
-        self.session.steer(_user_message(text))
+        # Streaming: pi requires an explicit streamingBehavior and routes
+        # 'followUp' to the after-run queue (agent-session.ts prompt()).
+        if streaming_behavior is None:
+            return _error(
+                command_id,
+                "prompt",
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+            )
+        if streaming_behavior == "followUp":
+            self.session.follow_up(_user_message(text, images))
+        else:
+            self.session.steer(_user_message(text, images))
         return _success(command_id, "prompt", {"disposition": "queued"})
 
     async def wait_for_idle(self) -> None:
@@ -440,9 +522,9 @@ class RpcServer:
             if self._prompt_task is task:
                 self._prompt_task = None
 
-    async def _run_prompt(self, text: str) -> None:
+    async def _run_prompt(self, text: str, images: Optional[List[ImageContent]] = None) -> None:
         try:
-            await self.session.prompt(text, auto_compact=self.auto_compaction_enabled)
+            await self.session.prompt(text, images=images, auto_compact=self.auto_compaction_enabled)
         except Exception as error:  # prompt failures surface through events; log elsewhere
             if self.on_command_error is not None:
                 self.on_command_error(error)

@@ -63,6 +63,7 @@ karen -p "summarize this repo"              # headless text mode: final reply on
 karen "one" "two"                           # headless: prompts run sequentially
 karen --mode json "prompt"                  # headless JSON event stream
 karen --mode rpc                            # JSON command protocol on stdin/stdout (M5)
+karen --export session.jsonl out.html       # session file -> standalone HTML report (M9)
 printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive it)
 ```
 
@@ -86,7 +87,8 @@ printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive i
   `/tree [--summarize] [id]`, `/fork [n|<id>]`, `/clone`, `/sessions`,
   `/resume <n|id>`,
   `/name [text]`, `/session`, `/templates`, `/skills`, `/quit` (the session
-  navigation set arrived in M7, `/retry` in M8); `/<template> args...` invokes
+  navigation set arrived in M7, `/retry` in M8, `/thinking`, `/export` and
+  `/settings` in M9); `/<template> args...` invokes
   a prompt
   template from `.karen/prompts` (project) or `~/.karen/prompts` (user), with
   `$1`/`$@`/`${@:N:L}` substitution, or a skill from `.karen/skills` /
@@ -201,11 +203,18 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
   `set_auto_compaction`, `set_auto_retry`, `abort_retry`. Unknown commands and
   malformed lines are answered with `success:false` (`command:"parse"` for
   JSON errors) — the loop keeps running; stdin EOF exits 0.
-- **`prompt` while a run is active** is queued as a steering message and
-  answered `{"disposition":"queued"}` (pi's default `streamingBehavior:
-  "steer"`); when idle it answers `{"disposition":"started"}` and the run's
-  progress arrives on the event stream. Deviation: karen reports the
+- **`prompt` while a run is active** requires an explicit `streamingBehavior`
+  (`"steer"` or `"followUp"`); karen answers `{"disposition":"queued"}` and
+  routes the message accordingly, or fails with pi's
+  `"Agent is already processing. Specify streamingBehavior ('steer' or
+  'followUp') to queue the message."` when it is missing (see M9 — the earlier
+  implicit steer is gone). When idle it answers `{"disposition":"started"}` and
+  the run's progress arrives on the event stream. Deviation: karen reports the
   disposition at command time, where pi resolves its response after preflight.
+  A spawned prompt task counts as busy from the moment it is created (before it
+  has run a step), so a burst of buffered prompts is never answered `started`
+  and then dropped: every one after the first gets the busy error, or is queued
+  when it names a `streamingBehavior`.
 - **`new_session`** opens a brand-new session for the cwd (closing the old
   one) and emits the new header line; pi's `parentSession` (fork) is not
   supported. `get_state` reports model, thinkingLevel, isStreaming,
@@ -216,10 +225,12 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
   flags. Manual `compact` answers `{"compacted": bool}`.
 - `get_entries` answers the session's entries (with `since` slicing after a
   named entry); M7 turned the earlier id-only shape into pi's entry objects.
-- Not ported: the thinking-level commands, pi's bash side channel,
+- Not ported at M5: the thinking-level commands, pi's bash side channel,
   export-html, `get_commands` and the extension UI sub-protocol (karen has no
   extensions or TUI yet), and image inputs on `prompt`/`steer`/`follow_up`.
-  Fork/clone/switch/session-stats arrived in M7, retry control in M8 (below).
+  Fork/clone/switch/session-stats arrived in M7, retry control in M8, and the
+  rest of that list in M9 (below) — only `get_commands` and the extension UI
+  sub-protocol remain.
 
 Verified against real DeepSeek over real stdio: header → `prompt` → full event
 stream → `get_last_assistant_text` = `"RPC-OK"`, model switching,
@@ -318,9 +329,9 @@ gained the operations pi's `navigateTree`/runtime fork/clone/switch perform.
   returns the entries themselves and honours `since`. `session_tree` and
   `session_info_changed` are forwarded on the event stream, and every command
   that replaces the session re-emits the JSONL header line.
-- Not ported: pi's `/import` (JSONL import), HTML export, and the interactive
-  full-screen tree/fork selector (karen's REPL takes ids and indices); the new
-  built-in command names shadow templates or skills of the same name.
+- Not ported: pi's `/import` (JSONL import; HTML export and the interactive
+  full-screen tree/fork selector arrived later — see M9 and the roadmap). The
+  new built-in command names shadow templates or skills of the same name.
 
 Verified against real DeepSeek: a two-turn session rendered its tree; a fork
 reproduced the first turn in a new file with `parent_session_id` set;
@@ -387,10 +398,124 @@ real summary; the next turn answered from that summary; and a 30s backoff was
 cancelled by `abort_retry` with `finalError: "Retry cancelled"`. A real
 project `settings.json` drove `/retry` (maxRetries 5, baseDelayMs 250).
 
+## M9: images, export, bash side channel, thinking levels, settings writes
+
+CA-M9 closes out the non-extension app-layer surface pi's coding-agent has
+that karen had not ported yet.
+
+- **Image input** (`utils/image_process.py`, `utils/exif_orientation.py`,
+  `utils/tool_result_images.py`, plus the `read` tool's image processor): pi's
+  `utils/image-*.ts`, with Pillow standing in for the photon Rust/WASM module
+  and `asyncio.to_thread` for pi's worker thread (Pillow releases the GIL
+  around decode/resize/encode). `processImage` normalizes to a supported
+  inline format (PNG/JPEG/GIF/WebP; anything else — including BMP — is
+  converted to PNG or omitted with pi's exact hint strings), `resizeImage`
+  applies EXIF orientation then downscales to fit 2000×2000 and a 4.5MB base64
+  ceiling (pi's `Math.round` semantics, PNG-then-JPEG candidate order,
+  `[q, 85, 70, 55, 40]` quality ladder, 0.75 shrink loop), and
+  `formatDimensionNote` tells the model the coordinate mapping. The **prompt
+  path** (`AgentSession._normalize_prompt_images`, pi's `_normalizePromptImages`)
+  resizes each image to the current model's `input_limits.images.resize`
+  profile, drops failures into text hints, and appends the hints to the user
+  text; `steer()`/`follow_up()` keep images raw, exactly like pi. The
+  **tool-result path** (`AgentSession._after_tool_call`) normalizes images
+  tools produced *after* the hooks run (pi's ordering), keeping the original
+  block on failure (unlike the prompt path). The **read tool** now wires its
+  `image_processor` hook so `read` on an image returns a resized `ImageContent`
+  (BMP goes through PNG conversion like pi instead of an omission note).
+  `images.autoResize` (default true) skips the resize path entirely when off, and
+  `images.blockImages` (default false) strips images from the LLM request in a
+  `convert_to_llm` wrapper — pi's `convertToLlmWithBlockImages`, including its
+  "Image reading is disabled." placeholder and consecutive-placeholder dedupe.
+  Both are read live (a `/settings` write applies to the running session) and at
+  session open from the merged settings files. An EXIF transpose failure aborts
+  the resize (pi folds decode + EXIF into one try/catch that yields null) rather
+  than sending a silently unrotated image.
+- **Session export** (`session_export.py`): `export_to_jsonl` writes the
+  current branch in pi's importable v3 wire format — a
+  `{"type":"session","version":3,...}` header then the branch re-parented into
+  one linear chain — so pi can re-open it; `export_to_html` writes one
+  self-contained `.html` report: the session data is base64-embedded, only the
+  `leafId` branch path is included (pi's `getPath`), and the template renders it
+  with its own markdown-subset renderer — no CDN scripts, so the report opens
+  offline and makes no network requests. pi inlines vendored
+  marked/highlight.js instead; karen trades syntax highlighting for not shipping
+  a 165KB JS blob. The template's renderer handles `bashExecution` messages
+  (`$ command`, output, `(exit n)`/`(cancelled)`/truncated notes) and extracts
+  fenced code the way CommonMark reads it — a fence opens only at the start of a
+  line and an unterminated one runs to the end — so a mid-line triple-backtick
+  can neither swallow text nor leak a placeholder. The base64 payload is decoded
+  as UTF-8 (`atob` alone yields Latin-1, which mojibakes every non-ASCII
+  string), matching pi's `TextDecoder` step. pi sources the export theme from its
+  TUI theme system; karen ships a neutral dark default until the TUI milestone
+  lands.
+- **Bash side channel** (`bash_executor.py`): `AgentSession.execute_bash` /
+  `abort_bash` run a shell command outside the agent loop (pi's
+  `core/bash-executor.ts`), streaming sanitized output to a callback and
+  `bash_execution_update` events (each carrying the command id and the fresh
+  chunk — pi's `onChunk`, so appending the deltas reproduces the output rather
+  than repeating it), spilling
+  oversized output to a temp file, and reporting pi's `BashResult`
+  (`output`/`exitCode`/`cancelled`/`truncated`/`fullOutputPath`). The result is
+  recorded in the transcript as a `BashExecutionMessage` (pi's
+  `recordBashResult`, so the model sees it next turn; `excludeFromContext` keeps
+  it out of the LLM conversion), queued until `agent_end` when a run is in
+  flight so tool_use/tool_result ordering can't break. Built on karen-agent's
+  `run_shell_command` + `OutputCapture`.
+- **Thinking levels**: `set_thinking_level` (clamped to the model's
+  capabilities via karen-ai's `clamp_thinking_level`, emits
+  `thinking_level_changed` and appends a `thinking_level_change` session entry
+  on change), `cycle_thinking_level`, `get_available_thinking_levels`,
+  `supports_thinking`. A resumed session restores the last recorded level on its
+  branch (pi's `getSessionContextSettings`). Deviation: pi also seeds that entry
+  into every new session from its `defaultThinkingLevel` setting; karen has no
+  such setting, so it records actual changes only — no metadata node at the root
+  of every tree.
+- **RPC**: the new commands `set_thinking_level`, `cycle_thinking_level`,
+  `get_available_thinking_levels`, `bash`, `abort_bash`, `export_html`;
+  `images` (`[{data, mimeType}]`) is accepted on `prompt`/`steer`/`follow_up`;
+  `thinking_level_changed`/`bash_execution_update` are forwarded; `get_state`
+  now reports the real `sessionFile` path and `sessionName` (it previously
+  echoed the session id as `sessionFile`). `prompt` honors `streamingBehavior`:
+  while a run is in flight it is required (pi's exact error) and routes the
+  message to `steer` or `followUp`. `/new` rebinding carries the image and retry
+  settings across.
+- **Settings writes** (`settings.update_settings`, behind `/settings`): merge
+  camelCase keys back into the global or project file atomically (nested dicts
+  deep-merge, unknown keys kept), pi's write path minus its lock file and
+  modified-field bookkeeping (karen runs single-process). A file that exists but
+  fails to parse is never overwritten (pi's `save()` returns early on a load
+  error) — `update_settings` raises instead, and the CLI reports it.
+- **CLI**: `/thinking [level|cycle]`, `/export [jsonl|html] [path]`,
+  `/settings [show | global|project key=value ...]`, and pi's
+  `karen --export FILE [OUT.html]` (an existing session file — the native
+  storage log or a v3 export — to a standalone report, no model needed).
+  Handler failures (unwritable export path, malformed settings file) print
+  `[error: ...]` and leave the REPL running. A `/settings` write re-reads the
+  file into the CLI's own settings snapshot (pi reads its settings manager on
+  every use), so the next `/new` — and the tool set it rebuilds — sees it
+  instead of silently reverting to the startup values.
+
+Two parity details pi splits across two call sites, both now matched: the
+pending bash queue is flushed **at `agent_end` and again before a new prompt**
+(pi `agent-session.ts` flushes in the run's `finally` and in `prompt()`), so a
+result recorded after the settle flush still reaches the model in the next turn
+rather than after it; and `switch_session`/`fork`/`clone` re-read the branch's
+last `thinking_level_change` (pi rebuilds its AgentSession on every switch,
+restoring the level in the constructor) instead of leaving the outgoing
+session's level in place. The RPC prompt path also treats a spawned-but-unstarted
+prompt task as busy: `create_task` does not yield, so a burst of buffered
+prompts used to answer every one of them `disposition: started` while all but
+the first died in a swallowed `RuntimeError`.
+
+Verified with 54 new offline tests (`tests/test_m9.py`, including a node-driven
+render of the HTML report against a DOM stub) plus the full suite (257 passed)
+and karen-agent/karen-ai suites (332 / 443+1). New runtime dependency: Pillow.
+
 ## Roadmap
 
-Later milestones (tracked in the repo root README): extensions / MCP / TUI /
-image input (unscheduled).
+Later milestones (tracked in the repo root README): extensions / MCP / TUI
+(unscheduled; image input landed in M9).
 
 ## Development
 

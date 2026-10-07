@@ -16,6 +16,7 @@ are unreachable from the tip, exactly like branch navigation.
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import time
@@ -30,12 +31,14 @@ from karen_ai import (
     RetryCallbacks,
     RetryPolicy,
     SystemMessage,
+    TextContent,
     abortable_sleep,
 )
 from karen_ai.utils.overflow import is_context_overflow, is_recoverable_length
 from karen_ai.utils.retry import is_retryable_assistant_error, retry_delay_ms
 from karen_ai.utils.text import get_system_message_text
 from karen_agent import (
+    AfterToolCallResult,
     AfterToolEvent,
     Agent,
     AgentInitialState,
@@ -65,6 +68,7 @@ from karen_agent.session import (
     BranchForkOptions,
     BranchScan,
     BranchSummaryEntry,
+    CustomEntry,
     Entry,
     EntryQuery,
     JsonlSessionCreateOptions,
@@ -91,8 +95,12 @@ from karen_agent.session.context import build_session_context
 from karen_agent.session.jsonl import to_jsonable
 from karen_agent.session.types import CompactionEntry
 from .navigation import TreeNode, build_tree, entry_text, forkable_user_messages
+from .bash_executor import BashResult
 from .settings import DEFAULT_RETRY_POLICY
 from .tools import create_default_tools
+
+#: pi-ai's full thinking-level ordering (karen-ai's `ModelThinkingLevel`).
+EXTENDED_THINKING_LEVELS: List[str] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".karen" / "sessions"
 DEFAULT_BRANCH = "main"
@@ -141,6 +149,51 @@ def _add_usage(totals: Dict[str, float], usage) -> None:
 #: {"type": "session_info_changed", "name": str}
 SessionListener = Callable[[Dict[str, Any]], Any]
 
+#: pi's placeholder for an image stripped by `images.blockImages`.
+BLOCKED_IMAGE_PLACEHOLDER = "Image reading is disabled."
+
+#: Session entry custom type carrying a thinking-level change (pi's
+#: `thinking_level_change` entry), so a resumed session comes back at the same
+#: level (pi's `getSessionContextSettings`).
+THINKING_LEVEL_ENTRY = "thinking_level_change"
+
+
+def _thinking_level_value(entry: Any) -> Optional[str]:
+    """The `thinkingLevel` payload of a `thinking_level_change` custom entry."""
+    data = getattr(entry, "data", None)
+    if not isinstance(data, dict):
+        return None
+    level = data.get("thinkingLevel")
+    return level if isinstance(level, str) else None
+
+
+def _block_message_images(message: Any) -> Any:
+    """Replace image blocks in a converted user/toolResult message (pi's sdk.ts).
+
+    pi keeps the exact placeholder text and drops a placeholder that directly
+    follows another one, so a message with several images renders as one line.
+    """
+    if getattr(message, "role", None) not in ("user", "toolResult"):
+        return message
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return message
+    if not any(getattr(block, "type", None) == "image" for block in content):
+        return message
+    filtered: List[Any] = []
+    for block in content:
+        if getattr(block, "type", None) != "image":
+            filtered.append(block)
+            continue
+        if (
+            filtered
+            and getattr(filtered[-1], "type", None) == "text"
+            and getattr(filtered[-1], "text", None) == BLOCKED_IMAGE_PLACEHOLDER
+        ):
+            continue
+        filtered.append(TextContent(text=BLOCKED_IMAGE_PLACEHOLDER))
+    return message.model_copy(update={"content": filtered})
+
 
 class AgentSession:
     """An `Agent` bound to a durable, resumable session on disk."""
@@ -162,11 +215,23 @@ class AgentSession:
         hooks: Optional[HookRegistry] = None,
         compaction_settings: Optional[CompactionSettings] = None,
         retry_policy: Optional[RetryPolicy] = None,
+        auto_resize_images: bool = True,
+        block_images: bool = False,
         stream_fn: Optional[StreamFn] = None,
         listener: Optional[SessionListener] = None,
     ) -> None:
         self.cwd = cwd
         self.models = models
+        self.shell_path = shell_path
+        self.shell_command_prefix = shell_command_prefix
+        #: pi's `settings.images.autoResize` (default true) — resize inline
+        #: images to the model's limits on the prompt and tool-result paths.
+        self.auto_resize_images = auto_resize_images
+        #: pi's `settings.images.blockImages` (default false) — strip images
+        #: from the LLM request in a `convert_to_llm` wrapper (defense-in-depth,
+        #: pi's `convertToLlmWithBlockImages`). Read on every call so a
+        #: mid-session change takes effect.
+        self.block_images = block_images
         self.model = model
         self.fresh = fresh
         self.branch_name = branch_name
@@ -178,7 +243,14 @@ class AgentSession:
         self.tools = (
             tools
             if tools is not None
-            else create_default_tools(cwd, shell_path=shell_path, shell_command_prefix=shell_command_prefix)
+            else create_default_tools(
+                cwd,
+                shell_path=shell_path,
+                shell_command_prefix=shell_command_prefix,
+                auto_resize_images=auto_resize_images,
+                # Resolved per read, so `set_model` picks up the new profile.
+                image_resize_options=lambda: self._image_resize_options(),
+            )
         )
         #: Structured prompt sections (pi's `SystemMessage.sections`), when the
         #: caller assembles the prompt with `karen_coding_agent.prompt`.
@@ -206,7 +278,7 @@ class AgentSession:
             initial_state=AgentInitialState(
                 system_prompt=self.system_prompt_text, model=model, tools=self.tools
             ),
-            convert_to_llm=convert_to_llm,
+            convert_to_llm=self._convert_to_llm,
             stream_fn=self._stream_fn,
             before_tool_call=self._before_tool_call,
             after_tool_call=self._after_tool_call,
@@ -218,6 +290,10 @@ class AgentSession:
         self._retry_attempt = 0
         self._retry_controller: Optional[AbortController] = None
         self._abort_requested = False
+        self._bash_controllers: List[AbortController] = []
+        #: Side-channel bash results recorded while streaming, flushed at
+        #: agent_end and again before a new prompt (pi's `_pendingBashMessages`).
+        self._pending_bash_messages: List[Any] = []
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -238,8 +314,43 @@ class AgentSession:
             self.fresh = True
         await self._ensure_branch(self.session)
         await self._reload_context()
+        await self._restore_thinking_level()
         self._emit(
             {"type": "session_opened", "session_id": self.session.metadata.id, "resumed": resumed}
+        )
+
+    async def _thinking_level_entries(self) -> List[Any]:
+        branch = await self.session.branch(self.branch_name)
+        entries = await branch.find_entries(BranchScan(order="oldestFirst"))
+        return [
+            entry
+            for entry in entries
+            if getattr(entry, "type", None) == "custom"
+            and getattr(entry, "custom_type", None) == THINKING_LEVEL_ENTRY
+        ]
+
+    async def _restore_thinking_level(self) -> None:
+        """Restore the branch's last `thinking_level_change` (pi's `getSessionContextSettings`).
+
+        Deviation: pi also seeds a `thinking_level_change` entry into every new
+        session, and backfills one into sessions that predate the entry type,
+        from the settings manager's `defaultThinkingLevel`. karen has no such
+        setting — a session starts at the level the caller passed — so a seed
+        entry would carry no information while putting a metadata node at the
+        root of every tree. karen records actual changes only, and restores
+        them the same way pi does, from the last entry on the branch path.
+        """
+        from karen_ai import clamp_thinking_level
+
+        entries = await self._thinking_level_entries()
+        if not entries:
+            return
+        level = _thinking_level_value(entries[-1])
+        if not isinstance(level, str):
+            return
+        available = self.get_available_thinking_levels()
+        self.agent.state.thinking_level = (
+            level if level in available else (clamp_thinking_level(self.model, level) if self.model else "off")
         )
 
     async def _ensure_branch(self, session: Session) -> None:
@@ -406,6 +517,42 @@ class AgentSession:
             },
             "cost": totals["cost"],
         }
+
+    # -- export (M9) --------------------------------------------------------------
+
+    async def export_to_jsonl(self, output_path: Optional[str] = None) -> str:
+        """Export the current branch as pi-importable JSONL (pi's `exportSessionToJsonl`).
+
+        The branch is re-parented into one linear chain under a v3
+        `{"type":"session",...}` header so pi can re-open the file. Returns the
+        written path.
+        """
+        from .session_export import export_session_to_jsonl
+
+        branch = await self.session.branch(self.branch_name)
+        entries = await branch.find_entries(BranchScan(order="oldestFirst"))
+        return export_session_to_jsonl(
+            self.session.metadata.id,
+            self.cwd,
+            [to_jsonable(entry) for entry in entries],
+            output_path=output_path,
+        )
+
+    async def export_to_html(self, output_path: Optional[str] = None) -> str:
+        """Export the session as a self-contained HTML report (pi's `exportToHtml`)."""
+        from .session_export import export_session_to_html
+
+        header = self.session_header() or {}
+        entries = [to_jsonable(entry) for entry in await self.entries()]
+        leaf_id = await self.branch_tip_id()
+        return export_session_to_html(
+            header,
+            entries,
+            leaf_id,
+            output_path=output_path,
+            cwd=self.cwd,
+            system_prompt=self.system_prompt_text,
+        )
 
     # -- navigation --------------------------------------------------------------
 
@@ -582,6 +729,10 @@ class AgentSession:
             await previous.close()
         await self._ensure_branch(session)
         await self._reload_context()
+        # The level belongs to the session, not the runtime (pi rebuilds its
+        # AgentSession on every switch and restores the level there), so a
+        # switch/fork/clone must re-read the new branch's last change.
+        await self._restore_thinking_level()
         branch = await session.branch(self.branch_name)
         self._pre_run_tip = await branch.get_tip_id()
         self._run_entries = []
@@ -636,6 +787,129 @@ class AgentSession:
         self.model = model
         self.agent.state.model = model
 
+    # -- thinking level ---------------------------------------------------------
+
+    def supports_thinking(self) -> bool:
+        """Whether the current model supports thinking/reasoning (pi's `supportsThinking`)."""
+        return bool(getattr(self.model, "reasoning", False))
+
+    def get_available_thinking_levels(self) -> List[str]:
+        """Thinking levels the current model supports (pi's `getAvailableThinkingLevels`)."""
+        from karen_ai import get_supported_thinking_levels
+
+        if not self.model:
+            return list(EXTENDED_THINKING_LEVELS)
+        return list(get_supported_thinking_levels(self.model))
+
+    async def set_thinking_level(self, level: str) -> None:
+        """Set the thinking level, clamped to the model's capabilities (pi's `setThinkingLevel`).
+
+        Records a `thinking_level_change` session entry and emits
+        `thinking_level_changed`, both only when the level actually changes.
+        """
+        from karen_ai import clamp_thinking_level
+
+        available = self.get_available_thinking_levels()
+        effective = level if level in available else (clamp_thinking_level(self.model, level) if self.model else "off")
+        previous = self.agent.state.thinking_level
+        self.agent.state.thinking_level = effective
+        if effective != previous:
+            await self._append_custom_entry(THINKING_LEVEL_ENTRY, {"thinkingLevel": effective})
+            self._emit({"type": "thinking_level_changed", "level": effective})
+
+    async def cycle_thinking_level(self) -> Optional[str]:
+        """Cycle to the next supported thinking level (pi's `cycleThinkingLevel`).
+
+        Returns the new level, or None when the model doesn't support thinking.
+        """
+        if not self.supports_thinking():
+            return None
+        levels = self.get_available_thinking_levels()
+        try:
+            index = levels.index(self.agent.state.thinking_level)
+        except ValueError:
+            index = -1
+        next_level = levels[(index + 1) % len(levels)]
+        await self.set_thinking_level(next_level)
+        return next_level
+
+    # -- bash (RPC side channel) -------------------------------------------------
+
+    async def execute_bash(
+        self,
+        command: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        *,
+        exclude_from_context: bool = False,
+        command_id: Optional[str] = None,
+    ) -> "BashResult":
+        """Run a shell command outside the agent loop (pi's `AgentSession.executeBash`).
+
+        Applies the configured shell path and command prefix, streams sanitized
+        output to `on_chunk` and `bash_execution_update` events, records the
+        result as a `BashExecutionMessage` in the session (pi's
+        `recordBashResult`, so the model sees it next turn; `exclude_from_context`
+        keeps it out of the LLM conversion), and reports pi's `BashResult`.
+        `abort_bash()` cancels it.
+        """
+        from .bash_executor import execute_bash
+
+        controller = AbortController()
+        self._bash_controllers.append(controller)
+
+        def _on_chunk(delta: str) -> None:
+            if on_chunk is not None:
+                on_chunk(delta)
+            self._emit({"type": "bash_execution_update", "id": command_id, "delta": delta})
+
+        try:
+            result = await execute_bash(
+                command,
+                self.cwd,
+                shell_path=self.shell_path,
+                shell_command_prefix=self.shell_command_prefix,
+                on_chunk=_on_chunk,
+                signal=controller.signal,
+            )
+            await self.record_bash_result(command, result, exclude_from_context=exclude_from_context)
+            return result
+        finally:
+            if controller in self._bash_controllers:
+                self._bash_controllers.remove(controller)
+
+    async def record_bash_result(
+        self, command: str, result: "BashResult", *, exclude_from_context: bool = False
+    ) -> None:
+        """Record a side-channel bash run in the transcript (pi's `recordBashResult`).
+
+        The message goes into the session so the model sees the command and its
+        output on the next turn; while the agent is streaming it is queued
+        instead, so appending it can't break the tool_use/tool_result ordering.
+        """
+        from karen_agent.messages import BashExecutionMessage
+
+        message = BashExecutionMessage(
+            command=command,
+            output=result.output,
+            exit_code=result.exit_code,
+            cancelled=result.cancelled,
+            truncated=result.truncated,
+            full_output_path=result.full_output_path,
+            timestamp=int(time.time() * 1000),
+            exclude_from_context=exclude_from_context or None,
+        )
+        if getattr(self.agent.state, "is_streaming", False):
+            self._pending_bash_messages.append(message)
+            return
+        await self._persist_message(message)
+        self.agent.state.messages.append(message)
+
+    def abort_bash(self) -> None:
+        """Cancel any in-flight `execute_bash` (pi's `AgentSession.abortBash`)."""
+        for controller in self._bash_controllers:
+            controller.abort()
+        self._bash_controllers.clear()
+
     # -- prompting ---------------------------------------------------------------
 
     async def prompt(self, text: str, images=None, auto_compact: bool = True) -> None:
@@ -643,11 +917,75 @@ class AgentSession:
         provider failures, overflow recovery and threshold auto-compaction (pi's
         post-run `_handlePostAgentRun` driver; `auto_compact=False` skips the
         compaction and overflow branches — the RPC mode's `set_auto_compaction`
-        switch routes through here — while auto-retry keeps running, like pi)."""
+        switch routes through here — while auto-retry keeps running, like pi).
+
+        `images` are normalized first (pi's `_normalizePromptImages`): each is
+        converted/resized to the model's inline limits, failures are dropped and
+        their messages appended to the text as hints. `steer()`/`follow_up()`
+        keep images raw, exactly like pi.
+        """
         self._overflow_recovery_attempted = False
         self._abort_requested = False
-        await self.agent.prompt(text, images)
+        # pi's second flush point (the first is the run-settle flush on
+        # `agent_end`): a bash result recorded in the window after that flush but
+        # before the run fully settled is still queued here, and the model has to
+        # see it in *this* turn rather than at the end of the next one. pi skips
+        # this on the streaming path (a steer/followUp returns before the flush),
+        # so a mid-run call leaves the queue alone.
+        if not getattr(self.agent.state, "is_streaming", False):
+            await self._flush_pending_bash_messages()
+        normalized_images, hints = await self._normalize_prompt_images(images)
+        if hints:
+            text = f"{text}\n\n" + "\n".join(hints)
+        await self.agent.prompt(text, normalized_images)
         await self._post_run(auto_compact)
+
+    @staticmethod
+    def _resize_options_for(model):
+        """A model's image resize profile (pi's `model.inputLimits.images.resize`)."""
+        input_limits = getattr(model, "input_limits", None)
+        images = getattr(input_limits, "images", None) if input_limits is not None else None
+        return getattr(images, "resize", None) if images is not None else None
+
+    def _convert_to_llm(self, messages: List[AgentMessage]) -> Any:
+        """`convert_to_llm` + pi's `images.blockImages` filter (pi's sdk.ts wrapper).
+
+        The setting is read on every call, so toggling it mid-session applies to
+        the next request without rebuilding the agent.
+        """
+        converted = convert_to_llm(messages)
+        if not self.block_images:
+            return converted
+        return [_block_message_images(message) for message in converted]
+
+    def _image_resize_options(self):
+        """The current model's image resize profile (pi's `model.inputLimits.images.resize`)."""
+        return self._resize_options_for(self.model)
+
+    async def _normalize_prompt_images(self, images):
+        """pi's `_normalizePromptImages`: process each image, drop failures into hints."""
+        if not images:
+            return images, []
+        from karen_ai import ImageContent
+
+        from .utils import process_image
+
+        resize_options = self._image_resize_options()
+        normalized: List[Any] = []
+        hints: List[str] = []
+        for image in images:
+            processed = await process_image(
+                base64.b64decode(image.data),
+                image.mime_type,
+                auto_resize_images=self.auto_resize_images,
+                resize_options=resize_options,
+            )
+            if not processed.ok:
+                hints.append(processed.message)
+                continue
+            normalized.append(ImageContent(data=processed.data, mime_type=processed.mime_type))
+            hints.extend(processed.hints)
+        return normalized, hints
 
     async def _post_run(self, auto_compact: bool = True) -> None:
         while True:
@@ -886,6 +1224,17 @@ class AgentSession:
                     attempt = self._retry_attempt
                     self._retry_attempt = 0
                     self._emit({"type": "auto_retry_end", "success": True, "attempt": attempt})
+        elif event_type == "agent_end":
+            await self._flush_pending_bash_messages()
+
+    async def _flush_pending_bash_messages(self) -> None:
+        """Append side-channel bash results queued during the run (pi's agent_end flush)."""
+        if not self._pending_bash_messages:
+            return
+        pending, self._pending_bash_messages = list(self._pending_bash_messages), []
+        for message in pending:
+            await self._persist_message(message)
+            self.agent.state.messages.append(message)
 
     async def _persist_message(self, message: AgentMessage) -> None:
         entry_id = self.session.id_generator.next()
@@ -913,6 +1262,33 @@ class AgentSession:
 
         await self.session.mutate(write_one)
         self._run_entries.append(entry_id)
+
+    async def _append_custom_entry(self, custom_type: str, data: Any = None) -> str:
+        """Append a non-context custom entry to the current branch tip.
+
+        pi's session entries of this kind (labels, model/thinking changes) carry
+        metadata the context builder ignores.
+        """
+        entry_id = self.session.id_generator.next()
+
+        async def write_one(mutator):
+            tip = await mutator.get_value(branch_tip(self.branch_name))
+            await mutator.commit(
+                [
+                    insert_entry(
+                        CustomEntry(
+                            id=entry_id,
+                            parent_id=tip.value,
+                            custom_type=custom_type,
+                            data=data,
+                        )
+                    ),
+                    set_value(branch_tip(self.branch_name), entry_id),
+                ]
+            )
+
+        await self.session.mutate(write_one)
+        return entry_id
 
     # -- compaction --------------------------------------------------------------
 
@@ -1026,4 +1402,19 @@ class AgentSession:
                 usage=hook_context.result.usage,
             ),
         )
+        # pi runs image normalization AFTER the extension tool_result hook so
+        # hook-injected images are normalized too. Oversized images from tools
+        # (screenshots, MCP bridges) would otherwise make the provider reject
+        # the whole conversation, so normalize them once here.
+        content = hook_context.result.content
+        if content and any(getattr(block, "type", None) == "image" for block in content):
+            from .utils import normalize_tool_result_images
+
+            normalized = await normalize_tool_result_images(
+                content,
+                auto_resize_images=self.auto_resize_images,
+                resize_options=self._image_resize_options(),
+            )
+            if normalized != list(content):
+                return AfterToolCallResult(content=normalized)
         return None
