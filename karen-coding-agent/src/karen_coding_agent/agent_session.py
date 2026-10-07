@@ -21,7 +21,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from karen_ai import (
     AbortController,
@@ -285,14 +285,20 @@ class AgentSession:
         )
         self.agent.subscribe(self._on_agent_event)
         self._overflow_recovery_attempted = False
-        self._run_entries: List[str] = []
+        #: Everything appended to the branch during the current run, in append
+        #: order, as `(kind, entry_id, entry)` — `entry` is the `CustomEntry`
+        #: itself for `"custom"` appends (the rewind has to re-parent it) and
+        #: None for `"message"` ones. Because every append moves the branch tip
+        #: to the new entry, this list mirrors the chain the run built, which is
+        #: what `_omit_final_attempt` has to undo — and only partially.
+        self._run_appends: List[Tuple[str, str, Any]] = []
         self._pre_run_tip: Optional[str] = None
         self._retry_attempt = 0
         self._retry_controller: Optional[AbortController] = None
         self._abort_requested = False
         self._bash_controllers: List[AbortController] = []
-        #: Side-channel bash results recorded while streaming, flushed at
-        #: agent_end and again before a new prompt (pi's `_pendingBashMessages`).
+        #: Side-channel bash results recorded while streaming, flushed when the
+        #: run settles and again before a new prompt (pi's `_pendingBashMessages`).
         self._pending_bash_messages: List[Any] = []
 
     # -- lifecycle -------------------------------------------------------------
@@ -735,7 +741,7 @@ class AgentSession:
         await self._restore_thinking_level()
         branch = await session.branch(self.branch_name)
         self._pre_run_tip = await branch.get_tip_id()
-        self._run_entries = []
+        self._run_appends = []
         self._emit(
             {
                 "type": "session_opened",
@@ -926,19 +932,32 @@ class AgentSession:
         """
         self._overflow_recovery_attempted = False
         self._abort_requested = False
-        # pi's second flush point (the first is the run-settle flush on
-        # `agent_end`): a bash result recorded in the window after that flush but
-        # before the run fully settled is still queued here, and the model has to
-        # see it in *this* turn rather than at the end of the next one. pi skips
-        # this on the streaming path (a steer/followUp returns before the flush),
-        # so a mid-run call leaves the queue alone.
+        # pi's second flush point (the first is the run-settle flush in the
+        # `finally` below): a bash result recorded in the window after that
+        # flush but before the run fully settled is still queued here, and the
+        # model has to see it in *this* turn rather than at the end of the next
+        # one. pi skips this on the streaming path (a steer/followUp returns
+        # before the flush), so a mid-run call leaves the queue alone.
         if not getattr(self.agent.state, "is_streaming", False):
             await self._flush_pending_bash_messages()
         normalized_images, hints = await self._normalize_prompt_images(images)
         if hints:
             text = f"{text}\n\n" + "\n".join(hints)
-        await self.agent.prompt(text, normalized_images)
-        await self._post_run(auto_compact)
+        try:
+            await self.agent.prompt(text, normalized_images)
+            await self._post_run(auto_compact)
+        finally:
+            # pi flushes pending side-channel results in the `finally` of
+            # `_runAgentPrompt` — once the whole run is over, including
+            # auto-retry and overflow recovery. Flushing at each attempt's
+            # `agent_end` instead would append the result *behind* the failed
+            # attempt that `_omit_final_attempt` then casts away, so a retried
+            # turn would silently lose it from the transcript and the branch.
+            # A run still in flight (a nested `prompt()` returns through here
+            # after the agent refused to re-enter) keeps the queue for its own
+            # settle flush rather than having a message spliced into it.
+            if not getattr(self.agent.state, "is_streaming", False):
+                await self._flush_pending_bash_messages()
 
     @staticmethod
     def _resize_options_for(model):
@@ -1052,21 +1071,47 @@ class AgentSession:
     async def _omit_final_attempt(self) -> None:
         """Drop the final assistant attempt from the in-memory transcript AND
         rewind the persisted branch tip past its entries (pi's
-        `_omitRecoveryAttempt`)."""
+        `_omitRecoveryAttempt`).
+
+        pi edits the failed message out of the *context* and leaves every
+        session entry parented where it was; karen's storage has no context-edit
+        entry, so it rewinds the branch tip instead. That is only equivalent as
+        long as the rewind does not take unrelated entries off the branch: a
+        recovery can be triggered while the run has already recorded something
+        else — a thinking-level change, a label, a model switch — and those
+        entries must survive (a lost `thinking_level_change` silently reverts
+        the level on the next resume).
+        """
         messages = self.agent.state.messages
         index = len(messages) - 1
         while index > 0 and message_field(messages[index], "role") != "assistant":
             index -= 1
         omitted = len(messages) - index
         self.agent.state.messages = list(messages[:index])
-        # the omitted messages were the last `omitted` entries persisted this run
-        del self._run_entries[len(self._run_entries) - omitted :]
-        new_tip = self._run_entries[-1] if self._run_entries else self._pre_run_tip
+        # Each append made its entry the branch tip, so the list mirrors the
+        # chain the run built and the failed attempt's entries are its last
+        # `omitted` message appends.
+        message_appends = [
+            position
+            for position, (kind, _id, _entry) in enumerate(self._run_appends)
+            if kind == "message"
+        ]
+        cut_index = len(message_appends) - omitted
+        cut = message_appends[cut_index] if cut_index >= 0 else 0
+        kept, dropped = self._run_appends[:cut], self._run_appends[cut:]
+        self._run_appends = kept
+        new_tip = kept[-1][1] if kept else self._pre_run_tip
 
         async def rewind(mutator):
             await mutator.commit([set_value(branch_tip(self.branch_name), new_tip)])
 
         await self.session.mutate(rewind)
+        # Everything after the new tip that is not part of the failed attempt
+        # (i.e. every custom entry the rewind just took off the branch) goes
+        # back on, in order, as a child of the tip we rewound to.
+        for kind, _id, entry in dropped:
+            if kind == "custom":
+                await self._append_custom_entry(entry.custom_type, entry.data)
 
     # -- auto-retry ---------------------------------------------------------------
 
@@ -1208,7 +1253,7 @@ class AgentSession:
         event_type = getattr(event, "type", None)
         if event_type == "agent_start":
             self._abort_requested = False
-            self._run_entries = []
+            self._run_appends = []
             branch = await self.session.branch(self.branch_name)
             self._pre_run_tip = await branch.get_tip_id()
         elif event_type == "message_end":
@@ -1224,11 +1269,10 @@ class AgentSession:
                     attempt = self._retry_attempt
                     self._retry_attempt = 0
                     self._emit({"type": "auto_retry_end", "success": True, "attempt": attempt})
-        elif event_type == "agent_end":
-            await self._flush_pending_bash_messages()
 
     async def _flush_pending_bash_messages(self) -> None:
-        """Append side-channel bash results queued during the run (pi's agent_end flush)."""
+        """Append side-channel bash results queued during the run (pi's
+        `_runAgentPrompt` settle flush)."""
         if not self._pending_bash_messages:
             return
         pending, self._pending_bash_messages = list(self._pending_bash_messages), []
@@ -1261,7 +1305,7 @@ class AgentSession:
             await mutator.commit(writes)
 
         await self.session.mutate(write_one)
-        self._run_entries.append(entry_id)
+        self._run_appends.append(("message", entry_id, None))
 
     async def _append_custom_entry(self, custom_type: str, data: Any = None) -> str:
         """Append a non-context custom entry to the current branch tip.
@@ -1270,24 +1314,29 @@ class AgentSession:
         metadata the context builder ignores.
         """
         entry_id = self.session.id_generator.next()
+        written: Dict[str, Any] = {}
 
         async def write_one(mutator):
             tip = await mutator.get_value(branch_tip(self.branch_name))
+            entry = CustomEntry(
+                id=entry_id,
+                parent_id=tip.value,
+                custom_type=custom_type,
+                data=data,
+            )
+            written["entry"] = entry
             await mutator.commit(
                 [
-                    insert_entry(
-                        CustomEntry(
-                            id=entry_id,
-                            parent_id=tip.value,
-                            custom_type=custom_type,
-                            data=data,
-                        )
-                    ),
+                    insert_entry(entry),
                     set_value(branch_tip(self.branch_name), entry_id),
                 ]
             )
 
         await self.session.mutate(write_one)
+        # Recorded so `_omit_final_attempt` can re-parent it if a recovery
+        # rewinds the tip past it (the entry carries no model context, but it
+        # carries state a resume reads back — the thinking level, a label).
+        self._run_appends.append(("custom", entry_id, written["entry"]))
         return entry_id
 
     # -- compaction --------------------------------------------------------------

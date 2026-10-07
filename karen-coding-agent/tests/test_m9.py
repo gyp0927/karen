@@ -51,6 +51,19 @@ async def _open(tmp_path, models, registration, **kwargs):
     return session
 
 
+async def _branch_entries(session):
+    """The entries a resume or an export would see — the current branch, not the
+    whole file (an omitted attempt stays in the file, but off-branch)."""
+    branch = await session.session.branch("main")
+    return await branch.find_entries(BranchScan(order="oldestFirst"))
+
+
+def _retry_policy():
+    from karen_ai import RetryPolicy
+
+    return RetryPolicy(enabled=True, max_retries=3, base_delay_ms=1, max_agent_delay_ms=1)
+
+
 def _png_bytes(width, height, color=(120, 60, 200)):
     from PIL import Image
 
@@ -200,11 +213,12 @@ async def test_execute_bash_queues_while_streaming(tmp_path):
     await session.close()
 
 
-async def test_queued_bash_result_is_flushed_at_agent_end(tmp_path):
-    """The `agent_end` flush itself — no test called it directly.
+async def test_queued_bash_result_is_flushed_when_the_run_settles(tmp_path):
+    """The settle flush itself, driven by a real run rather than by hand.
 
-    A real run records the message from inside a tool (so the queue is used for
-    real, not by hand), and the prompt only returns after the flush has landed.
+    pi flushes pending side-channel results in the `finally` of the run, "after
+    the agent turn completes to maintain proper message ordering", so the
+    message closes the turn — behind that turn's reply.
     """
     from karen_agent.types import AgentTool, AgentToolResult
 
@@ -259,6 +273,141 @@ async def test_queued_bash_result_is_flushed_before_the_next_prompt(tmp_path):
     assert session._pending_bash_messages == []
     # the model sees it during the turn for "next", not after the reply
     assert roles.index("bashExecution") < roles.index("assistant")
+    await session.close()
+
+
+async def test_queued_bash_result_survives_a_retried_turn(tmp_path):
+    """A result recorded during a failed attempt must not go down with it.
+
+    pi flushes in the run's `finally`, i.e. after the retries settle. Flushing
+    at the failed attempt's `agent_end` would put the message *behind* the
+    attempt that `_omit_final_attempt` casts away, and the tip rewind would take
+    its entry off the branch with it — invisible to the retried turn's model
+    call, to a resumed session and to `/export`.
+    """
+    from karen_agent.types import AgentTool, AgentToolResult
+
+    models, registration = _models_with_faux(
+        [
+            faux_assistant_message([faux_tool_call("side_bash", {})]),
+            faux_assistant_message([], stop_reason="error", error_message="Error 503"),
+            faux_assistant_message("recovered"),
+        ]
+    )
+    holder = {}
+
+    async def execute(tool_call_id, params, signal, on_update):
+        await holder["session"].execute_bash("echo mid-run")
+        return AgentToolResult(content=[TextContent(text="ran")])
+
+    tool = AgentTool(
+        name="side_bash",
+        description="run a side-channel bash command",
+        label="side_bash",
+        parameters={"type": "object", "properties": {}},
+        execute=execute,
+    )
+    session = await _open(tmp_path, models, registration, tools=[tool], retry_policy=_retry_policy())
+    holder["session"] = session
+
+    await session.prompt("go")
+
+    messages = [entry.message for entry in await _branch_entries(session) if entry.type == "message"]
+    roles = [getattr(m, "role", None) for m in messages]
+    # the failed attempt is gone, the result it produced is not
+    assert all(getattr(m, "stop_reason", None) != "error" for m in messages)
+    assert messages[-1].command == "echo mid-run"
+    assert roles[-1] == "bashExecution"
+    await session.close()
+
+
+async def test_thinking_level_change_survives_a_retried_turn(tmp_path):
+    """A level recorded mid-attempt stays on the branch when the attempt is omitted.
+
+    The change lands between the attempt's own entries, so the rewind has to go
+    back to the last entry that is *not* part of the attempt, not simply to the
+    last message entry — otherwise the entry is orphaned in the file, and the
+    next resume silently falls back to the previous level.
+    """
+    from karen_agent.types import AgentTool, AgentToolResult
+
+    models, registration = _models_with_faux(
+        [
+            faux_assistant_message([faux_tool_call("set_level", {})]),
+            faux_assistant_message([], stop_reason="error", error_message="Error 503"),
+            faux_assistant_message("recovered"),
+        ],
+        reasoning=True,
+    )
+    holder = {}
+
+    async def execute(tool_call_id, params, signal, on_update):
+        await holder["session"].set_thinking_level("high")
+        return AgentToolResult(content=[TextContent(text="level set")])
+
+    tool = AgentTool(
+        name="set_level",
+        description="change the thinking level",
+        label="set_level",
+        parameters={"type": "object", "properties": {}},
+        execute=execute,
+    )
+    session = await _open(tmp_path, models, registration, tools=[tool], retry_policy=_retry_policy())
+    holder["session"] = session
+
+    await session.prompt("go")
+
+    assert session.agent.state.thinking_level == "high"
+    await session.close()
+
+    resumed = await _open(tmp_path, models, registration, fresh=False)
+    assert resumed.agent.state.thinking_level == "high"
+    await resumed.close()
+
+
+async def test_omit_final_attempt_reparents_entries_that_are_not_part_of_the_attempt(tmp_path):
+    """A rewind takes the failed attempt off the branch and nothing else.
+
+    pi edits the failed message out of the context and unparents nothing, so an
+    entry recorded while the failed attempt was still the tip (an RPC
+    `set_thinking_level` arriving between the failure and the recovery) keeps its
+    place; and one recorded just *before* the failure is where the rewind has to
+    land, rather than behind it on the last message entry.
+    """
+    models, registration = _models_with_faux([faux_assistant_message("hi")], reasoning=True)
+    session = await _open(tmp_path, models, registration)
+    await session.prompt("hello")
+
+    # a change recorded behind the failing message
+    failed = faux_assistant_message([], stop_reason="error", error_message="Error 503")
+    session.agent.state.messages.append(failed)
+    await session._persist_message(failed)
+    await session.set_thinking_level("high")
+
+    await session._omit_final_attempt()
+
+    assert all(getattr(m, "stop_reason", None) != "error" for m in session.agent.state.messages)
+    assert len(session.agent.state.messages) == 3
+    custom = [entry for entry in await _branch_entries(session) if entry.type == "custom"]
+    assert [entry.data for entry in custom] == [{"thinkingLevel": "high"}]
+    # still the branch tip, so the retried reply lands behind it
+    assert await session.branch_tip_id() == custom[0].id
+
+    # a change recorded in front of the failing message
+    await session.set_thinking_level("low")
+    failed_again = faux_assistant_message([], stop_reason="error", error_message="Error 500")
+    session.agent.state.messages.append(failed_again)
+    await session._persist_message(failed_again)
+
+    await session._omit_final_attempt()
+
+    levels = [
+        entry
+        for entry in await _branch_entries(session)
+        if entry.type == "custom" and entry.data == {"thinkingLevel": "low"}
+    ]
+    assert levels, "the level recorded before the failure went off-branch"
+    assert await session.branch_tip_id() == levels[0].id
     await session.close()
 
 

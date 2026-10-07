@@ -36,7 +36,10 @@ await session.close()
   recoverable length stop **rewinds the branch tip** to persistently omit the
   failed attempt (pi's `_omitRecoveryAttempt`), compacts with reason
   `"overflow"`, and retries the turn once via `agent.continue_()`; a second
-  overflow keeps the failure and emits `overflow_give_up`. A silent overflow
+  overflow keeps the failure and emits `overflow_give_up`. The rewind stops at
+  the last entry that is *not* part of the attempt, so anything recorded
+  alongside it (a thinking-level change, a label, a model switch) stays on the
+  branch — pi's context edit unparents nothing. A silent overflow
   on a *successful* response (usage over the window) compacts without
   retrying. Aborted messages and messages from a different model are skipped,
   like pi.
@@ -459,8 +462,9 @@ that karen had not ported yet.
   (`output`/`exitCode`/`cancelled`/`truncated`/`fullOutputPath`). The result is
   recorded in the transcript as a `BashExecutionMessage` (pi's
   `recordBashResult`, so the model sees it next turn; `excludeFromContext` keeps
-  it out of the LLM conversion), queued until `agent_end` when a run is in
-  flight so tool_use/tool_result ordering can't break. Built on karen-agent's
+  it out of the LLM conversion), queued while a run is in flight so
+  tool_use/tool_result ordering can't break and appended once the run settles.
+  Built on karen-agent's
   `run_shell_command` + `OutputCapture`.
 - **Thinking levels**: `set_thinking_level` (clamped to the model's
   capabilities via karen-ai's `clamp_thinking_level`, emits
@@ -497,10 +501,13 @@ that karen had not ported yet.
   instead of silently reverting to the startup values.
 
 Two parity details pi splits across two call sites, both now matched: the
-pending bash queue is flushed **at `agent_end` and again before a new prompt**
-(pi `agent-session.ts` flushes in the run's `finally` and in `prompt()`), so a
-result recorded after the settle flush still reaches the model in the next turn
-rather than after it; and `switch_session`/`fork`/`clone` re-read the branch's
+pending bash queue is flushed **when the run settles and again before a new
+prompt** (pi `agent-session.ts` flushes in the run's `finally` — after
+auto-retry and overflow recovery are through, *not* at each attempt's
+`agent_end` — and in `prompt()`), so a result recorded after the settle flush
+still reaches the model in the next turn rather than after it, and a result
+recorded during an attempt that gets retried is not cast away with that
+attempt; and `switch_session`/`fork`/`clone` re-read the branch's
 last `thinking_level_change` (pi rebuilds its AgentSession on every switch,
 restoring the level in the constructor) instead of leaving the outgoing
 session's level in place. The RPC prompt path also treats a spawned-but-unstarted
@@ -508,8 +515,8 @@ prompt task as busy: `create_task` does not yield, so a burst of buffered
 prompts used to answer every one of them `disposition: started` while all but
 the first died in a swallowed `RuntimeError`.
 
-Verified with 54 new offline tests (`tests/test_m9.py`, including a node-driven
-render of the HTML report against a DOM stub) plus the full suite (257 passed)
+Verified with 57 new offline tests (`tests/test_m9.py`, including a node-driven
+render of the HTML report against a DOM stub) plus the full suite (260 passed)
 and karen-agent/karen-ai suites (332 / 443+1). New runtime dependency: Pillow.
 
 ## Roadmap
