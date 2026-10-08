@@ -6,6 +6,7 @@ in-memory testing transport, and the MCP OAuth client subset.
 """
 
 from .auth_provider import AuthProvider, McpFetch, UnauthorizedContext
+from .cancellation import Signal
 from .client import DEFAULT_REQUEST_TIMEOUT_MS, MAX_LIST_PAGES, McpClient, McpClientOptions, RequestContext
 from .protocol.content import CallToolResult, ContentBlock, LlmContent, to_llm_content
 from .protocol.jsonrpc import (
@@ -42,7 +43,19 @@ from .protocol.types import (
     ToolExecution,
 )
 from .transports.in_memory import InMemoryTransport, create_in_memory_transport_pair
+from .transports.http_client import Headers, HttpRequest, HttpResponse, http_fetch
 from .transports.stdio import StdioTransport, StdioTransportOptions
+from .transports.streamable_http import (
+    ConsumeSseOptions,
+    McpAuthRequiredError,
+    McpHttpError,
+    McpSessionExpiredError,
+    SseEvent,
+    StreamableHttpReconnectOptions,
+    StreamableHttpTransport,
+    StreamableHttpTransportOptions,
+    consume_sse_stream,
+)
 from .transports.transport import (
     DEFAULT_MAX_MESSAGE_BYTES,
     CloseListener,
@@ -63,8 +76,12 @@ __all__ = [
     "CancelledNotification",
     "ClientCapabilities",
     "CloseListener",
+    "ConsumeSseOptions",
     "ContentBlock",
     "ErrorListener",
+    "Headers",
+    "HttpRequest",
+    "HttpResponse",
     "Implementation",
     "InMemoryTransport",
     "InitializeResult",
@@ -74,11 +91,14 @@ __all__ = [
     "ListToolsResult",
     "LlmContent",
     "McpAbortError",
+    "McpAuthRequiredError",
     "McpClient",
     "McpClientOptions",
     "McpConnectionClosedError",
     "McpError",
     "McpFetch",
+    "McpHttpError",
+    "McpSessionExpiredError",
     "McpTimeoutError",
     "McpTransport",
     "MessageListener",
@@ -90,13 +110,20 @@ __all__ = [
     "ResourceTemplate",
     "Root",
     "ServerCapabilities",
+    "Signal",
+    "SseEvent",
     "StdioTransport",
     "StdioTransportOptions",
+    "StreamableHttpReconnectOptions",
+    "StreamableHttpTransport",
+    "StreamableHttpTransportOptions",
     "Tool",
     "ToolAnnotations",
     "ToolExecution",
     "UnauthorizedContext",
+    "consume_sse_stream",
     "create_in_memory_transport_pair",
+    "http_fetch",
     "is_json_rpc_notification",
     "is_json_rpc_request",
     "is_json_rpc_response",

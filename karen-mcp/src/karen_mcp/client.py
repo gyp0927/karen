@@ -6,6 +6,10 @@ requests to us, and the protocol-level helpers (`tools/list`, `tools/call`,
 `resources/*`) with pi's exact validation and leniency — a server that omits
 `content`, ends pagination with `""`, or drops a resource's `name` is handled
 rather than rejected.
+
+The helpers also parse their results into the pydantic protocol models, so a
+known member with the wrong type is rejected where pi's plain casts would pass
+it through; unknown members always pass through (`extra="allow"`).
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from typing import (
 
 from pydantic import ValidationError
 
+from .cancellation import Signal
 from .protocol.content import CallToolResult, ContentBlock
 from .protocol.jsonrpc import (
     JSON_RPC_ERROR_CODES,
@@ -79,31 +84,6 @@ ErrorListener = Callable[[BaseException], None]
 CloseListener = Callable[[], None]
 RequestHandler = Callable[[Any, "RequestContext"], Any]
 RootsSource = Union[Sequence[Root], Callable[[], Union[Sequence[Root], Awaitable[Sequence[Root]]]]]
-
-
-class _AbortSignal:
-    """Abort signal for the requests a server sends us. karen-ai's `AbortSignal`
-    duck-types against it (`.aborted`, `.wait()`, `.reason`)."""
-
-    def __init__(self) -> None:
-        self._event = asyncio.Event()
-        self._reason: Optional[BaseException] = None
-
-    @property
-    def aborted(self) -> bool:
-        return self._event.is_set()
-
-    @property
-    def reason(self) -> BaseException:
-        return self._reason if self._reason is not None else McpAbortError()
-
-    async def wait(self) -> None:
-        await self._event.wait()
-
-    def _abort(self, reason: Optional[BaseException] = None) -> None:
-        if not self._event.is_set():
-            self._reason = reason
-            self._event.set()
 
 
 @dataclass
@@ -209,9 +189,9 @@ def _validate_read_resource_result(value: Any) -> Dict[str, Any]:
 def _validate_call_tool_result(value: Any) -> Dict[str, Any]:
     if not is_object(value) or ("content" in value and not isinstance(value["content"], list)):
         raise _invalid("Invalid MCP tools/call result")
-    if "structuredContent" in value and value["structuredContent"] is not None and not is_object(
-        value["structuredContent"]
-    ):
+    # `structuredContent` is an object when present; an explicit `null` is not
+    # one, exactly as in pi.
+    if "structuredContent" in value and not is_object(value["structuredContent"]):
         raise _invalid("Invalid MCP tools/call structured content")
     if "content" not in value:
         value = {**value, "content": []}
@@ -232,7 +212,7 @@ class McpClient:
         self._protocol_version: Optional[str] = None
         self._pending: Dict[JsonRpcId, _PendingRequest] = {}
         self._progress_requests: Dict[JsonRpcId, JsonRpcId] = {}
-        self._incoming: Dict[JsonRpcId, Tuple["asyncio.Task[Any]", _AbortSignal]] = {}
+        self._incoming: Dict[JsonRpcId, Tuple["asyncio.Task[Any]", Signal]] = {}
         self._request_handlers: Dict[str, RequestHandler] = {}
         self._notification_listeners: Dict[str, List[NotificationListener]] = {}
         self._error_listeners: List[ErrorListener] = []
@@ -314,7 +294,11 @@ class McpClient:
             self._state = "connected"
             return result
         except BaseException:
-            await self.close()
+            # A failed close must not replace the error the caller is owed.
+            try:
+                await self.close()
+            except BaseException:
+                pass
             raise
 
     async def close(self) -> None:
@@ -496,7 +480,11 @@ class McpClient:
             timeout_ms=(
                 timeout_ms
                 if timeout_ms is not None
-                else (self.options.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS)
+                else (
+                    self.options.request_timeout_ms
+                    if self.options.request_timeout_ms is not None
+                    else DEFAULT_REQUEST_TIMEOUT_MS
+                )
             ),
             signal=signal,
             # The spec forbids cancelling `initialize`.
@@ -586,7 +574,7 @@ class McpClient:
                 }
             )
             return
-        signal = _AbortSignal()
+        signal = Signal()
         task = asyncio.current_task()
         if task is not None:
             self._incoming[message["id"]] = (task, signal)
@@ -644,7 +632,7 @@ class McpClient:
         if incoming is None:
             return
         task, signal = incoming
-        signal._abort(McpAbortError(str(params.get("reason") or "Cancelled")))
+        signal.abort(McpAbortError(str(params.get("reason") or "Cancelled")))
         task.cancel()
 
     def _arm_timeout(self, request_id: JsonRpcId, entry: _PendingRequest) -> None:
@@ -708,7 +696,7 @@ class McpClient:
         self._state = "closed"
         self._reject_pending(error)
         for task, signal in list(self._incoming.values()):
-            signal._abort(error)
+            signal.abort(error)
             task.cancel()
         self._incoming.clear()
         if was_closed:
