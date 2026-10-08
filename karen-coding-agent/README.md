@@ -3,8 +3,8 @@
 The `karen` CLI coding assistant — the application layer on top of
 [karen-agent](../karen-agent), and the karen equivalent of
 [`@earendil-works/pi`](https://github.com/earendil-works/pi)'s
-`packages/coding-agent` (much smaller scope: no TUI, MCP, or extensions yet —
-see the milestone list).
+`packages/coding-agent` (much smaller scope: no TUI or extensions yet —
+MCP tool integration and TUI are tracked in the roadmap below).
 
 ## M1: AgentSession + CLI
 
@@ -521,8 +521,41 @@ and karen-agent/karen-ai suites (332 / 443+1). New runtime dependency: Pillow.
 
 ## Roadmap
 
-Later milestones (tracked in the repo root README): extensions / MCP / TUI
-(unscheduled; image input landed in M9).
+Later milestones: TUI (unscheduled). MCP tool integration landed in this
+milestone (below): `karen_coding_agent.mcp` bridges `karen_mcp` into the
+agent's tool set.
+
+## MCP: tools from external servers
+
+`karen_coding_agent.mcp` connects to Model Context Protocol servers (stdio or
+Streamable HTTP) via `karen_mcp`, wraps each of their tools as an `AgentTool`
+the loop can call, and projects `tools/call` results into LLM content with
+`to_llm_content` (text and images pass through; audio, resource links, and
+binary resources become short placeholders, exactly as `karen_mcp` documents).
+
+Configuration lives in the settings files' `mcpServers` block (global
+`~/.karen/settings.json` and project `<cwd>/.karen/settings.json`), one entry
+per server:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"] },
+    "remote": { "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer …" } }
+  }
+}
+```
+
+The CLI builds an `McpToolManager`, connects every configured server, and
+passes it to `AgentSession`, which merges the wrapped tools into the default
+tool set (so a server's tool is callable by name and its result reaches the
+model as text/images). A server that fails to connect or list its tools is
+skipped with a stderr diagnostic rather than aborting the session. An HTTP
+server that needs OAuth takes an `AuthProvider` (from
+`karen_mcp.oauth.adapt_oauth_provider`) in place of a static header.
+
+`mcp_server_configs_from_settings` turns the settings block into
+`McpServerConfig` objects; `McpToolManager(configs)` does the rest.
 
 ## Development
 

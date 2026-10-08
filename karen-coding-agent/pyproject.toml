@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "karen-agent",
     "karen-ai",
+    "karen-mcp",
     "pathspec>=0.12",
     "Pillow>=10.0",
 ]

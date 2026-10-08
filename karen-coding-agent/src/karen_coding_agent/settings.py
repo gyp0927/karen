@@ -61,6 +61,21 @@ class Settings:
     images: Optional[Dict[str, Any]] = None  # raw camelCase dict
     prompts: Optional[List[str]] = None
     default_tools: Optional[List[str]] = None
+    mcp_servers: Optional[Dict[str, Any]] = None  # camelCase `mcpServers` → list of server dicts
+
+
+def _mcp_servers_from_wire(value: Any) -> Optional[Dict[str, Any]]:
+    """`mcpServers` is a `{name: {command?, args?, url?, headers?}}` dict.
+    Unknown keys are kept (the manager decides what to do with each server);
+    wrong-typed values are dropped."""
+    if not isinstance(value, dict):
+        return None
+    servers: Dict[str, Any] = {}
+    for name, spec in value.items():
+        if not isinstance(name, str) or not isinstance(spec, dict):
+            continue
+        servers[name] = spec
+    return servers or None
 
 
 @dataclass
@@ -172,6 +187,7 @@ def _settings_from_wire(merged: Dict[str, Any]) -> Settings:
         images=_as_dict(merged.get("images")),
         prompts=[_expand_user(entry) for entry in _as_str_list(merged.get("prompts")) or []] or None,
         default_tools=_as_str_list(merged.get("defaultTools")),
+        mcp_servers=_mcp_servers_from_wire(merged.get("mcpServers")),
     )
 
 
@@ -287,6 +303,35 @@ DEFAULT_RETRY_POLICY = RetryPolicy(
 )
 
 
+def mcp_server_configs_from_settings(settings: "Settings") -> List[Any]:
+    """Turn a `Settings.mcp_servers` dict into `McpServerConfig` objects.
+
+    Each entry in the settings file's `mcpServers` maps a server name to a
+    spec (`command`/`args` for stdio, `url`/`headers` for HTTP). The import of
+    `McpServerConfig` is lazy so this function is usable before `karen_mcp`
+    is installed in a minimal environment.
+    """
+    if not settings.mcp_servers:
+        return []
+    from karen_coding_agent.mcp import McpServerConfig
+
+    configs: List[McpServerConfig] = []
+    for name, spec in settings.mcp_servers.items():
+        if not isinstance(spec, dict):
+            continue
+        config = McpServerConfig(name=name)
+        if isinstance(spec.get("command"), str):
+            config.command = spec["command"]
+            args = spec.get("args")
+            config.args = [entry for entry in args if isinstance(entry, str)] if isinstance(args, list) else None
+        if isinstance(spec.get("url"), str):
+            config.url = spec["url"]
+            headers = spec.get("headers")
+            config.headers = {k: v for k, v in headers.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(headers, dict) else None
+        configs.append(config)
+    return configs
+
+
 def _as_count(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -344,6 +389,7 @@ __all__ = [
     "image_block_images",
     "load_settings",
     "merge_default_tools",
+    "mcp_server_configs_from_settings",
     "resolve_default_tool_names",
     "retry_policy_from_wire",
     "update_settings",

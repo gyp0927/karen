@@ -58,6 +58,7 @@ from .settings import (
     image_auto_resize,
     image_block_images,
     load_settings,
+    mcp_server_configs_from_settings,
     resolve_default_tool_names,
     retry_policy_from_wire,
     update_settings,
@@ -363,6 +364,18 @@ class KarenCli:
             sessions_root = settings.session_dir
         tools = self._select_default_tools(settings.default_tools)
         retry_policy = retry_policy_from_wire(settings.retry)
+
+        # MCP servers from settings: connect each, expose their tools to the
+        # agent. A server that fails to connect is skipped (see McpToolManager).
+        mcp_manager = None
+        if settings.mcp_servers:
+            from karen_coding_agent.mcp import McpToolManager
+
+            mcp_configs = mcp_server_configs_from_settings(settings)
+            if mcp_configs:
+                mcp_manager = McpToolManager(configs=mcp_configs)
+                await mcp_manager.connect()
+
         self.session = AgentSession(
             cwd=self.cwd,
             models=self.models,
@@ -371,7 +384,9 @@ class KarenCli:
             listener=self._on_session_event,
             sessions_root=sessions_root,
             tools=tools,
-            system_prompt_sections=self._build_prompt_sections(tools),
+            system_prompt_sections=self._build_prompt_sections(
+                [*tools, *mcp_manager.tools()] if mcp_manager else tools
+            ),
             shell_path=settings.shell_path,
             shell_command_prefix=settings.shell_command_prefix,
             auto_resize_images=image_auto_resize(settings.images),
@@ -380,6 +395,7 @@ class KarenCli:
             if settings.compaction is not None
             else None,
             retry_policy=retry_policy,
+            mcp_manager=mcp_manager,
         )
         await self.session.open()
         self.session.subscribe(self._on_agent_event)

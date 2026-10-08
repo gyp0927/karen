@@ -219,6 +219,7 @@ class AgentSession:
         block_images: bool = False,
         stream_fn: Optional[StreamFn] = None,
         listener: Optional[SessionListener] = None,
+        mcp_manager: Optional[Any] = None,
     ) -> None:
         self.cwd = cwd
         self.models = models
@@ -252,6 +253,10 @@ class AgentSession:
                 image_resize_options=lambda: self._image_resize_options(),
             )
         )
+        # MCP tools (from a connected `McpToolManager`) extend the default set.
+        self.mcp_manager = mcp_manager
+        if mcp_manager is not None:
+            self.tools = [*self.tools, *mcp_manager.tools()]
         #: Structured prompt sections (pi's `SystemMessage.sections`), when the
         #: caller assembles the prompt with `karen_coding_agent.prompt`.
         self.system_prompt_sections = system_prompt_sections
@@ -385,6 +390,8 @@ class AgentSession:
         if self.session is not None:
             await self.session.close()
             self.session = None
+        if self.mcp_manager is not None:
+            await self.mcp_manager.aclose()
 
     # -- context ---------------------------------------------------------------
 
