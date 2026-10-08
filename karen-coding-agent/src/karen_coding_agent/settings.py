@@ -16,9 +16,12 @@ Ported subset (camelCase wire keys, like pi): `defaultProvider`,
 `defaultModel`, `shellPath`, `shellCommandPrefix`, `sessionDir`,
 `compaction` (`enabled`/`reserveTokens`/`keepRecentTokens`), `retry`
 (`enabled`/`maxRetries`/`baseDelayMs`/`maxAgentDelayMs`), `prompts`,
-`defaultTools`. The rest of pi's Settings is TUI/extensions/analytics scope
-and intentionally not ported — including `retry.provider` (the provider-adapter
-retry knobs; karen-ai adapters take those per request).
+`defaultTools`, plus karen additions `images`, `mcpServers` and `tui`
+(`tui: false` keeps `karen` in the plain REPL instead of the alt-screen TUI;
+read at startup, like the model and shell settings). The rest of pi's Settings
+is extensions/analytics scope and intentionally not ported — including
+`retry.provider` (the provider-adapter retry knobs; karen-ai adapters take
+those per request).
 """
 
 from __future__ import annotations
@@ -62,6 +65,10 @@ class Settings:
     prompts: Optional[List[str]] = None
     default_tools: Optional[List[str]] = None
     mcp_servers: Optional[Dict[str, Any]] = None  # camelCase `mcpServers` → list of server dicts
+    #: `tui: false` keeps `karen` in the plain REPL; unset means "auto" (the
+    #: TUI whenever both ends are a terminal). An explicit `--tui`/`--repl`
+    #: outranks it.
+    tui: Optional[bool] = None
 
 
 def _mcp_servers_from_wire(value: Any) -> Optional[Dict[str, Any]]:
@@ -170,6 +177,12 @@ def _as_dict(value: Any) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
+def _as_bool(value: Any) -> Optional[bool]:
+    """A real JSON boolean, or None. `1`/`"true"` are wrong-typed and dropped,
+    like every other setting (a truthy string must not silently win)."""
+    return value if isinstance(value, bool) else None
+
+
 def _expand_user(value: Optional[str]) -> Optional[str]:
     """pi expands a leading `~` in shellPath; do the same for path settings."""
     return os.path.expanduser(value) if value else value
@@ -188,6 +201,7 @@ def _settings_from_wire(merged: Dict[str, Any]) -> Settings:
         prompts=[_expand_user(entry) for entry in _as_str_list(merged.get("prompts")) or []] or None,
         default_tools=_as_str_list(merged.get("defaultTools")),
         mcp_servers=_mcp_servers_from_wire(merged.get("mcpServers")),
+        tui=_as_bool(merged.get("tui")),
     )
 
 

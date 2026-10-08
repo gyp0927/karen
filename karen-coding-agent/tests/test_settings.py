@@ -50,6 +50,18 @@ def test_missing_files_yield_empty_settings(tmp_path, isolated_global):
     assert loaded.diagnostics == []
 
 
+def test_tui_setting_is_read_from_the_project_file(tmp_path, isolated_global):
+    _write(tmp_path / ".karen" / "settings.json", {"tui": False})
+    assert load_settings(str(tmp_path)).settings.tui is False
+
+
+def test_tui_is_unset_by_default_and_drops_wrong_types(tmp_path, isolated_global):
+    assert load_settings(str(tmp_path)).settings.tui is None
+    # a truthy string must not silently count as "true"
+    _write(tmp_path / ".karen" / "settings.json", {"tui": "false"})
+    assert load_settings(str(tmp_path)).settings.tui is None
+
+
 def test_project_deep_merges_over_global(tmp_path):
     global_path = tmp_path / "global.json"
     _write(global_path, {

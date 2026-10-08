@@ -14,8 +14,55 @@ import sys
 from typing import Optional
 
 
-def _supports_tty() -> bool:
-    return hasattr(sys.stdin, "isatty") and sys.stdin.isatty() and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+def _is_console_handle(handle) -> bool:
+    """True when `handle` is a real Windows console.
+
+    `isatty()` cannot answer this: the NUL device is a character device, so a
+    process with `karen < NUL > NUL` (a scheduled or console-less launch)
+    reports True on both ends. `GetConsoleMode` is the same call the raw-mode
+    setup below depends on, so it is the honest gate.
+    """
+    try:
+        import ctypes
+
+        mode = ctypes.c_uint32()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    except Exception:
+        return False
+
+
+def _has_windows_console(std_handle: int) -> bool:
+    """`std_handle`: -10 = STD_INPUT_HANDLE, -11 = STD_OUTPUT_HANDLE."""
+    try:
+        import ctypes
+
+        return _is_console_handle(ctypes.windll.kernel32.GetStdHandle(std_handle))
+    except Exception:
+        return False
+
+
+def supports_tty() -> bool:
+    """True when this process has a usable interactive terminal on both ends.
+
+    Both streams are required: the alt-screen escapes go to stdout, so a
+    redirected stdout would dump them into a file, and the raw-mode/key path
+    needs a real stdin. On Windows that means a real *console*, not just
+    something `isatty()` likes — `msvcrt.getwch()` has no EOF path, so a
+    NUL-backed stdin would park the key loop forever instead of ending it, and
+    Git Bash (mintty) hands a native program pipes rather than a console.
+
+    Failing this check is not fatal: the caller falls back to the plain REPL.
+    """
+    if not (
+        hasattr(sys.stdin, "isatty")
+        and sys.stdin.isatty()
+        and hasattr(sys.stdout, "isatty")
+        and sys.stdout.isatty()
+    ):
+        return False
+    if sys.platform == "win32":
+        return _has_windows_console(-10) and _has_windows_console(-11)
+    return True
 
 
 class TerminalController:

@@ -12,7 +12,16 @@ The logic is split so it is testable without a TTY:
 
 from .app import LiveTui, TuiApp
 from .layout import Layout
-from .terminal import TerminalController
-from .transcript import TMessage, Transcript
+from .terminal import TerminalController, supports_tty
+from .transcript import BashExecution, TMessage, Transcript
 
-__all__ = ["LiveTui", "TuiApp", "Layout", "TerminalController", "TMessage", "Transcript"]
+__all__ = [
+    "BashExecution",
+    "Layout",
+    "LiveTui",
+    "TerminalController",
+    "TMessage",
+    "Transcript",
+    "TuiApp",
+    "supports_tty",
+]

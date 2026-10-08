@@ -27,7 +27,9 @@ from .transcript import Transcript
 
 # The default footer hint line. pi shows the active keybindings; we keep a
 # short, stable hint and let the status line carry the live state.
-_FOOTER = "enter : send   ctrl+j : newline   up/down : scroll   ctrl+c : quit"
+_FOOTER = (
+    "enter: send  ctrl+j: newline  up/down: scroll  ctrl+c: quit  !cmd: shell"
+)
 
 
 class TuiApp:

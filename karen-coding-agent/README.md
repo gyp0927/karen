@@ -61,8 +61,9 @@ post-run messages are checked.
 ### The `karen` CLI
 
 ```bash
-karen [--cwd PATH] [--model ID] [--new]     # interactive REPL
-karen --tui                                 # interactive alt-screen TUI
+karen                                       # interactive: alt-screen TUI (plain REPL when piped)
+karen --repl                                # force the plain line-based REPL instead
+karen --tui                                 # force the alt-screen TUI
 karen -p "summarize this repo"              # headless text mode: final reply on stdout
 karen "one" "two"                           # headless: prompts run sequentially
 karen --mode json "prompt"                  # headless JSON event stream
@@ -71,9 +72,22 @@ karen --export session.jsonl out.html       # session file -> standalone HTML re
 printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive it)
 ```
 
+`--cwd PATH`, `--model ID` and `--new` apply to every interactive and headless
+mode.
+
 - Interactive mode streams replies live and prints tool calls
   (`[tool ->] write(path='a.py', ...)`) plus a context-token estimate after
   every turn.
+- Interactive mode picks its front-end at startup (`tui/terminal.py`'s
+  `supports_tty()`): the alt-screen **TUI when stdin *and* stdout are a
+  terminal**, otherwise the plain REPL plus a one-line notice saying why. Both
+  ends are required — the alt-screen escapes go to stdout, and the Windows key
+  path (`msvcrt.getwch()`, which has no EOF path) needs a real *console*, so on
+  Windows the gate asks `GetConsoleMode` rather than trusting `isatty()`: the
+  NUL device is a character device and passes `isatty()`, and Git Bash (mintty)
+  hands a native program pipes, not a console. Force either side with
+  `--tui`/`--repl`, or persist it with `"tui": false` in a settings file;
+  precedence is flag > settings > default.
 - Headless modes (pi's `runPrintMode`; M3): **text** (default) prints only the
   final assistant message's text to stdout — tool chatter and session notices
   go to stderr — and exits 1 when the final message is an error or aborted;
@@ -81,10 +95,9 @@ printf 'hello\n/quit\n' | karen --new       # piped REPL (how the smokes drive i
   event per line (pi's `json-event.ts` shape: `message_update` carries only
   cumulative `usage` + the delta sub-event with `partial` stripped,
   `toolcall_start` gains `id`/`toolName`) and stays machine-parseable end to
-  end. Deviations from pi: no TTY auto-detection (karen's REPL is designed to
-  be piped), positional prompts imply print mode instead of becoming an
-  interactive initial message, and `@file`/image arguments are not supported
-  yet.
+  end. Deviations from pi: positional prompts imply print mode instead of
+  becoming an interactive initial message, and `@file`/image arguments are not
+  supported yet.
 - Sessions live under `~/.karen/sessions` (override with
   `KAREN_SESSIONS_ROOT`), resumed per working directory; `/new` starts fresh.
 - Slash commands: `/help`, `/new`, `/compact [focus]`, `/retry [on|off]`,
@@ -175,9 +188,10 @@ Ported subset (camelCase wire keys, like pi):
 - `retry` (M8) is pi's coding-agent retry block — per-field fallbacks are
   `enabled: true`, `maxRetries: 3`, `baseDelayMs: 2000`,
   `maxAgentDelayMs: 60000`; wrong types fall back instead of failing.
-- `~` is expanded in path settings. Writes (pi's `/settings` command) and the
-  rest of pi's Settings (TUI, extensions, analytics, themes, `retry.provider`,
-  …) are not ported.
+- `~` is expanded in path settings. `tui` (a karen addition) keeps `karen` in
+  the plain REPL when it is `false`; it is read at startup, like the model and
+  shell settings. Writes (pi's `/settings` command) and the rest of pi's
+  Settings (extensions, analytics, themes, `retry.provider`, …) are not ported.
 
 ## M5: RPC mode
 
@@ -522,8 +536,9 @@ and karen-agent/karen-ai suites (332 / 443+1). New runtime dependency: Pillow.
 
 ## TUI: alt-screen interactive mode
 
-`karen --tui` runs the interactive session inside a hand-rolled alternate-screen
-viewport, pi's `modes/interactive/` minus the React/Ink framework pi builds on
+`karen` runs the interactive session inside a hand-rolled alternate-screen
+viewport (and `--tui` forces it when auto-detection says no), pi's
+`modes/interactive/` minus the React/Ink framework pi builds on
 (its `@earendil-works/pi-tui` is ~1.3MB and not portable, so this is pure
 stdlib). The layout mirrors pi's chat viewport (`chat-viewport.ts`): a
 scrollable transcript on top, a fixed input dock below.
@@ -539,9 +554,15 @@ Looking around:▌
 It looks like a Python monorepo with packages karen-ai, karen-agent,
 karen-coding-agent and karen-mcp.
 
-model: deepseek/deepseek-v4-pro | cwd: E:\karen | tools: read bash edit write grep find ls
+! python -m pytest -q
+[bash <-] python -m pytest -q
+    ................................
+    1 failed, 371 passed in 32.8s
+    exit 1
+
+                                model: deepseek/deepseek-v4-pro | tools: 8 | cwd: E:\karen
 > ▌
-enter : send   ctrl+j : newline   up/down : scroll   ctrl+c : quit
+enter: send  ctrl+j: newline  up/down: scroll  ctrl+c: quit  !cmd: shell
 ```
 
 The package (`src/karen_coding_agent/tui/`) is split so the logic is testable
@@ -549,7 +570,7 @@ without a TTY:
 
 | module | role |
 | --- | --- |
-| `transcript.py` | pure model: agent/session events → user / assistant / tool / notice messages |
+| `transcript.py` | pure model: agent/session events → user / assistant / tool / bash / notice messages |
 | `layout.py` | pure renderer: messages + terminal size → exactly `height` ANSI lines |
 | `terminal.py` | the only TTY-touching module: alt screen (`CSI ?1049h/l`), raw mode, key decoding |
 | `app.py` | `TuiApp` (state + editor) and `LiveTui` (the async driver) |
@@ -585,6 +606,22 @@ without a TTY:
   `/resume`, `/name`, `/session`, `/thinking`, `/export`, `/settings`,
   `/templates`, `/skills`, `/help`, `/quit`, and `/<template>`/`<skill>`
   invocation.
+- **Shell bypass** (`!command`, pi's `!` — TUI-only, the plain REPL has no
+  equivalent): the command runs through `AgentSession.execute_bash`, so it stays
+  outside the agent loop, streams into the transcript as a `[bash ->]` block
+  that becomes `[bash <-]` when it finishes, and is recorded in the session so
+  the model sees the command and its output on the next turn
+  (`recordBashResult`). A non-zero exit adds `exit N`; an executor spill adds
+  `output truncated (full output: …)`. The live view is bounded on three axes so
+  a flooding command cannot stall the frame loop: 400 retained lines, 1024
+  characters per retained line (a `base64 -w0` stream or a `\r`-redrawn progress
+  bar has no line breaks at all, and `textwrap` on a whitespace-free megabyte is
+  quadratic), and a 50 ms repaint throttle. Whatever falls off is reported: a
+  dropped-lines marker, or a leading `…` on a truncated line.
+- **A submitted line that is a command never stays `(pending)`**: slash-command
+  lines are resolved on the spot (they never become a run, so no `agent_start`
+  will clear them), and a `!command` line is not echoed as a user message at
+  all — the bash block already carries the command.
 - **Layout accounting** is exact: the dock is rendered and measured first, the
   transcript fills the remaining rows, and `render` always returns exactly
   `height` lines (a tall dock on a tiny terminal keeps the footer by trimming
@@ -596,10 +633,11 @@ without a TTY:
   pi's incremental (damage-region) painting — karen repaints whole frames,
   which is what makes the renderer testable without a TTY.
 
-Verified with 55 offline tests (`tests/test_tui.py`, `tests/test_tui_app.py`:
-transcript lifecycle, layout row accounting, the editor's key handling, CSI
-decoding, and an end-to-end async driver over a fake terminal) plus the full
-suite; a `--tui` run was also driven against a real terminal.
+Verified with 94 offline tests (`tests/test_tui.py`, `tests/test_tui_app.py`:
+transcript lifecycle, the three bash-output bounds, layout row accounting, the
+editor's key handling, CSI decoding, the TTY gate, and an end-to-end async
+driver over a fake terminal including the `!command` path) plus the full suite;
+a `--tui` run was also driven against a real terminal.
 
 ## Roadmap
 

@@ -28,6 +28,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, Optional, Tuple
 
 from karen_ai import CreateModelsOptions, JsonFileCredentialStore, create_models
 from karen_ai.providers import deepseek_provider
@@ -64,7 +65,7 @@ from .settings import (
     update_settings,
 )
 from .tools import create_default_tools
-from .tui.app import LiveTui
+from .tui import LiveTui, supports_tty
 
 DEFAULT_MODEL_ID = "deepseek-v4-pro"
 DEFAULT_CREDENTIALS = Path.home() / ".karen" / "credentials.json"
@@ -89,6 +90,12 @@ HELP_TEXT = """Commands:
   /quit                 exit
   /<name> [args]        invoke a prompt template or skill from the current project
 Anything else is sent to the model."""
+
+
+#: How often `!command` output may repaint the alt screen (seconds). The
+#: command's own output is the only thing that streams between keystrokes, and
+#: a full-screen repaint per chunk of a flooded stdout would be wasteful.
+_BASH_PAINT_INTERVAL_SECONDS = 0.05
 
 
 def parse_command(line: str, template_names, skill_names=()):
@@ -146,6 +153,37 @@ def parse_command(line: str, template_names, skill_names=()):
     if name in skill_names:
         return "skill", name, rest
     return "prompt", None, line  # unknown slash command: send verbatim
+
+
+def resolve_interactive_mode(
+    *,
+    tui_flag: bool,
+    repl_flag: bool,
+    setting: Optional[bool],
+    interactive: bool,
+) -> Tuple[bool, str]:
+    """Decide whether `karen` opens the alt-screen TUI or the plain REPL.
+
+    Precedence: an explicit `--tui`/`--repl` wins, then the settings file's
+    `tui` key, then the default (TUI). The TUI needs a real terminal — the
+    alt-screen escapes go to stdout and the Windows key path wants a native
+    console handle — so without one the caller gets the plain REPL plus a
+    `notice` explaining why. Returns `(use_tui, notice)`; `notice` is empty
+    when there is nothing to explain.
+    """
+    if tui_flag:
+        wanted = True
+    elif repl_flag:
+        wanted = False
+    elif setting is not None:
+        wanted = setting
+    else:
+        wanted = True
+    if not wanted:
+        return False, ""
+    if not interactive:
+        return False, "TUI needs an interactive terminal; using the plain REPL"
+    return True, ""
 
 
 def format_args_preview(args, max_len: int = 72) -> str:
@@ -819,20 +857,18 @@ class KarenCli:
         the same command router the REPL uses, and the async run loop keeps
         reading keys while a prompt streams.
         """
-        if not sys.stdin.isatty():
-            print("TUI mode requires an interactive terminal; falling back to the plain REPL",
-                  file=sys.stderr)
+        if not supports_tty():
+            print("TUI needs an interactive terminal; using the plain REPL", file=sys.stderr)
             return await self.repl()
         # Create the TUI before opening the session so the session-opened event
         # lands in the transcript instead of on stdout (redraw is gated on
         # `start`, which happens once the alt screen is entered).
         self.tui = LiveTui()
-        tool_names = " ".join(tool.name for tool in (self.session.tools if self.session else []))
         try:
             await self._open_session(self.fresh)
-            tool_names = " ".join(tool.name for tool in self.session.tools)
+            tool_count = len(self.session.tools)
             self.tui.app.set_status_provider(
-                lambda: f"model: {self.provider}/{self.model.id} | cwd: {self.cwd} | tools: {tool_names}"
+                lambda: f"model: {self.provider}/{self.model.id} | tools: {tool_count} | cwd: {self.cwd}"
             )
 
             async def _prompt_handler(app, text: str) -> None:
@@ -845,11 +881,20 @@ class KarenCli:
         return 0
 
     async def _dispatch_tui_input(self, app, text: str) -> None:
-        """Route one submitted editor line: prompt, or slash command."""
+        """Route one submitted editor line: shell bypass, prompt, or slash command."""
+        if text.startswith("!"):
+            # pi's `!command` shell bypass. The runner echoes every submitted
+            # line as a user message before dispatch; a shell run renders as a
+            # bash block instead (it carries the command itself), so drop the
+            # echo rather than showing the command twice.
+            app.transcript.drop_pending_user(text)
+            await self._run_tui_bash(app, text[1:])
+            return
         kind, name, rest = parse_command(
             text, {t.name for t in self.templates}, {s.name for s in self.skills}
         )
         if kind == "quit":
+            app.transcript.resolve_pending()
             app.running = False
             return
         if kind in ("prompt", "template", "skill"):
@@ -863,6 +908,10 @@ class KarenCli:
                 prompt_text = text
             await self._run_tui_prompt(app, prompt_text)
             return
+        # Everything below is a command, not a prompt: it never becomes a run,
+        # so its transcript line must not keep the "(pending)" marker waiting
+        # for an `agent_start` that will not come.
+        app.transcript.resolve_pending()
         if kind == "new":
             # Reset first: the fresh session's session_opened notice should
             # survive the reset, not be erased by it.
@@ -886,6 +935,44 @@ class KarenCli:
             await self.session.wait_for_idle()
         except Exception as error:
             self.tui.app.add_notice(f"[error: {error}]", error=True)
+
+    async def _run_tui_bash(self, app, raw_command: str) -> None:
+        """`!command` in the TUI: run it through `AgentSession.execute_bash`.
+
+        The command runs outside the agent loop, its output streams into the
+        transcript block as it arrives, and the result is recorded in the
+        session so the model sees it on the next turn (pi's `recordBashResult`).
+        """
+        command = raw_command.strip()
+        if not command:
+            app.add_notice("usage: !<shell command>")
+            return
+        transcript = app.transcript
+        entry = transcript.on_bash_start(command)
+        last_paint = 0.0
+
+        def _on_chunk(delta: str) -> None:
+            nonlocal last_paint
+            transcript.on_bash_chunk(entry, delta)
+            # A command that floods stdout would otherwise repaint the whole
+            # screen per chunk; throttle, and always paint again at the end.
+            now = time.monotonic()
+            if now - last_paint >= _BASH_PAINT_INTERVAL_SECONDS:
+                last_paint = now
+                app.redraw()
+
+        try:
+            result = await self.session.execute_bash(command, on_chunk=_on_chunk)
+        except asyncio.CancelledError:
+            # The TUI is going away (ctrl+c): kill the child instead of
+            # leaving it running behind a dead app.
+            self.session.abort_bash()
+            raise
+        except Exception as error:
+            transcript.on_bash_end(entry, error=str(error))
+        else:
+            transcript.on_bash_end(entry, result=result)
+        app.redraw()
 
     async def _handle_navigation_or_settings(self, kind: str, rest: str) -> None:
         """TUI-side dispatcher for slash commands that aren't prompt-shaped.
@@ -923,6 +1010,8 @@ class KarenCli:
         elif kind == "help":
             for line in HELP_TEXT.splitlines():
                 self.tui.app.add_notice(line)
+            # TUI-only: the shell bypass has no plain-REPL counterpart.
+            self.tui.app.add_notice("  !<command>            run a shell command in this session")
 
     async def _run_captured(self, produce) -> None:
         """Run `produce()` (sync or async) and post its stdout/stderr as
@@ -962,8 +1051,11 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", default=None,
                         help="model provider (default: KAREN_PROVIDER, then settings defaultProvider, then deepseek)")
     parser.add_argument("--new", action="store_true", help="start a fresh session instead of resuming")
-    parser.add_argument("--tui", action="store_true",
-                        help="interactive alt-screen TUI (full chat viewport with a multi-line editor)")
+    ui = parser.add_mutually_exclusive_group()
+    ui.add_argument("--tui", action="store_true",
+                    help="interactive alt-screen TUI (the default when stdin and stdout are a terminal)")
+    ui.add_argument("--repl", action="store_true",
+                    help="plain line-based REPL instead of the alt-screen TUI")
     parser.add_argument("--export", metavar="FILE", dest="export_file",
                         help="export a session file to HTML and exit (an optional PROMPT arg is the output path)")
     parser.add_argument("messages", nargs="*", metavar="PROMPT",
@@ -1022,7 +1114,15 @@ def main(argv=None) -> int:
                    loaded_settings=loaded_settings)
     if headless:
         return asyncio.run(cli.run_print(args.messages))
-    if args.tui:
+    use_tui, notice = resolve_interactive_mode(
+        tui_flag=args.tui,
+        repl_flag=args.repl,
+        setting=loaded_settings.settings.tui,
+        interactive=supports_tty(),
+    )
+    if notice:
+        print(notice, file=sys.stderr)
+    if use_tui:
         return asyncio.run(cli.repl_tui())
     return asyncio.run(cli.repl())
 

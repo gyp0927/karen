@@ -6,7 +6,9 @@ event ingestion run.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
+from karen_coding_agent import cli as karen_cli
 from karen_coding_agent.tui.app import LiveTui
 
 
@@ -172,3 +174,162 @@ async def test_prompt_handler_errors_do_not_kill_the_loop():
 
     await asyncio.wait_for(live.run(handler), 5)
     assert seen == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
+# shell bypass (`!command`) and the command/prompt split
+# ---------------------------------------------------------------------------
+
+
+class FakeBashSession:
+    """The slice of `AgentSession` the TUI's input router touches."""
+
+    def __init__(self, output="", exit_code=0, cancelled=False, error=None, snapshot=None):
+        self.output = output
+        self.exit_code = exit_code
+        self.cancelled = cancelled
+        self.error = error
+        #: Called after the output has been pushed, while the command is still
+        #: "running" — sampling there is what proves the streams are live
+        #: rather than the end-of-run snapshot being backfilled into the block.
+        self.snapshot = snapshot
+        self.mid_run = None
+        self.commands = []
+        self.aborted = False
+
+    async def execute_bash(self, command, on_chunk=None, **kwargs):
+        self.commands.append(command)
+        if on_chunk is not None and self.output:
+            on_chunk(self.output)
+        if self.snapshot is not None:
+            self.mid_run = self.snapshot()
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        return SimpleNamespace(
+            output=self.output,
+            exit_code=self.exit_code,
+            cancelled=self.cancelled,
+            truncated=False,
+            full_output_path=None,
+        )
+
+    def abort_bash(self):
+        self.aborted = True
+
+
+def _cli_with(session, templates=(), skills=()):
+    """A `KarenCli` carrying only what the input router reads.
+
+    Built without `__init__`: opening a session needs a model, credentials and
+    a session file, none of which this path touches.
+    """
+    cli = object.__new__(karen_cli.KarenCli)
+    cli.session = session
+    cli.templates = list(templates)
+    cli.skills = list(skills)
+    cli.tui = None
+    return cli
+
+
+def _bash_blocks(live):
+    return [m for m in live.transcript.messages if m.kind == "bash"]
+
+
+async def test_a_bang_line_runs_through_execute_bash():
+    live, controller = _live(["!", "l", "s", "enter"])
+    session = FakeBashSession(output="a.txt\nb.txt\n")
+    cli = _cli_with(session)
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await live.run(handler)
+    assert session.commands == ["ls"]
+    blocks = _bash_blocks(live)
+    assert len(blocks) == 1
+    assert blocks[0].bash.command == "ls"
+    assert blocks[0].bash.output == "a.txt\nb.txt\n"
+    assert blocks[0].bash.state == "done"
+    # the bash block carries the command, so it is not echoed as a prompt too
+    assert [m for m in live.transcript.messages if m.kind == "user"] == []
+
+
+async def test_bash_output_streams_into_the_block_while_the_command_runs():
+    """The live view, not just the end-of-run snapshot: if the `on_chunk`
+    wiring is dropped, the block still fills in from `result.output` at the
+    end, so only a sample taken mid-run can tell the two apart."""
+    live, controller = _live(["!", "c", "a", "t", "enter"])
+
+    def snapshot():
+        blocks = _bash_blocks(live)
+        if not blocks:
+            return None
+        return (blocks[0].bash.state, blocks[0].bash.output)
+
+    session = FakeBashSession(output="part one\npart two\n", snapshot=snapshot)
+    cli = _cli_with(session)
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await live.run(handler)
+    assert session.mid_run == ("running", "part one\npart two\n")
+
+
+async def test_a_bang_line_with_a_nonzero_exit_is_an_error_block():
+    live, controller = _live(["!", "f", "a", "l", "s", "e", "enter"])
+    session = FakeBashSession(output="boom\n", exit_code=2)
+    cli = _cli_with(session)
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await live.run(handler)
+    assert session.commands == ["false"]
+    block = _bash_blocks(live)[0].bash
+    assert block.state == "error"
+    assert block.exit_code == 2
+
+
+async def test_a_failing_bash_spawn_becomes_an_error_block():
+    live, controller = _live(["!", "n", "o", "p", "e", "enter"])
+    session = FakeBashSession(error="no such shell")
+    cli = _cli_with(session)
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await live.run(handler)
+    block = _bash_blocks(live)[0].bash
+    assert block.state == "error"
+    assert "no such shell" in block.error_text
+
+
+async def test_a_bare_bang_line_explains_the_usage():
+    live, controller = _live(["!", "enter"])
+    session = FakeBashSession()
+    cli = _cli_with(session)
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await live.run(handler)
+    assert session.commands == []
+    assert _bash_blocks(live) == []
+    notices = [m.notice.text for m in live.transcript.messages if m.kind == "notice"]
+    assert any("!<shell command>" in text for text in notices)
+
+
+async def test_a_slash_command_line_is_not_left_pending():
+    live, _ = _live([])
+    live.app.start()
+    cli = _cli_with(FakeBashSession())
+    cli.tui = SimpleNamespace(app=live.app)
+    live.app.notify_user_message("/help")
+
+    await cli._dispatch_tui_input(live.app, "/help")
+
+    live.app.stop()
+    users = [m for m in live.transcript.messages if m.kind == "user"]
+    assert len(users) == 1
+    assert users[0].user.pending is False

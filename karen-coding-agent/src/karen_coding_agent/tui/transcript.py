@@ -2,15 +2,32 @@
 
 Consumes the agent event stream (the same events `cli.py`'s `_on_agent_event`
 renders to stdout) and maintains an in-memory transcript the layout renderer
-can paint: user prompts, streaming assistant text, tool executions and
-session notices. No terminal I/O and no asyncio here — the loop in
-`app.py` feeds events in and calls `layout.render`.
+can paint: user prompts, streaming assistant text, tool executions, `!command`
+shell runs and session notices. No terminal I/O and no asyncio here — the loop
+in `app.py` feeds events in and calls `layout.render`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
+
+#: `!command` output is kept as a bounded tail of this many complete lines
+#: (plus the one still being written). The transcript is re-rendered from
+#: scratch every frame, so a command that dumps a hundred thousand lines must
+#: not make painting quadratic; whatever falls off is counted in
+#: `BashExecution.dropped_lines` and shown as a marker.
+_BASH_MAX_LINES = 400
+
+#: Longest a single output line may get before its head is dropped (keeping the
+#: tail — the newest part is what a progress bar or a minified file is showing).
+#: A command with no line breaks at all (`base64 -w0`, a `\r`-redrawn progress
+#: bar whose redraws `sanitize_shell_output` folds into one line) would
+#: otherwise grow a single line without limit, and `textwrap` on a
+#: whitespace-free string of megabytes is quadratic — the renderer would freeze
+#: frame after frame. 1024 also keeps the 400-line worst case cheap to wrap.
+#: A truncated line is prefixed with an ellipsis so it reads as truncated.
+_BASH_MAX_LINE_CHARS = 1024
 
 
 @dataclass
@@ -20,6 +37,52 @@ class ToolExecution:
     args: Any = None
     state: str = "running"  # "running" | "done" | "error"
     error_text: str = ""
+
+
+@dataclass
+class BashExecution:
+    """A `!command` shell run (pi's `BashExecutionMessage`, live view).
+
+    Output arrives as sanitized chunks (`AgentSession.execute_bash`'s
+    `on_chunk`), so the block streams while the command runs instead of
+    appearing all at once. `lines` always holds at least one element, and the
+    last one is the line currently being written (it may be partial).
+    """
+
+    command: str = ""
+    lines: List[str] = field(default_factory=lambda: [""])
+    dropped_lines: int = 0
+    #: "running" | "done" | "error" | "cancelled"
+    state: str = "running"
+    exit_code: Optional[int] = None
+    #: The executor spilled the full output to a file (see `full_output_path`).
+    truncated: bool = False
+    full_output_path: Optional[str] = None
+    error_text: str = ""
+
+    def append(self, delta: str) -> None:
+        parts = delta.split("\n")
+        # Index of the line this delta continues (it takes `parts[0]`), kept so
+        # the length bound below covers every line the delta touched.
+        start = len(self.lines) - 1
+        self.lines[-1] += parts[0]
+        self.lines.extend(parts[1:])
+        # The last element is the line still being written; only the complete
+        # lines above it count against the bound, so `dropped_lines` is exactly
+        # the number of whole lines that scrolled out of the window.
+        over = (len(self.lines) - 1) - _BASH_MAX_LINES
+        if over > 0:
+            del self.lines[:over]
+            self.dropped_lines += over
+            start = max(0, start - over)
+        for index in range(start, len(self.lines)):
+            line = self.lines[index]
+            if len(line) > _BASH_MAX_LINE_CHARS:
+                self.lines[index] = "…" + line[-_BASH_MAX_LINE_CHARS:]
+
+    @property
+    def output(self) -> str:
+        return "\n".join(self.lines)
 
 
 @dataclass
@@ -47,10 +110,11 @@ class Notice:
 
 @dataclass
 class TMessage:
-    kind: str  # "user" | "assistant" | "tool" | "notice"
+    kind: str  # "user" | "assistant" | "tool" | "bash" | "notice"
     user: Optional[UserMessage] = None
     assistant: Optional[AssistantMessage] = None
     tool: Optional[ToolExecution] = None
+    bash: Optional[BashExecution] = None
     notice: Optional[Notice] = None
 
 
@@ -200,6 +264,69 @@ class Transcript:
             message.user.pending = False
         if message is self._pending_user:
             self._pending_user = None
+
+    def resolve_pending(self) -> None:
+        """A submitted line turned out to be a command, not a prompt: it will
+        never become a run, so its line must not keep the "(pending)" marker."""
+        if self._pending_user is not None and self._pending_user.user is not None:
+            self._pending_user.user.pending = False
+            self._pending_user = None
+
+    def drop_pending_user(self, text: str) -> None:
+        """Remove the just-submitted line the runner echoed.
+
+        A `!command` run renders as a bash block, which already carries the
+        command; echoing it as a user line as well would read as if the model
+        had been asked to run it. Only the exact, still-pending line is
+        dropped (identity match — two identical blocks are not the same one).
+        """
+        message = self._pending_user
+        if message is None or message.user is None or message.user.text != text:
+            return
+        for index, candidate in enumerate(self.messages):
+            if candidate is message:
+                del self.messages[index]
+                break
+        self._pending_user = None
+
+    # -- shell bypass (`!command`) ---------------------------------------------
+
+    def on_bash_start(self, command: str) -> TMessage:
+        """The `!command` was submitted: append its block and hand it back, so
+        the caller can stream chunks into this exact message."""
+        message = TMessage(kind="bash", bash=BashExecution(command=command))
+        self.messages.append(message)
+        return message
+
+    def on_bash_chunk(self, message: TMessage, delta: str) -> None:
+        if message.bash is not None and delta:
+            message.bash.append(delta)
+
+    def on_bash_end(
+        self, message: TMessage, result: Any = None, error: Optional[str] = None
+    ) -> None:
+        """The command finished (`result`: a `BashResult`) or failed to run
+        (`error`: the spawn/IO failure `execute_bash` raised)."""
+        bash = message.bash
+        if bash is None:
+            return
+        if error is not None:
+            bash.state = "error"
+            bash.error_text = error
+            return
+        bash.exit_code = getattr(result, "exit_code", None)
+        bash.truncated = bool(getattr(result, "truncated", False))
+        bash.full_output_path = getattr(result, "full_output_path", None)
+        if getattr(result, "cancelled", False):
+            bash.state = "cancelled"
+        elif bash.exit_code not in (0, None):
+            bash.state = "error"
+        else:
+            bash.state = "done"
+        # Defensive: a command whose output never reached `on_chunk` (or whose
+        # chunks were all dropped) still shows the tail the session recorded.
+        if not bash.output and getattr(result, "output", ""):
+            bash.append(result.output)
 
     # -- session events (the dict events `cli.py`'s `_on_session_event` eats) --
 

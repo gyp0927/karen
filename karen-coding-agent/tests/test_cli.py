@@ -81,6 +81,71 @@ def test_format_args_preview():
 
 
 # ---------------------------------------------------------------------------
+# interactive-mode resolution (auto TUI)
+# ---------------------------------------------------------------------------
+
+
+def _resolve(**kwargs):
+    arguments = {"tui_flag": False, "repl_flag": False, "setting": None, "interactive": True}
+    arguments.update(kwargs)
+    return karen_cli.resolve_interactive_mode(**arguments)
+
+
+def test_the_tui_is_the_default_on_a_terminal():
+    assert _resolve() == (True, "")
+
+
+def test_no_terminal_falls_back_to_the_repl_with_a_notice():
+    use_tui, notice = _resolve(interactive=False)
+    assert use_tui is False
+    assert "plain REPL" in notice
+
+
+def test_explicit_flags_outrank_the_setting():
+    assert _resolve(tui_flag=True, setting=False) == (True, "")
+    assert _resolve(repl_flag=True, setting=True) == (False, "")
+
+
+def test_the_setting_outranks_the_default():
+    assert _resolve(setting=False) == (False, "")
+    assert _resolve(setting=True) == (True, "")
+
+
+def test_an_explicit_repl_choice_is_never_explained():
+    # the user asked for the plain REPL (or the setting did): there is nothing
+    # to warn about, even without a terminal
+    assert _resolve(repl_flag=True, interactive=False) == (False, "")
+    assert _resolve(setting=False, interactive=False) == (False, "")
+
+
+def test_an_explicit_tui_without_a_terminal_still_explains_itself():
+    use_tui, notice = _resolve(tui_flag=True, interactive=False)
+    assert use_tui is False
+    assert "plain REPL" in notice
+
+
+def test_tui_and_repl_are_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        karen_cli.main(["--tui", "--repl"])
+    assert exit_info.value.code == 2
+
+
+def _recording_repl_tui(opened):
+    """A `KarenCli.repl_tui` stand-in that records that it was entered.
+
+    `main`'s choice would otherwise be unobservable: both it and `repl_tui`'s
+    own guard print the same sentence and both end up in the plain REPL, so
+    only "was `repl_tui` entered at all" pins the decision down.
+    """
+
+    async def repl_tui(self):
+        opened.append(True)
+        return 0
+
+    return repl_tui
+
+
+# ---------------------------------------------------------------------------
 # piped REPL, offline (faux provider)
 # ---------------------------------------------------------------------------
 
@@ -108,6 +173,110 @@ def test_piped_repl_round_trip(tmp_path, monkeypatch, capsys, faux_models):
     assert "pong" in out
     assert "new session" in out
     assert "[context ~" in out
+
+
+def test_main_opens_the_tui_on_a_terminal(tmp_path, monkeypatch, capsys, faux_models):
+    """The headline behaviour: with a terminal and no flags, `karen` enters the
+    alt-screen TUI (not merely "the helper returns True")."""
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(tmp_path / "no-global.json"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/quit\n"))
+    monkeypatch.setattr(karen_cli, "supports_tty", lambda: True)
+    opened = []
+    monkeypatch.setattr(karen_cli.KarenCli, "repl_tui", _recording_repl_tui(opened))
+
+    exit_code = karen_cli.main(
+        ["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    assert exit_code == 0
+    assert opened == [True]
+    assert "plain REPL" not in capsys.readouterr().err
+
+
+def test_the_tui_is_not_started_without_a_terminal(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(tmp_path / "no-global.json"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/quit\n"))
+    monkeypatch.setattr(karen_cli, "supports_tty", lambda: False)
+    opened = []
+    monkeypatch.setattr(karen_cli.KarenCli, "repl_tui", _recording_repl_tui(opened))
+
+    exit_code = karen_cli.main(
+        ["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "plain REPL" in captured.err  # the auto-TUI explains its fallback
+    assert "type /help for commands" in captured.out  # the plain REPL ran
+    assert opened == []  # main decided, not repl_tui's own guard
+
+
+def test_a_tui_false_setting_keeps_the_repl_without_a_notice(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(tmp_path / "no-global.json"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/quit\n"))
+    # a terminal is available, so only the setting can keep the TUI away
+    monkeypatch.setattr(karen_cli, "supports_tty", lambda: True)
+    opened = []
+    monkeypatch.setattr(karen_cli.KarenCli, "repl_tui", _recording_repl_tui(opened))
+    project = tmp_path / ".karen" / "settings.json"
+    project.parent.mkdir(parents=True, exist_ok=True)
+    project.write_text(json.dumps({"tui": False}), encoding="utf-8")
+
+    exit_code = karen_cli.main(
+        ["--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert opened == []
+    assert "plain REPL" not in captured.err  # nothing to explain: it was asked for
+    assert "type /help for commands" in captured.out  # the plain REPL really ran
+
+
+def test_the_repl_flag_is_silent_about_the_tui(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(tmp_path / "no-global.json"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/quit\n"))
+    monkeypatch.setattr(karen_cli, "supports_tty", lambda: True)
+    opened = []
+    monkeypatch.setattr(karen_cli.KarenCli, "repl_tui", _recording_repl_tui(opened))
+
+    exit_code = karen_cli.main(
+        ["--repl", "--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert opened == []
+    assert "plain REPL" not in captured.err
+    assert "type /help for commands" in captured.out  # the plain REPL ran
+
+
+def test_the_tui_flag_beats_a_tui_false_setting(tmp_path, monkeypatch, capsys, faux_models):
+    monkeypatch.setattr(karen_cli, "build_models", faux_models)
+    monkeypatch.setenv("KAREN_SESSIONS_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setenv("KAREN_SETTINGS_PATH", str(tmp_path / "no-global.json"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("/quit\n"))
+    monkeypatch.setattr(karen_cli, "supports_tty", lambda: True)
+    opened = []
+    monkeypatch.setattr(karen_cli.KarenCli, "repl_tui", _recording_repl_tui(opened))
+    project = tmp_path / ".karen" / "settings.json"
+    project.parent.mkdir(parents=True, exist_ok=True)
+    project.write_text(json.dumps({"tui": False}), encoding="utf-8")
+
+    exit_code = karen_cli.main(
+        ["--tui", "--new", "--cwd", str(tmp_path), "--provider", "faux", "--model", "faux-1"]
+    )
+
+    assert exit_code == 0
+    assert opened == [True]
 
 
 def test_print_mode_prints_final_reply_only(tmp_path, monkeypatch, capsys, faux_models):

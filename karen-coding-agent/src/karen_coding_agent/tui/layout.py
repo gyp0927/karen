@@ -103,6 +103,45 @@ class Layout:
                 lines.extend(self._wrap(line, width, "    ", 4))
         return lines
 
+    def _bash_lines(self, message: TMessage, width: int) -> List[str]:
+        bash = message.bash
+        # A `.get` and not a bare lookup: `render` must never raise, and an
+        # unknown state should degrade to a generic label rather than kill the
+        # frame (and with it the run loop).
+        code, label = {
+            "running": ("36", "[bash ->]"),
+            "done": ("38;5;245", "[bash <-]"),
+            "error": ("31", "[bash <-]"),
+            "cancelled": ("33", "[bash <-]"),
+        }.get(bash.state, ("38;5;245", "[bash <-]"))
+        # The command is wrapped as the body of the colored label, so a long
+        # one folds instead of running past the terminal width.
+        prefix_plain = f"{label} "
+        lines = self._wrap(bash.command, width, self.style.fg(code, prefix_plain), len(prefix_plain))
+        if bash.dropped_lines:
+            lines.extend(
+                self._wrap(f"… {bash.dropped_lines} earlier line(s) dropped", width, "    ", 4)
+            )
+        # `splitlines` (not `split("\n")`): the trailing element of a
+        # newline-terminated buffer is the open line slot, not a line the
+        # command printed, and rendering it would add a phantom blank row.
+        if bash.output:
+            for row in bash.output.splitlines():
+                lines.extend(self._wrap(row, width, "    ", 4))
+        if bash.error_text:
+            for row in bash.error_text.splitlines()[:10]:
+                lines.extend(self._wrap(row, width, "    ", 4))
+        elif bash.exit_code not in (0, None):
+            lines.extend(self._wrap(f"exit {bash.exit_code}", width, "    ", 4))
+        if bash.state == "cancelled":
+            lines.extend(self._wrap("cancelled", width, "    ", 4))
+        if bash.truncated:
+            note = "output truncated"
+            if bash.full_output_path:
+                note += f" (full output: {bash.full_output_path})"
+            lines.extend(self._wrap(note, width, "    ", 4))
+        return lines
+
     def _message_lines(self, message: TMessage, width: int) -> List[str]:
         s = self.style
         if message.kind == "user":
@@ -128,6 +167,8 @@ class Layout:
             return lines
         if message.kind == "tool":
             return self._tool_lines(message, width)
+        if message.kind == "bash":
+            return self._bash_lines(message, width)
         notice = message.notice
         prefix = s.fg("31", "! ") if notice.error else s.fg("38;5;245", "· ")
         return self._wrap(notice.text, width, prefix, 2)

@@ -4,11 +4,16 @@ tables — the pure parts, no TTY is opened)."""
 
 from __future__ import annotations
 
+import io
+import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from karen_coding_agent.tui import Layout, TuiApp, Transcript
 from karen_coding_agent.tui.terminal import TerminalController, _decode_csi
+from karen_coding_agent.tui.transcript import _BASH_MAX_LINES, _BASH_MAX_LINE_CHARS
 
 
 # -- event shims (the same shapes the agent/session layers emit) -------------
@@ -230,6 +235,160 @@ def test_failed_compaction_is_flagged_as_error():
 
 
 # ---------------------------------------------------------------------------
+# shell bypass (`!command`)
+# ---------------------------------------------------------------------------
+
+
+def _bash_result(output="", exit_code=0, cancelled=False, truncated=False, full_output_path=None):
+    return SimpleNamespace(
+        output=output,
+        exit_code=exit_code,
+        cancelled=cancelled,
+        truncated=truncated,
+        full_output_path=full_output_path,
+    )
+
+
+def test_bash_chunks_stream_into_one_block():
+    t = Transcript()
+    msg = t.on_bash_start("echo hi")
+    t.on_bash_chunk(msg, "hi")
+    assert t.messages[-1].kind == "bash"
+    assert t.messages[-1].bash.state == "running"
+    t.on_bash_chunk(msg, "\n")
+    t.on_bash_end(msg, _bash_result(output="hi\n"))
+    bash = msg.bash
+    assert bash.output == "hi\n"
+    assert bash.state == "done"
+    assert bash.exit_code == 0
+
+
+def test_bash_partial_lines_survive_a_chunk_boundary():
+    t = Transcript()
+    msg = t.on_bash_start("printf")
+    t.on_bash_chunk(msg, "par")
+    t.on_bash_chunk(msg, "tial\nsecond")
+    assert msg.bash.output == "partial\nsecond"
+
+
+def test_bash_output_without_a_trailing_newline_is_kept_as_is():
+    t = Transcript()
+    msg = t.on_bash_start("printf")
+    t.on_bash_chunk(msg, "no newline")
+    assert msg.bash.output == "no newline"
+
+
+def test_bash_nonzero_exit_is_an_error_state():
+    t = Transcript()
+    msg = t.on_bash_start("false")
+    t.on_bash_end(msg, _bash_result(exit_code=1))
+    assert msg.bash.state == "error"
+    assert msg.bash.exit_code == 1
+
+
+def test_bash_cancelled_run_is_its_own_state():
+    t = Transcript()
+    msg = t.on_bash_start("sleep 100")
+    t.on_bash_end(msg, _bash_result(exit_code=None, cancelled=True))
+    assert msg.bash.state == "cancelled"
+
+
+def test_bash_spawn_failure_is_recorded_as_an_error():
+    t = Transcript()
+    msg = t.on_bash_start("nope")
+    t.on_bash_end(msg, error="[Errno 2] no such file")
+    assert msg.bash.state == "error"
+    assert "no such file" in msg.bash.error_text
+
+
+def test_bash_truncation_reports_the_spill_file():
+    t = Transcript()
+    msg = t.on_bash_start("yes")
+    t.on_bash_end(msg, _bash_result(output="x\n", truncated=True, full_output_path="C:/tmp/full.txt"))
+    assert msg.bash.truncated is True
+    assert msg.bash.full_output_path == "C:/tmp/full.txt"
+
+
+def test_bash_output_is_bounded_to_a_tail():
+    t = Transcript()
+    msg = t.on_bash_start("yes")
+    for index in range(1000):
+        t.on_bash_chunk(msg, f"line {index}\n")
+    bash = msg.bash
+    assert len(bash.lines) == _BASH_MAX_LINES + 1  # the 400 kept + the open one
+    assert bash.dropped_lines == 1000 - _BASH_MAX_LINES
+    # the window holds a contiguous tail up to the last written line
+    assert bash.output.endswith("line 999\n")
+    assert f"line {1000 - _BASH_MAX_LINES}\n" in bash.output
+    assert f"line {999 - _BASH_MAX_LINES}\n" not in bash.output
+
+
+def test_a_single_unbroken_line_keeps_only_its_tail():
+    t = Transcript()
+    msg = t.on_bash_start("base64 -w0 big.bin")
+    t.on_bash_chunk(msg, "START" + "a" * 100_000)
+    t.on_bash_chunk(msg, "END")
+    line = msg.bash.lines[-1]
+    assert len(line) == _BASH_MAX_LINE_CHARS + 1  # the tail plus the "…" marker
+    assert line.startswith("…")
+    assert line.endswith("END")
+    assert "START" not in line
+
+
+def test_a_long_complete_line_is_capped_too():
+    t = Transcript()
+    msg = t.on_bash_start("cat bundle.js")
+    t.on_bash_chunk(msg, ("z" * 5000) + "\ntail\n")
+    assert len(msg.bash.lines[0]) == _BASH_MAX_LINE_CHARS + 1
+    assert msg.bash.lines[0].startswith("…")
+    assert msg.bash.lines[1] == "tail"
+
+
+def test_a_capped_line_does_not_accumulate_markers():
+    t = Transcript()
+    msg = t.on_bash_start("yes")
+    for _ in range(20):
+        t.on_bash_chunk(msg, "q" * 20_000)
+    assert len(msg.bash.lines[-1]) == _BASH_MAX_LINE_CHARS + 1
+    assert msg.bash.lines[-1].count("…") == 1
+
+
+def test_a_bash_block_does_not_disturb_the_assistant_run():
+    t = Transcript()
+    t.on_user_message("hi")
+    t.on_text_delta("partial")
+    t.on_bash_start("ls")
+    t.on_text_delta("more")
+    assistants = [m for m in t.messages if m.kind == "assistant"]
+    assert len(assistants) == 1
+    assert assistants[0].assistant.text == "partialmore"
+
+
+def test_a_slash_command_line_is_not_left_pending():
+    t = Transcript()
+    msg = t.on_user_message("/tree")
+    t.resolve_pending()
+    assert msg.user.pending is False
+
+
+def test_drop_pending_user_removes_the_echoed_bash_line():
+    t = Transcript()
+    t.on_user_message("!ls")
+    t.drop_pending_user("!ls")
+    assert t.messages == []
+    # a later prompt still becomes pending normally
+    t.on_user_message("hi")
+    assert t.messages[-1].user.pending is True
+
+
+def test_drop_pending_user_ignores_a_different_line():
+    t = Transcript()
+    t.on_user_message("!ls")
+    t.drop_pending_user("/tree")
+    assert len(t.messages) == 1
+
+
+# ---------------------------------------------------------------------------
 # layout renderer
 # ---------------------------------------------------------------------------
 
@@ -375,6 +534,108 @@ def test_no_color_emits_no_sgr_when_disabled():
     out = _lines(t, layout)
     joined = "\n".join(out)
     assert "\x1b[" not in joined
+
+
+def test_a_bash_block_renders_command_output_and_exit_code():
+    t = Transcript()
+    msg = t.on_bash_start("false")
+    t.on_bash_chunk(msg, "boom\n")
+    t.on_bash_end(msg, _bash_result(output="boom\n", exit_code=1))
+    layout = Layout(50, 10, color=False)
+    joined = "\n".join(_lines(t, layout))
+    assert "[bash <-] false" in joined
+    assert "boom" in joined
+    assert "exit 1" in joined
+
+
+def test_a_running_bash_block_uses_the_running_label():
+    t = Transcript()
+    t.on_bash_start("sleep 5")
+    layout = Layout(40, 8, color=False)
+    joined = "\n".join(_lines(t, layout))
+    assert "[bash ->] sleep 5" in joined
+    assert "exit" not in joined
+
+
+def test_a_silent_bash_block_renders_no_output_rows():
+    t = Transcript()
+    msg = t.on_bash_start("true")
+    t.on_bash_end(msg, _bash_result(exit_code=0))
+    layout = Layout(50, 8, color=False)
+    assert layout.transcript_lines(t) == ["[bash <-] true"]
+
+
+def test_a_trailing_newline_does_not_add_a_phantom_blank_row():
+    t = Transcript()
+    msg = t.on_bash_start("ls")
+    t.on_bash_chunk(msg, "a.txt\nb.txt\n")
+    t.on_bash_end(msg, _bash_result(output="a.txt\nb.txt\n"))
+    layout = Layout(50, 8, color=False)
+    assert layout.transcript_lines(t) == [
+        "[bash <-] ls",
+        "    a.txt",
+        "    b.txt",
+    ]
+
+
+def test_a_successful_bash_block_prints_no_exit_code():
+    t = Transcript()
+    msg = t.on_bash_start("true")
+    t.on_bash_end(msg, _bash_result(exit_code=0))
+    layout = Layout(50, 8, color=False)
+    joined = "\n".join(_lines(t, layout))
+    assert "exit 0" not in joined
+
+
+def test_a_long_bash_command_wraps_instead_of_overflowing():
+    t = Transcript()
+    t.on_bash_start("x" * 200)
+    layout = Layout(30, 14, color=False)
+    for row in _lines(t, layout):
+        assert len(row) <= 30, row
+
+
+def test_long_bash_output_rows_never_exceed_the_width():
+    t = Transcript()
+    msg = t.on_bash_start("cat log")
+    t.on_bash_chunk(msg, ("y" * 300) + "\n")
+    layout = Layout(40, 12, color=False)
+    for row in _lines(t, layout):
+        assert len(row) <= 40, row
+
+
+def test_a_cancelled_bash_block_says_so():
+    t = Transcript()
+    msg = t.on_bash_start("sleep 100")
+    t.on_bash_end(msg, _bash_result(exit_code=None, cancelled=True))
+    layout = Layout(50, 8, color=False)
+    joined = "\n".join(_lines(t, layout))
+    assert "cancelled" in joined
+
+
+def test_dropped_bash_lines_are_announced():
+    t = Transcript()
+    msg = t.on_bash_start("yes")
+    for index in range(_BASH_MAX_LINES + 5):
+        t.on_bash_chunk(msg, f"line {index}\n")
+    layout = Layout(50, 10, color=False)
+    # the block is taller than the viewport by construction, so assert on the
+    # rendered transcript rather than on the scrolled window
+    rows = layout.transcript_lines(t)
+    assert any("5 earlier line(s) dropped" in row for row in rows)
+    # the header and the tail of the output are both rendered
+    assert rows[0].startswith("[bash ->] yes")
+    assert any("line 404" in row for row in rows)
+
+
+def test_a_truncated_bash_block_points_at_the_full_output():
+    t = Transcript()
+    msg = t.on_bash_start("yes")
+    t.on_bash_end(msg, _bash_result(truncated=True, full_output_path="C:/tmp/full.txt"))
+    layout = Layout(60, 8, color=False)
+    joined = "\n".join(_lines(t, layout))
+    assert "output truncated" in joined
+    assert "C:/tmp/full.txt" in joined
 
 
 # ---------------------------------------------------------------------------
@@ -549,3 +810,57 @@ def test_csi_unknown_and_empty():
     assert _decode_csi("") == "escape"
     assert _decode_csi("M") == "mouse"
     assert _decode_csi("ZZZ") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# the TTY gate (what decides TUI vs plain REPL)
+# ---------------------------------------------------------------------------
+
+
+class _Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class _Pipe(io.StringIO):
+    def isatty(self):
+        return False
+
+
+def test_supports_tty_is_false_when_a_stream_is_a_pipe(monkeypatch):
+    import karen_coding_agent.tui.terminal as terminal
+
+    monkeypatch.setattr(sys, "stdin", _Tty())
+    monkeypatch.setattr(sys, "stdout", _Pipe())
+    assert terminal.supports_tty() is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console semantics")
+def test_supports_tty_rejects_a_non_console_on_windows(monkeypatch):
+    """On Windows `isatty()` is not enough — NUL is a character device — so the
+    gate must consult the console check as well."""
+    import karen_coding_agent.tui.terminal as terminal
+
+    monkeypatch.setattr(sys, "stdin", _Tty())
+    monkeypatch.setattr(sys, "stdout", _Tty())
+    monkeypatch.setattr(terminal, "_has_windows_console", lambda handle: False)
+    assert terminal.supports_tty() is False
+    monkeypatch.setattr(terminal, "_has_windows_console", lambda handle: True)
+    assert terminal.supports_tty() is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows device semantics")
+def test_the_nul_device_is_not_a_console():
+    """The quirk the gate exists for: `karen < NUL > NUL` reports isatty() on
+    both ends (so a console-less launch would enter the alt screen and park in
+    `msvcrt.getwch()`, which has no EOF path) while GetConsoleMode says no."""
+    import msvcrt
+
+    from karen_coding_agent.tui.terminal import _is_console_handle
+
+    descriptor = os.open("NUL", os.O_RDWR)
+    try:
+        assert os.isatty(descriptor) is True
+        assert _is_console_handle(msvcrt.get_osfhandle(descriptor)) is False
+    finally:
+        os.close(descriptor)
