@@ -170,6 +170,43 @@ async def test_abort_bash(tmp_path):
     assert result.exit_code is None
 
 
+async def test_cancelling_execute_bash_kills_the_running_command(tmp_path):
+    """The other half of `abort_bash`: Ctrl+C in the TUI cancels the run's task
+    (`LiveTui.run`'s teardown), and `_run_tui_bash` only re-raises. The child
+    has to die in the layer below, or a `!command` keeps writing files behind a
+    dead app — the cooperative abort above is too late by then, because the
+    cancellation has already unwound through the controller registry.
+    """
+    import asyncio
+
+    models, registration = _models_with_faux([])
+    session = await _open(tmp_path, models, registration)
+    started = tmp_path / "started.txt"
+    marker = tmp_path / "alive.txt"
+    command = (
+        f'echo started > "{started.as_posix()}"; '
+        f'sleep 1; '
+        f'echo alive > "{marker.as_posix()}"'
+    )
+
+    task = asyncio.create_task(session.execute_bash(command))
+    # The child's own `started` file is the clock: cancelling before the shell
+    # runs anything would pass this test without testing anything.
+    for _ in range(1500):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert started.exists(), "the shell never ran the command"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.sleep(1.5)
+    assert not marker.exists(), "the !command outlived the run that started it"
+    await session.close()
+
+
 async def test_execute_bash_records_the_result_in_the_transcript(tmp_path):
     """pi's `recordBashResult`: the model sees the command and its output next turn."""
     models, registration = _models_with_faux([])

@@ -371,6 +371,62 @@ def test_a_slash_command_line_is_not_left_pending():
     assert msg.user.pending is False
 
 
+def _streaming_run(t: Transcript, text: str = "part one") -> None:
+    """A run that has started and is still producing text."""
+    t.on_user_message("hi")
+    t.on_agent_start()
+    t.on_text_delta(text)
+
+
+def test_a_slash_command_does_not_split_the_run_it_interrupts():
+    """A command line submitted mid-answer is not a run of its own, so it must
+    not cost the answer its block: a second block would split the text in two
+    and leave the first with a cursor that no `agent_end` will ever clear."""
+    t = Transcript()
+    _streaming_run(t)
+    t.on_user_message("/help")
+    t.resolve_pending()
+    t.on_text_delta(" part two")
+    assistants = [m for m in t.messages if m.kind == "assistant"]
+    assert len(assistants) == 1
+    assert assistants[0].assistant.text == "part one part two"
+    t.finish_assistant()
+    assert [m.assistant.streaming for m in assistants] == [False]
+
+
+def test_a_bang_line_does_not_split_the_run_it_interrupts():
+    t = Transcript()
+    _streaming_run(t)
+    t.on_user_message("!ls")
+    t.drop_pending_user("!ls")
+    t.on_bash_start("ls")
+    t.on_text_delta(" part two")
+    assistants = [m for m in t.messages if m.kind == "assistant"]
+    assert len(assistants) == 1
+    assert assistants[0].assistant.text == "part one part two"
+    t.finish_assistant()
+    assert [m.assistant.streaming for m in assistants] == [False]
+
+
+def test_a_prompt_really_does_start_a_new_assistant_block():
+    """The other side of the same coin: a second *prompt* still opens a block
+    of its own, and a command line after it must not hand the previous run's
+    block back over it."""
+    t = Transcript()
+    _streaming_run(t)
+    t.finish_assistant()
+    t.on_user_message("!ls")
+    t.drop_pending_user("!ls")
+    t.on_user_message("second prompt")
+    t.on_agent_start()
+    t.on_text_delta("second answer")
+    t.on_user_message("/help")
+    t.resolve_pending()
+    t.on_text_delta(" continues")
+    assistants = [m for m in t.messages if m.kind == "assistant"]
+    assert [m.assistant.text for m in assistants] == ["part one", "second answer continues"]
+
+
 def test_drop_pending_user_removes_the_echoed_bash_line():
     t = Transcript()
     t.on_user_message("!ls")

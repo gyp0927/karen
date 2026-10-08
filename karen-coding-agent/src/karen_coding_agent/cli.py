@@ -964,9 +964,13 @@ class KarenCli:
         try:
             result = await self.session.execute_bash(command, on_chunk=_on_chunk)
         except asyncio.CancelledError:
-            # The TUI is going away (ctrl+c): kill the child instead of
-            # leaving it running behind a dead app.
-            self.session.abort_bash()
+            # The TUI is going away (ctrl+c). Killing the child is not this
+            # frame's job: the cancel has already unwound through
+            # `execute_bash`, which drops its controller, so the kill happens in
+            # `run_shell_command`'s own `finally` (nothing else may outlive the
+            # app). The loose end left here is the block an answer was
+            # streaming into — no `agent_end` is coming to close it.
+            transcript.finish_assistant()
             raise
         except Exception as error:
             transcript.on_bash_end(entry, error=str(error))

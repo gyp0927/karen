@@ -135,6 +135,9 @@ class Transcript:
         self.messages: List[TMessage] = []
         self._run_assistant: Optional[TMessage] = None
         self._pending_user: Optional[TMessage] = None
+        #: The block an echoed line displaced, parked until that line turns out
+        #: to be a run of its own (or not: see `_restore_parked_assistant`).
+        self._parked_run_assistant: Optional[TMessage] = None
 
     # -- agent events (karen_agent.agent.AgentEvent) --------------------------
 
@@ -143,12 +146,22 @@ class Transcript:
         if self._pending_user is not None and self._pending_user.user is not None:
             self._pending_user.user.pending = False
             self._pending_user = None
+        # The echoed line became a run: it owns the slot now, so the block its
+        # echo displaced must not be handed back over it.
+        self._parked_run_assistant = None
 
     def on_user_message(self, text: str) -> TMessage:
+        """The runner echoes the submitted line before dispatching it.
+
+        The echo is not proof that a run starts — `!command` and slash commands
+        never become one — so the in-flight run's block is parked rather than
+        dropped, and comes back if the line turns out to be a command.
+        """
         message = TMessage(kind="user", user=UserMessage(text=text))
         self.messages.append(message)
         self._pending_user = message
         # A new prompt starts a new assistant block.
+        self._parked_run_assistant = self._run_assistant
         self._run_assistant = None
         return message
 
@@ -264,13 +277,29 @@ class Transcript:
             message.user.pending = False
         if message is self._pending_user:
             self._pending_user = None
+            self._parked_run_assistant = None
 
     def resolve_pending(self) -> None:
         """A submitted line turned out to be a command, not a prompt: it will
-        never become a run, so its line must not keep the "(pending)" marker."""
+        never become a run, so its line must not keep the "(pending)" marker —
+        and the run it interrupted gets its assistant block back."""
         if self._pending_user is not None and self._pending_user.user is not None:
             self._pending_user.user.pending = False
             self._pending_user = None
+            self._restore_parked_assistant()
+
+    def _restore_parked_assistant(self) -> None:
+        """Give the assistant block back to the run a command line interrupted.
+
+        The line never became a run, so the deltas still arriving must continue
+        the block they were already streaming into. Opening a second one would
+        split the answer in two and leave the first with a streaming cursor
+        that no `agent_end` will ever clear (it only ever looks at
+        `_run_assistant`).
+        """
+        if self._parked_run_assistant is not None:
+            self._run_assistant = self._parked_run_assistant
+            self._parked_run_assistant = None
 
     def drop_pending_user(self, text: str) -> None:
         """Remove the just-submitted line the runner echoed.
@@ -288,6 +317,7 @@ class Transcript:
                 del self.messages[index]
                 break
         self._pending_user = None
+        self._restore_parked_assistant()
 
     # -- shell bypass (`!command`) ---------------------------------------------
 
@@ -377,3 +407,4 @@ class Transcript:
         self.messages = []
         self._run_assistant = None
         self._pending_user = None
+        self._parked_run_assistant = None

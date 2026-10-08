@@ -316,6 +316,13 @@ async def run_shell_command(
             timeout_handle.cancel()
         if abort_task is not None:
             abort_task.cancel()
+        # A cancelled caller — Ctrl+C in the TUI, a `wait_for` deadline, a
+        # torn-down run — unwinds through here without the abort watcher ever
+        # firing (cancelling it is the line above): the shell and its children
+        # would outlive the app that asked for them. Kill the tree explicitly;
+        # the helper returns at once for a process that already exited, which
+        # is every other way out of the `try`.
+        _kill_process_tree(proc)
         if spill_file is not None and not spill_file.closed:
             spill_file.close()
 

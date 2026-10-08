@@ -333,3 +333,47 @@ async def test_a_slash_command_line_is_not_left_pending():
     users = [m for m in live.transcript.messages if m.kind == "user"]
     assert len(users) == 1
     assert users[0].user.pending is False
+
+
+class HangingBashSession:
+    """A `!command` that never finishes on its own: only the teardown ends it."""
+
+    def __init__(self):
+        self.commands = []
+        self.cancelled = False
+
+    async def execute_bash(self, command, on_chunk=None, **kwargs):
+        self.commands.append(command)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("the hanging command was never cancelled")
+
+    def abort_bash(self):
+        pass
+
+
+async def test_ctrl_c_during_a_bang_line_leaves_no_streaming_cursor():
+    """Ctrl+C tears the run down, so the block an answer was streaming into
+    never gets its `agent_end`: nothing else would ever clear its cursor."""
+    live, _ = _live(["!", "s", "l", "e", "e", "p", "enter", "ctrl_c"])
+    session = HangingBashSession()
+    cli = _cli_with(session)
+    live.transcript.on_user_message("question")
+    live.transcript.on_text_delta("partial answer")
+
+    async def handler(app, text):
+        await cli._dispatch_tui_input(app, text)
+
+    await asyncio.wait_for(live.run(handler), 10)
+    for _ in range(50):  # let the cancelled run unwind
+        if session.cancelled:
+            break
+        await asyncio.sleep(0.01)
+
+    assert session.commands == ["sleep"]
+    assert session.cancelled is True
+    assistants = [m for m in live.transcript.messages if m.kind == "assistant"]
+    assert [m.assistant.streaming for m in assistants] == [False]
