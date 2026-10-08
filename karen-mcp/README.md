@@ -9,9 +9,8 @@ for the typed protocol objects), and it does not wrap the official MCP SDK. The
 package provides a transport-neutral client core, stdio and Streamable HTTP
 transports, and an in-memory testing transport.
 
-> Status: the client core, the stdio transport, and the in-memory transport are
-> in place. The Streamable HTTP transport and OAuth are the next two slices, so
-> `StreamableHttpTransport` and `karen_mcp.oauth` do not exist yet.
+> Status: the client core, the stdio, in-memory, and Streamable HTTP
+> transports, and the `karen_mcp.oauth` OAuth client subset are all in place.
 
 ## Usage
 
@@ -38,7 +37,9 @@ result = await client.call_tool("search", {"query": "MCP"})
 await client.close()
 ```
 
-For a remote server, use `StreamableHttpTransport(url=..., headers=...)`.
+For a remote server, use `StreamableHttpTransport(StreamableHttpTransportOptions(url=..., headers=...))`.
+The default HTTP client is the package's own (`http_fetch`, stdlib only); pass
+`fetch=` to hand the transport an application's HTTP stack instead.
 
 ### Tools for an LLM
 
@@ -76,6 +77,52 @@ authorization, and a loopback callback server) without depending on the
 official SDK. The package does not open a browser or choose where credentials
 are stored — applications inject `McpOAuthStateStore`.
 
+```python
+from karen_mcp import McpClient, McpClientOptions, StreamableHttpTransport, StreamableHttpTransportOptions
+from karen_mcp.oauth import (
+    McpOAuthAuthorizationRequiredError,
+    McpOAuthProvider,
+    McpOAuthProviderOptions,
+    OAuthCallbackServer,
+    OAuthFlowOptions,
+    adapt_oauth_provider,
+    authorize_mcp,
+)
+
+server_url = "https://mcp.example.com/mcp"
+callback = await OAuthCallbackServer.listen()
+oauth = McpOAuthProvider(
+    McpOAuthProviderOptions(
+        server_url=server_url,
+        redirect_url=callback.redirect_url,
+        client_metadata={"client_name": "My MCP client"},
+        on_redirect=open_in_browser,  # the application decides how
+    )
+)
+
+def connect():
+    client = McpClient(McpClientOptions(name="my-client", version="1.0.0"))
+    transport = StreamableHttpTransport(
+        StreamableHttpTransportOptions(url=server_url, auth_provider=adapt_oauth_provider(oauth))
+    )
+    return client, client.connect(transport)
+
+client, connected = connect()
+try:
+    await connected
+except McpOAuthAuthorizationRequiredError:
+    pending = callback.wait_for_callback(await oauth.state())
+    # `on_redirect` has shown the user the authorization page by now.
+    result = await pending
+    await authorize_mcp(oauth, OAuthFlowOptions(server_url=server_url, authorization_code=result.code))
+
+client, connected = connect()
+await connected
+```
+
+The OAuth implementation is adapted from the MIT-licensed Model Context
+Protocol TypeScript SDK v1.29.0, by way of pi.
+
 ## Supported protocol surface
 
 - MCP protocol version `2025-11-25`, accepting servers that negotiate
@@ -104,3 +151,36 @@ outside the core, exactly as in pi.
 
 `karen_mcp.testing` exports `create_in_memory_transport_pair()` for client and
 adapter tests — no subprocess, no socket.
+
+## Port notes
+
+Deliberate differences from pi, each also documented where it applies:
+
+- The built-in HTTP client makes one request per connection and knows no
+  proxies, redirects, cookies, or HTTP/2; hand the transport an application's
+  HTTP stack with `fetch=` for those.
+- Framing errors from that client (a malformed status line, chunk size, or
+  chunk terminator) raise `ValueError` and are not retried: they describe a
+  server that is not speaking HTTP. pi retries them, because the platform
+  `fetch` reports them as `TypeError`.
+- When the server cancels a request it sent us, the client aborts the
+  handler's signal and cancels its task, so the cancelled request gets no
+  response — the spec says it should not. pi aborts the signal but still
+  sends whatever the handler returns.
+- URLs are strings handled with `urllib.parse`, without full WHATWG
+  normalization (dot segments, IDN punycode, empty queries stay as spelled).
+  The places that compare URLs normalize both sides: the origin comparison in
+  discovery and the server-URL identity in the provider.
+- Helper results are parsed into the pydantic protocol models, so a known
+  member with the wrong type is rejected where pi's plain casts would pass it
+  through. Unknown members pass through (`extra="allow"`).
+- Envelopes the package builds and reads itself (the `WWW-Authenticate`
+  challenge, the persisted discovery state, `McpOAuthState`) use snake_case
+  keys; only the server documents keep the wire shape.
+- `client_information` that comes back as an empty object is treated as
+  absent (Python's falsy, where JavaScript's truthiness would pass it
+  through), so the flow registers or exchanges a code instead of sending
+  `client_id` with no value.
+- OAuth URL handling is `urllib.parse` throughout: a malformed
+  `token_endpoint` that the WHATWG URL constructor would repair
+  (`"https:host/path"`) is passed to the fetch as-is and rejected there.
