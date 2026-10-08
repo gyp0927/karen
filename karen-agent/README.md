@@ -230,6 +230,13 @@ await env.cleanup()  # kills any processes still running from exec
   `cwd`, bounded capture (`ShellOutputLimits`) and active-process tracking for
   `cleanup()`. Path handling ports pi's `resolvePath` (`~` expansion, `file://`
   URLs, cwd-relative).
+- **A cancelled caller kills the command**: `run_shell_command`'s `finally`
+  kills the process tree, so Ctrl+C, a `wait_for` deadline or a torn-down run
+  cannot leave a shell — or a child of it — running behind the process that
+  asked for it. (pi is TypeScript, where a cancelled caller does not exist, so
+  this has no upstream counterpart.) The kill is synchronous and best-effort,
+  and is a no-op on every path that already killed the process or watched it
+  exit; `test_local_shell.py` pins it with a real shell.
 - `utils/shell_output.py`'s `execute_shell_with_capture` is the compatibility
   collector from pi's `shell-output.ts`: runs `exec` with pi's default
   tail-retained 50KB/2000-line capture + spill and folds aborts

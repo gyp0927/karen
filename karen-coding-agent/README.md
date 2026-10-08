@@ -618,10 +618,18 @@ without a TTY:
   bar has no line breaks at all, and `textwrap` on a whitespace-free megabyte is
   quadratic), and a 50 ms repaint throttle. Whatever falls off is reported: a
   dropped-lines marker, or a leading `…` on a truncated line.
-- **A submitted line that is a command never stays `(pending)`**: slash-command
-  lines are resolved on the spot (they never become a run, so no `agent_start`
-  will clear them), and a `!command` line is not echoed as a user message at
-  all — the bash block already carries the command.
+- **A submitted line that is a command never stays `(pending)` — and never
+  costs the answer it interrupts its block**: slash-command lines are resolved
+  on the spot (they never become a run, so no `agent_start` will clear them),
+  and a `!command` line is not echoed as a user message at all — the bash block
+  already carries the command. The in-flight run's assistant block is parked
+  while that line is in doubt and handed back when it turns out not to be a
+  run, so the answer keeps streaming into one block instead of splitting in two
+  with the first half holding a cursor nothing would clear.
+- **Ctrl+C takes the running command with it**: a `!command` still in flight
+  when the TUI quits is killed at the process-tree level by
+  `run_shell_command`'s own unwind, so no shell (and no child of it) keeps
+  writing files behind a dead app.
 - **Layout accounting** is exact: the dock is rendered and measured first, the
   transcript fills the remaining rows, and `render` always returns exactly
   `height` lines (a tall dock on a tiny terminal keeps the footer by trimming
@@ -633,11 +641,14 @@ without a TTY:
   pi's incremental (damage-region) painting — karen repaints whole frames,
   which is what makes the renderer testable without a TTY.
 
-Verified with 94 offline tests (`tests/test_tui.py`, `tests/test_tui_app.py`:
+Verified with 98 offline tests (`tests/test_tui.py`, `tests/test_tui_app.py`:
 transcript lifecycle, the three bash-output bounds, layout row accounting, the
 editor's key handling, CSI decoding, the TTY gate, and an end-to-end async
 driver over a fake terminal including the `!command` path) plus the full suite;
-a `--tui` run was also driven against a real terminal.
+a `--tui` run was also driven against a real terminal. The cancel path is
+covered with a real shell — the child writes a marker file a second in, and
+cancelling the caller must leave it unwritten (karen-agent's
+`tests/test_local_shell.py`, and the same chain through `execute_bash`).
 
 ## Roadmap
 
