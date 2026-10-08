@@ -3,8 +3,8 @@
 The `karen` CLI coding assistant — the application layer on top of
 [karen-agent](../karen-agent), and the karen equivalent of
 [`@earendil-works/pi`](https://github.com/earendil-works/pi)'s
-`packages/coding-agent` (much smaller scope: no TUI or extensions yet —
-MCP tool integration and TUI are tracked in the roadmap below).
+`packages/coding-agent` (smaller scope: no extensions; the TUI is hand-rolled
+in pure stdlib rather than ported from pi's React/Ink framework).
 
 ## M1: AgentSession + CLI
 
@@ -62,6 +62,7 @@ post-run messages are checked.
 
 ```bash
 karen [--cwd PATH] [--model ID] [--new]     # interactive REPL
+karen --tui                                 # interactive alt-screen TUI
 karen -p "summarize this repo"              # headless text mode: final reply on stdout
 karen "one" "two"                           # headless: prompts run sequentially
 karen --mode json "prompt"                  # headless JSON event stream
@@ -519,11 +520,91 @@ Verified with 57 new offline tests (`tests/test_m9.py`, including a node-driven
 render of the HTML report against a DOM stub) plus the full suite (260 passed)
 and karen-agent/karen-ai suites (332 / 443+1). New runtime dependency: Pillow.
 
+## TUI: alt-screen interactive mode
+
+`karen --tui` runs the interactive session inside a hand-rolled alternate-screen
+viewport, pi's `modes/interactive/` minus the React/Ink framework pi builds on
+(its `@earendil-works/pi-tui` is ~1.3MB and not portable, so this is pure
+stdlib). The layout mirrors pi's chat viewport (`chat-viewport.ts`): a
+scrollable transcript on top, a fixed input dock below.
+
+```
+❯ what is in this repo?
+
+Looking around:▌
+
+[tool <-] ls
+    path='.'
+
+It looks like a Python monorepo with packages karen-ai, karen-agent,
+karen-coding-agent and karen-mcp.
+
+model: deepseek/deepseek-v4-pro | cwd: E:\karen | tools: read bash edit write grep find ls
+> ▌
+enter : send   ctrl+j : newline   up/down : scroll   ctrl+c : quit
+```
+
+The package (`src/karen_coding_agent/tui/`) is split so the logic is testable
+without a TTY:
+
+| module | role |
+| --- | --- |
+| `transcript.py` | pure model: agent/session events → user / assistant / tool / notice messages |
+| `layout.py` | pure renderer: messages + terminal size → exactly `height` ANSI lines |
+| `terminal.py` | the only TTY-touching module: alt screen (`CSI ?1049h/l`), raw mode, key decoding |
+| `app.py` | `TuiApp` (state + editor) and `LiveTui` (the async driver) |
+
+- **Alt screen**: `--tui` enters `CSI ?1049h`, hides the cursor, and restores
+  both on exit, so the shell's scrollback is untouched. Raw mode is enabled on
+  entry and restored on exit — POSIX via `termios` cbreak, Windows via
+  `SetConsoleMode` (raw console input plus `ENABLE_VIRTUAL_TERMINAL_PROCESSING`
+  so the VT escapes are interpreted rather than printed).
+- **Responsive while streaming**: the key loop runs in an executor thread
+  (`asyncio.to_thread`) and each prompt runs as a task, so the viewport keeps
+  repainting, scrolling and accepting keys while the model streams. A prompt
+  submitted while a run is in flight is queued and sent as soon as that run
+  finishes (the status/dock shows it), rather than racing a second run against
+  the same session.
+- **Editor**: multi-line, with `ctrl+j` inserting a newline and `enter`
+  submitting a single-line buffer (or inserting a newline once it is
+  multi-line); `ctrl+enter` always submits. Cursor movement (`left`/`right`/
+  `ctrl+a`/`ctrl+e`), `backspace` (joining lines at a line start), `ctrl+k`
+  (kill to end of line), `ctrl+u` (clear to line start), `tab`, and
+  `up`/`down` scrolling of the transcript.
+- **Event-driven**, off the same stream the plain REPL prints: `text_delta`s
+  accumulate into one streaming assistant block with a cursor, tool calls
+  render as `[tool ->] name` / `[tool <-] name` (matched by `tool_call_id`, so
+  parallel executions of the same tool can't cross-attribute), a failed run
+  attaches its error to that run's block, and every session notice
+  (`session_opened`, compaction, overflow, `auto_retry_*`,
+  `summarization_retry_*`) lands in the transcript. Nothing prints to
+  stdout/stderr while the alt screen is live — slash-command output is captured
+  and reposted as notice lines.
+- **Slash commands** work in the TUI through the same router the REPL uses:
+  `/new`, `/compact`, `/retry`, `/tree`, `/fork`, `/clone`, `/sessions`,
+  `/resume`, `/name`, `/session`, `/thinking`, `/export`, `/settings`,
+  `/templates`, `/skills`, `/help`, `/quit`, and `/<template>`/`<skill>`
+  invocation.
+- **Layout accounting** is exact: the dock is rendered and measured first, the
+  transcript fills the remaining rows, and `render` always returns exactly
+  `height` lines (a tall dock on a tiny terminal keeps the footer by trimming
+  from the top). Agent messages start pending and clear when the run starts, so
+  an interrupted or failed prompt reads `(aborted)` / `(error)` instead of a
+  bare line.
+- Not ported: pi's session-tree/fork *selectors* (karen's are text commands),
+  the theme system, search-in-transcript, mouse selection/copy, widgets, and
+  pi's incremental (damage-region) painting — karen repaints whole frames,
+  which is what makes the renderer testable without a TTY.
+
+Verified with 55 offline tests (`tests/test_tui.py`, `tests/test_tui_app.py`:
+transcript lifecycle, layout row accounting, the editor's key handling, CSI
+decoding, and an end-to-end async driver over a fake terminal) plus the full
+suite; a `--tui` run was also driven against a real terminal.
+
 ## Roadmap
 
-Later milestones: TUI (unscheduled). MCP tool integration landed in this
-milestone (below): `karen_coding_agent.mcp` bridges `karen_mcp` into the
-agent's tool set.
+Later milestones: extensions (unscheduled). MCP tool integration and the TUI
+both landed (above/below).
 
 ## MCP: tools from external servers
 

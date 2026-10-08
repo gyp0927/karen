@@ -64,10 +64,10 @@ from .settings import (
     update_settings,
 )
 from .tools import create_default_tools
+from .tui.app import LiveTui
 
 DEFAULT_MODEL_ID = "deepseek-v4-pro"
 DEFAULT_CREDENTIALS = Path.home() / ".karen" / "credentials.json"
-
 HELP_TEXT = """Commands:
   /help                 show this help
   /new                  start a fresh session
@@ -206,6 +206,7 @@ class KarenCli:
         self.skill_diagnostics = skills_result.diagnostics
         self.session: AgentSession | None = None
         self.tool_counts = {}
+        self.tui: "Any" = None  # set when running in alt-screen TUI mode
         self._print_settings_diagnostics()
         for diagnostic in self.skill_diagnostics:
             print(f"[skill warning: {diagnostic.code} {diagnostic.path}: {diagnostic.message}]", file=sys.stderr)
@@ -231,6 +232,9 @@ class KarenCli:
     def _on_agent_event(self, event, signal) -> None:
         if self.output_mode == "json":
             print(json.dumps(to_json_event(event), ensure_ascii=False), flush=True)
+            return
+        if self.tui is not None:
+            self.tui.app.ingest_agent_event(event, self.session)
             return
         if (
             not self.quiet_tools
@@ -259,6 +263,11 @@ class KarenCli:
             # the session header line covers session_opened
             if event_type != "session_opened":
                 print(json.dumps(event, ensure_ascii=False), flush=True)
+            return
+        if self.tui is not None:
+            # Every session event renders inside the viewport; printing to
+            # stdout/stderr here would paint over the alt-screen frame.
+            self.tui.app.ingest_session_event(event)
             return
         if event_type == "session_opened":
             kind = "resumed" if event["resumed"] else event.get("reason", "new")
@@ -801,6 +810,144 @@ class KarenCli:
         await self.session.close()
         return 0
 
+    async def repl_tui(self) -> int:
+        """Alt-screen TUI (pi's interactive mode, hand-rolled viewport).
+
+        Opens the session exactly like the plain REPL, then hands control to
+        the TUI. Agent + session events are rerouted into the `Transcript`
+        (via `self.tui`), the editor's submitted text is dispatched through
+        the same command router the REPL uses, and the async run loop keeps
+        reading keys while a prompt streams.
+        """
+        if not sys.stdin.isatty():
+            print("TUI mode requires an interactive terminal; falling back to the plain REPL",
+                  file=sys.stderr)
+            return await self.repl()
+        # Create the TUI before opening the session so the session-opened event
+        # lands in the transcript instead of on stdout (redraw is gated on
+        # `start`, which happens once the alt screen is entered).
+        self.tui = LiveTui()
+        tool_names = " ".join(tool.name for tool in (self.session.tools if self.session else []))
+        try:
+            await self._open_session(self.fresh)
+            tool_names = " ".join(tool.name for tool in self.session.tools)
+            self.tui.app.set_status_provider(
+                lambda: f"model: {self.provider}/{self.model.id} | cwd: {self.cwd} | tools: {tool_names}"
+            )
+
+            async def _prompt_handler(app, text: str) -> None:
+                await self._dispatch_tui_input(app, text)
+
+            await self.tui.run(_prompt_handler)
+        finally:
+            self.tui = None
+        await self.session.close()
+        return 0
+
+    async def _dispatch_tui_input(self, app, text: str) -> None:
+        """Route one submitted editor line: prompt, or slash command."""
+        kind, name, rest = parse_command(
+            text, {t.name for t in self.templates}, {s.name for s in self.skills}
+        )
+        if kind == "quit":
+            app.running = False
+            return
+        if kind in ("prompt", "template", "skill"):
+            if kind == "template":
+                template = next(t for t in self.templates if t.name == name)
+                prompt_text = format_prompt_template_invocation(template, parse_command_args(rest))
+            elif kind == "skill":
+                skill = next(s for s in self.skills if s.name == name)
+                prompt_text = format_skill_invocation(skill, rest or None)
+            else:
+                prompt_text = text
+            await self._run_tui_prompt(app, prompt_text)
+            return
+        if kind == "new":
+            # Reset first: the fresh session's session_opened notice should
+            # survive the reset, not be erased by it.
+            app.transcript.reset()
+            try:
+                await self._open_session(fresh=True)
+            except Exception as error:
+                self.tui.app.add_notice(f"[error: {error}]", error=True)
+            return
+        try:
+            await self._handle_navigation_or_settings(kind, rest)
+        except Exception as error:
+            self.tui.app.add_notice(f"[error: {error}]", error=True)
+
+    async def _run_tui_prompt(self, app, prompt_text: str) -> None:
+        """Run one prompt, keeping the TUI alive and responsive throughout."""
+        try:
+            await self.session.prompt(prompt_text)
+        except KeyboardInterrupt:
+            self.session.abort()
+            await self.session.wait_for_idle()
+        except Exception as error:
+            self.tui.app.add_notice(f"[error: {error}]", error=True)
+
+    async def _handle_navigation_or_settings(self, kind: str, rest: str) -> None:
+        """TUI-side dispatcher for slash commands that aren't prompt-shaped.
+
+        Every branch's output is captured and reposted as transcript notice
+        lines: printing while the alt screen is live would paint over the
+        frame.
+        """
+        if kind in ("tree", "fork", "clone", "sessions", "resume", "name", "session"):
+            await self._run_captured(
+                lambda: self._handle_navigation(kind, rest)
+            )
+        elif kind == "retry":
+            await self._run_captured(lambda: self._handle_retry(rest))
+        elif kind == "thinking":
+            await self._run_captured(lambda: self._handle_thinking(rest))
+        elif kind == "export":
+            await self._run_captured(lambda: self._handle_export(rest))
+        elif kind == "settings":
+            await self._run_captured(lambda: self._handle_settings(rest))
+        elif kind == "compact":
+            await self._run_captured(
+                lambda: self.session.run_compaction("manual", custom_instructions=rest or None)
+            )
+        elif kind == "templates":
+            if not self.templates:
+                self.tui.app.add_notice("no templates (add .md files to .karen/prompts)")
+            for template in self.templates:
+                self.tui.app.add_notice(f"/{template.name}  {template.description or ''}")
+        elif kind == "skills":
+            if not self.skills:
+                self.tui.app.add_notice("no skills (add SKILL.md files to .karen/skills)")
+            for skill in self.skills:
+                self.tui.app.add_notice(f"/{skill.name}  {skill.description}")
+        elif kind == "help":
+            for line in HELP_TEXT.splitlines():
+                self.tui.app.add_notice(line)
+
+    async def _run_captured(self, produce) -> None:
+        """Run `produce()` (sync or async) and post its stdout/stderr as
+        transcript notices, one per non-empty line."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer), redirect_stderr(buffer):
+                await _maybe_await(produce())
+        except Exception as error:
+            self.tui.app.add_notice(f"[error: {error}]", error=True)
+            return
+        for line in buffer.getvalue().splitlines():
+            if line.strip():
+                self.tui.app.add_notice(line)
+
+
+async def _maybe_await(value):
+    """Await `value` when it is awaitable, else return it (sync handlers)."""
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="karen", description="karen — AI coding assistant")
@@ -815,6 +962,8 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", default=None,
                         help="model provider (default: KAREN_PROVIDER, then settings defaultProvider, then deepseek)")
     parser.add_argument("--new", action="store_true", help="start a fresh session instead of resuming")
+    parser.add_argument("--tui", action="store_true",
+                        help="interactive alt-screen TUI (full chat viewport with a multi-line editor)")
     parser.add_argument("--export", metavar="FILE", dest="export_file",
                         help="export a session file to HTML and exit (an optional PROMPT arg is the output path)")
     parser.add_argument("messages", nargs="*", metavar="PROMPT",
@@ -873,6 +1022,8 @@ def main(argv=None) -> int:
                    loaded_settings=loaded_settings)
     if headless:
         return asyncio.run(cli.run_print(args.messages))
+    if args.tui:
+        return asyncio.run(cli.repl_tui())
     return asyncio.run(cli.repl())
 
 
