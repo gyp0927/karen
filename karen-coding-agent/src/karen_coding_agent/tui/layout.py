@@ -147,8 +147,8 @@ class Layout:
     # -- the fixed dock --------------------------------------------------------
 
     def _status_line(self, app: _LayoutInput) -> str:
-        text = self._truncate(app.status, self.width)
-        return text.ljust(self.width)
+        text = self._truncate(app.status, self.width - 1)
+        return text.rjust(self.width - 1) + " "
 
     @staticmethod
     def _truncate(text: str, width: int) -> str:
@@ -162,38 +162,40 @@ class Layout:
             rows = [""]
         return rows
 
-    def _editor_lines(self, app: _LayoutInput) -> List[str]:
+    def _dock_lines(self, app: _LayoutInput, reserve_transcript: int = 1) -> List[str]:
+        """Status + editor + footer. The footer is always the last row; when
+        the whole dock cannot fit, the *first* editor rows drop off (the
+        newest — where the cursor is — and the footer stay), so the input and
+        the hint are never lost on a short terminal."""
         s = self.style
         rows = self._editor_rows(app)
-        prompt = s.fg("32", "> ")
-        out = []
+        # Keep at least one editor row; the rest is capped so the dock's
+        # status + editor + footer rows fit the screen.
+        max_editor_rows = max(1, self.height - 2 - reserve_transcript)
+        rows = rows[-max_editor_rows:]
+        out = [s.bg("238", self._status_line(app))]
         for index, line in enumerate(rows):
-            prefix = prompt if index == 0 else "  "
-            # Keep every editor row within the terminal width: a long typed
-            # line must not wrap into extra physical rows the dock did not
-            # reserve (that would desynchronise the frame). Reserve 2 columns
-            # for the prompt and 1 for the cursor block.
-            body = self._truncate(line, max(1, self.width - 3))
-            suffix = s.fg("32", "▌") if index == len(rows) - 1 else ""
+            prefix = s.fg("32", "> ") if index == 0 else "  "
+            is_last = index == len(rows) - 1
+            # The last row carries the cursor block, so it reserves 1 more
+            # column than a plain continuation row; a long typed/pasted line
+            # is truncated, never wrapped, or the frame's row accounting breaks.
+            avail = self.width - (3 if is_last else 2)
+            body = self._truncate(line, max(1, avail))
+            suffix = s.fg("32", "▌") if is_last else ""
             out.append(f"{prefix}{body}{suffix}")
+        out.append(s.fg("38;5;245", self._truncate(app.footer, self.width)))
         return out
-
-    def _dock_lines(self, app: _LayoutInput) -> List[str]:
-        s = self.style
-        lines = [s.bg("238", self._status_line(app))]
-        lines.extend(self._editor_lines(app))
-        lines.append(s.fg("38;5;245", self._truncate(app.footer, self.width)))
-        return lines
 
     # -- composition -----------------------------------------------------------
 
     def render(self, transcript: Transcript, app: Optional[_LayoutInput] = None, **_) -> List[str]:
         """Produce exactly `self.height` lines (ANSI strings).
 
-        The dock is rendered first and measured; the transcript fills the rows
-        that remain and is scrolled/padded to fit. `follow` sticks the view to
-        the newest line, otherwise the user's scroll offset (`self.top`) is
-        honored.
+        The dock is rendered first and measured (the editor is clamped so it
+        fits); the transcript fills the remaining rows and is scrolled/padded
+        to fit. `follow` sticks the view to the newest line, otherwise the
+        user's scroll offset (`self.top`) is honored.
         """
         app = app or _LayoutInput()
         dock = self._dock_lines(app)
@@ -206,11 +208,7 @@ class Layout:
         visible = all_lines[self.top : self.top + region]
         visible = list(visible) + [""] * (region - len(visible))
         out = visible + dock
-        # The dock may be taller than the screen (a very small terminal): keep
-        # the *last* height rows so the footer stays visible.
-        if len(out) > self.height:
-            out = out[len(out) - self.height :]
-        return out
+        return out[: self.height]
 
     # -- scrolling -------------------------------------------------------------
 
