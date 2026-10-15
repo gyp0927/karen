@@ -683,6 +683,11 @@ What an extension can do:
 
 - **Tools** (`pi.register_tool`) join the session's tool set, callable by the
   model exactly like the built-ins (the same four-argument `execute`).
+  A tool's `execute` may return an `AgentToolResult`, a `ToolResultDict`, a
+  mapping with those fields, a plain string, or nothing (side-effect tools get
+  a "(no output)" stub); any other shape is wrapped as a text block of its
+  `str()`, so the model sees a clean result instead of the loop's raw
+  type-validation error.
 - **Commands** (`pi.register_command`) share the one `/name` namespace —
   precedence: built-ins, extension commands, templates, skills. `/hello world`
   calls the handler with `args="world"` and a
@@ -726,12 +731,23 @@ What an extension can do:
     RPC prompts report `"rpc"`, not `"interactive"`.
   - `ToolResultEventResult` has no `terminate` — that is a `tool_call` /
     tool-result field, and a `tool_result` handler cannot change it.
+
+  Loader semantics:
+
+  - An `async def` factory may import its own sibling helper modules while it
+    runs, exactly like a sync one: the entry's directory stays on
+    ``sys.path`` until the caller has awaited the factory, and is dropped
+    after (the module is registered in `sys.modules` under a
+    `karen_extension_<sha1>` name, popped on failure).
 - **Session controls** (`pi.append_entry`, `send_message`,
   `send_user_message`, `exec`, `set_session_name`, `set_label`,
   `get/set_active_tools`, `get/set_thinking_level`, `set_model`, `notify`,
   `get_settings`, `get_commands`) delegate to a host bound to the live
   session, so they follow fork/switch; with no session bound they raise, like
-  pi's actions.
+  pi's actions. `send_message` persists immediately but, while a run is
+  streaming, defers the live-transcript append to the session's settle
+  flush — the same guard `record_bash_result` uses, so a custom message is
+  never spliced between an in-flight `tool_use` and its `tool_result`.
 - **The `pi.events` bus** lets two extensions coordinate without importing
   each other.
 
