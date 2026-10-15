@@ -358,6 +358,10 @@ class AgentSession:
         #: Side-channel bash results recorded while streaming, flushed when the
         #: run settles and again before a new prompt (pi's `_pendingBashMessages`).
         self._pending_bash_messages: List[Any] = []
+        #: Custom messages sent through the extension `send_message` API while
+        #: a run was in flight, flushed on the same two settle points — the
+        #: same ordering hazard as the side-channel bash results.
+        self._pending_custom_messages: List[Any] = []
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -1678,12 +1682,11 @@ class AgentSession:
                 return
 
     async def _flush_pending_bash_messages(self) -> None:
-        """Append side-channel bash results queued during the run (pi's
-        `_runAgentPrompt` settle flush)."""
-        if not self._pending_bash_messages:
-            return
-        pending, self._pending_bash_messages = list(self._pending_bash_messages), []
-        for message in pending:
+        """Append side-channel bash results and custom messages queued during a
+        run (pi's `_runAgentPrompt` settle flush)."""
+        pending_bash, self._pending_bash_messages = list(self._pending_bash_messages), []
+        pending_custom, self._pending_custom_messages = list(self._pending_custom_messages), []
+        for message in [*pending_bash, *pending_custom]:
             await self._persist_message(message)
             self.agent.state.messages.append(message)
 

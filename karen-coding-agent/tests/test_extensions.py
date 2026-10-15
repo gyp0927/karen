@@ -256,6 +256,26 @@ async def test_load_extensions_async_awaits_async_factories(tmp_path):
     assert loaded.diagnostics == []
 
 
+async def test_an_async_directory_extension_imports_its_helpers(tmp_path, monkeypatch):
+    """The promise the loader's docstring makes, in the async-factory case:
+
+    an ``index.py`` that is ``async def`` may import a sibling helper while it
+    runs, and the entry's directory stays on ``sys.path`` until the factory
+    settles — then it is dropped, not left behind.
+    """
+    ext_dir = tmp_path / "proj" / ".karen" / "extensions"
+    pkg = ext_dir / "pkg"
+    _write(pkg / "index.py", "import helper\n\nasync def extension(pi):\n    pi.register_command('fromhelper', lambda args, ctx: None)\n")
+    _write(pkg / "helper.py", "MARKER = 'ok'\n")
+    before = [p for p in sys.path if str(pkg) == p]
+
+    loaded = await load_extensions_async(cwd=str(tmp_path / "proj"), agent_dir=str(tmp_path / "user"))
+
+    assert list(loaded.runner.commands()) == ["fromhelper"]
+    assert loaded.diagnostics == []
+    assert [p for p in sys.path if str(pkg) == p] == before  # dropped, not lingered
+
+
 def test_a_raising_factory_is_a_diagnostic_and_never_fatal(tmp_path):
     ext_dir = tmp_path / "proj" / ".karen" / "extensions"
     _write(ext_dir / "abad.py", "def extension(pi):\n    raise RuntimeError('boom')\n")
@@ -881,6 +901,12 @@ def test_tool_result_from_normalizes_each_accepted_shape():
     empty = tool_result_from(None)
     assert isinstance(empty, AgentToolResult)
     assert empty.content[0].text == "(no output)"
+
+    # an unknown shape is wrapped as a text block rather than passed to the
+    # loop's validator (which would surface a raw type error as a tool result)
+    unknown = tool_result_from(42)
+    assert isinstance(unknown, AgentToolResult)
+    assert unknown.content[0].text == "42"
 
 
 # ---------------------------------------------------------------------------

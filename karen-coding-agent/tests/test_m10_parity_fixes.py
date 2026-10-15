@@ -214,3 +214,47 @@ async def test_rpc_prompt_queues_see_the_input_event_with_rpc_source(
     assert ("rpc", "followUp", "queued mid-run") in seen
 
     await session.close()
+
+
+async def test_send_message_does_not_splice_into_an_in_flight_run(
+    tmp_path, monkeypatch
+):
+    """`pi.send_message` while a tool batch is in flight must queue the
+    transcript append for the settle flush, not splice between the in-flight
+    `tool_use` and its `tool_result` (the same hazard `record_bash_result`
+    guards against)."""
+    from karen_ai import create_models
+    from karen_ai.providers import register_faux_provider
+
+    from karen_coding_agent import AgentSession
+
+    models = create_models()
+    registration = register_faux_provider(responses=[])
+    models.set_provider(registration.provider)
+    session = AgentSession(
+        cwd=str(tmp_path),
+        models=models,
+        model=registration.get_model(),
+        sessions_root=str(tmp_path),
+        fresh=True,
+    )
+    await session.open()
+
+    host = ExtensionHost()
+    host.bind(session)
+
+    session.agent.state.is_streaming = True
+    await host.send_message("note", "queued note", display=True, details=None)
+    # the live transcript must not have grown yet: the append is queued
+    assert not any(getattr(m, "custom_type", None) == "note" for m in session.agent.state.messages)
+    assert len(session._pending_custom_messages) == 1
+
+    await session._flush_pending_bash_messages()
+    assert len(session._pending_custom_messages) == 0
+    assert any(getattr(m, "custom_type", None) == "note" for m in session.agent.state.messages)
+
+    # idle send: appended in place, nothing queued
+    session.agent.state.is_streaming = False
+    await host.send_message("note", "idle note", display=True, details=None)
+    assert len(session._pending_custom_messages) == 0
+    await session.close()

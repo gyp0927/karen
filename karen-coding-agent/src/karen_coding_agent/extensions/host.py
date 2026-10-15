@@ -58,7 +58,12 @@ def tool_result_from(value: Any) -> Any:
 
     Accepted shapes: an ``AgentToolResult`` already, a
     :class:`~karen_coding_agent.extensions.types.ToolResultDict`, a mapping with
-    its fields, or a plain string (model-facing content, nothing else).
+    its fields, a plain string (model-facing content, nothing else), or
+    nothing at all (side-effect tool; the model still gets a stub back). Any
+    other shape is wrapped as a text block of its ``str()`` — the loop's
+    validator would otherwise surface a raw type error as a tool result, and
+    an extension author who returned, say, a bare number would be left to
+    guess why their tool is "failing".
     Raising — including a returned :class:`ToolError`, which is raisable — is
     how failure is reported, so it is also the one case *not* converted here.
     """
@@ -78,13 +83,13 @@ def tool_result_from(value: Any) -> Any:
             usage=value.get("usage"),
             terminate=value.get("terminate"),
         )
-    if isinstance(value, str):
-        return AgentToolResult(content=[TextContent(text=value)])
     if value is None:
         # An extension tool that returns nothing made its point through
         # side effects; the model still needs *something* back.
         return AgentToolResult(content=[TextContent(text="(no output)")])
-    return value
+    if not isinstance(value, str):
+        return AgentToolResult(content=[TextContent(text=str(value))])
+    return AgentToolResult(content=[TextContent(text=value)])
 
 
 def make_agent_tool(definition: ToolDefinition) -> Any:
@@ -196,6 +201,14 @@ class ExtensionHost:
     async def send_message(
         self, custom_type: str, content: Any, display: bool, details: Any
     ) -> None:
+        """Store a custom message the model will see on its next request.
+
+        While a run is streaming the message is persisted now but *queued* for
+        the live transcript — appending it in place would splice it between an
+        in-flight `tool_use` and its `tool_result`, which is exactly the hazard
+        `record_bash_result` guards against. The settle flush re-appends it in
+        the persisted order.
+        """
         from karen_agent.messages import create_custom_message
 
         session = self._require_session()
@@ -207,7 +220,10 @@ class ExtensionHost:
             timestamp=_now_ms(),
         )
         await session._persist_message(message)
-        session.agent.state.messages.append(message)
+        if getattr(session.agent.state, "is_streaming", False):
+            session._pending_custom_messages.append(message)
+        else:
+            session.agent.state.messages.append(message)
 
     async def send_user_message(self, text: str, images: Any, deliver_as: str) -> None:
         # An extension-sent message is still user input: `AgentSession` routes it

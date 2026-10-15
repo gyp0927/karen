@@ -383,8 +383,15 @@ def _load_one(
     host: Any,
     settings: Any,
     diagnostics: List[ExtensionLoadDiagnostic],
-) -> Optional[Extension]:
-    """Import and run one extension module; records diagnostics on failure."""
+) -> Optional[Tuple[Extension, Any, bool]]:
+    """Import and run one extension module; records diagnostics on failure.
+
+    Returns ``(record, pending, added_to_path)``. *pending* is an un-awaited
+    coroutine when the factory is `async def` — the caller awaits it and drops
+    the path entry only then; *added_to_path* says whether this call inserted
+    the entry's directory (an async factory's body still imports with the
+    directory on ``sys.path``, exactly like a sync factory would).
+    """
     record = Extension(path=entry, module_path=os.path.abspath(entry), source=source)
     directory = os.path.dirname(os.path.abspath(entry))
     added_to_path = False
@@ -405,8 +412,11 @@ def _load_one(
         api = ExtensionAPI(record, runner, host=host, settings=settings)
         result = factory(api)
         if hasattr(result, "__await__"):
-            return record, result  # an async factory; the caller awaits it
-        return record, None
+            # The async body still imports against this path entry, so it stays
+            # until the caller awaits the factory and cleans up.
+            return record, result, added_to_path
+        _drop_path_entry(directory, added_to_path)
+        return record, None, added_to_path
     except Exception as error:  # noqa: BLE001 - reported, never fatal
         diagnostics.append(
             ExtensionLoadDiagnostic(
@@ -415,13 +425,18 @@ def _load_one(
             )
         )
         sys.modules.pop(_module_name(entry), None)
+        _drop_path_entry(directory, added_to_path)
         return None
-    finally:
-        if added_to_path:
-            try:
-                sys.path.remove(directory)
-            except ValueError:
-                pass
+
+
+def _drop_path_entry(directory: str, added_to_path: bool) -> None:
+    """Remove a directory the loader put on ``sys.path`` (best effort)."""
+    if not added_to_path:
+        return
+    try:
+        sys.path.remove(directory)
+    except ValueError:
+        pass
 
 
 async def load_extensions_async(
@@ -452,7 +467,7 @@ async def load_extensions_async(
         outcome = _load_one(entry, source, runner, host, settings, diagnostics)
         if outcome is None:
             continue
-        record, pending = outcome
+        record, pending, added_to_path = outcome
         if pending is not None:
             try:
                 await maybe_await(pending)
@@ -463,7 +478,10 @@ async def load_extensions_async(
                         f"async {FACTORY_NAME}() failed: {type(error).__name__}: {error}",
                     )
                 )
+                sys.modules.pop(_module_name(entry), None)
+                _drop_path_entry(os.path.dirname(os.path.abspath(entry)), added_to_path)
                 continue
+        _drop_path_entry(os.path.dirname(os.path.abspath(entry)), added_to_path)
         loaded.append(record)
 
     runner.extensions = loaded
