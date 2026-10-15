@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "karen-ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unified LLM API with provider configuration and streaming — a Python port inspired by @earendil-works/pi-ai"
 readme = "README.md"
 requires-python = ">=3.11"

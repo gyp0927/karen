@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "karen-coding-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "The karen coding-agent app — CLI coding assistant built on karen-agent, the karen equivalent of @earendil-works/pi's packages/coding-agent"
 readme = "README.md"
 requires-python = ">=3.11"
