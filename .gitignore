@@ -27,3 +27,4 @@ Thumbs.db
 
 # Local reference snapshots
 .pi-reference/
+.scratch/

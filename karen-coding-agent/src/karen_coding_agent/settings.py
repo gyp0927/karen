@@ -16,12 +16,13 @@ Ported subset (camelCase wire keys, like pi): `defaultProvider`,
 `defaultModel`, `shellPath`, `shellCommandPrefix`, `sessionDir`,
 `compaction` (`enabled`/`reserveTokens`/`keepRecentTokens`), `retry`
 (`enabled`/`maxRetries`/`baseDelayMs`/`maxAgentDelayMs`), `prompts`,
-`defaultTools`, plus karen additions `images`, `mcpServers` and `tui`
-(`tui: false` keeps `karen` in the plain REPL instead of the alt-screen TUI;
-read at startup, like the model and shell settings). The rest of pi's Settings
-is extensions/analytics scope and intentionally not ported — including
-`retry.provider` (the provider-adapter retry knobs; karen-ai adapters take
-those per request).
+`defaultTools`, `extensions` (a list of extension paths, loaded after the
+conventional directories — M10), plus karen additions `images`, `mcpServers`
+and `tui` (`tui: false` keeps `karen` in the plain REPL instead of the
+alt-screen TUI; read at startup, like the model and shell settings). The rest
+of pi's Settings is analytics/themes scope and intentionally not ported —
+including `retry.provider` (the provider-adapter retry knobs; karen-ai
+adapters take those per request).
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ class Settings:
     images: Optional[Dict[str, Any]] = None  # raw camelCase dict
     prompts: Optional[List[str]] = None
     default_tools: Optional[List[str]] = None
+    #: Extension paths from the settings files (pi's `extensions`), loaded
+    #: after the conventional project/user directories, before `--extension`.
+    extensions: Optional[List[str]] = None
     mcp_servers: Optional[Dict[str, Any]] = None  # camelCase `mcpServers` → list of server dicts
     #: `tui: false` keeps `karen` in the plain REPL; unset means "auto" (the
     #: TUI whenever both ends are a terminal). An explicit `--tui`/`--repl`
@@ -200,6 +204,7 @@ def _settings_from_wire(merged: Dict[str, Any]) -> Settings:
         images=_as_dict(merged.get("images")),
         prompts=[_expand_user(entry) for entry in _as_str_list(merged.get("prompts")) or []] or None,
         default_tools=_as_str_list(merged.get("defaultTools")),
+        extensions=[_expand_user(entry) for entry in _as_str_list(merged.get("extensions")) or []] or None,
         mcp_servers=_mcp_servers_from_wire(merged.get("mcpServers")),
         tui=_as_bool(merged.get("tui")),
     )

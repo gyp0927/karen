@@ -1,6 +1,8 @@
 """`karen` — the CLI coding assistant (M1: REPL + print mode; M3: JSON mode;
 M5: RPC mode; M6: structured system prompt, context files and skills; M7:
-session navigation — tree, fork, clone, switch; M8: auto-retry).
+session navigation — tree, fork, clone, switch; M8: auto-retry; M10:
+extensions — `--extension`, the settings `extensions` list and `/name`
+extension commands).
 
 Interactive:
     karen [--cwd PATH] [--model ID] [--new]
@@ -40,6 +42,12 @@ from karen_agent import (
 )
 
 from .agent_session import AgentSession
+from .extensions import (
+    CommandContext,
+    ExtensionHost,
+    load_extensions_async,
+)
+from .extensions import events as extension_events
 from .json_events import to_json_event
 from .navigation import render_tree
 from .prompt import build_system_prompt_sections
@@ -88,7 +96,7 @@ HELP_TEXT = """Commands:
   /templates            list available prompt templates
   /skills               list available skills
   /quit                 exit
-  /<name> [args]        invoke a prompt template or skill from the current project
+  /<name> [args]        invoke a prompt template, skill, or extension command
 Anything else is sent to the model."""
 
 
@@ -98,15 +106,16 @@ Anything else is sent to the model."""
 _BASH_PAINT_INTERVAL_SECONDS = 0.05
 
 
-def parse_command(line: str, template_names, skill_names=()):
+def parse_command(line: str, template_names, skill_names=(), extension_names=()):
     """Route one input line. Returns (kind, name, arg_string).
 
     kind: "quit" | "help" | "new" | "compact" | "retry" | "tree" | "fork"
           | "clone" | "sessions" | "resume" | "name" | "session"
-          | "templates" | "skills" | "template" | "skill" | "prompt"
+          | "templates" | "skills" | "extension" | "template" | "skill" | "prompt"
 
-    Templates and skills share one `/name` namespace, like pi's slash commands;
-    templates win when a name is defined as both.
+    One `/name` namespace, like pi's slash commands; the precedence is
+    built-ins, then extension commands, then prompt templates, then skills
+    (templates win over skills when a name is defined as both).
     """
     if not line.startswith("/"):
         return "prompt", None, line
@@ -148,6 +157,8 @@ def parse_command(line: str, template_names, skill_names=()):
         return "templates", None, ""
     if name == "skills":
         return "skills", None, ""
+    if name in extension_names:
+        return "extension", name, rest
     if name in template_names:
         return "template", name, rest
     if name in skill_names:
@@ -224,13 +235,14 @@ class KarenCli:
 
     def __init__(self, cwd: str, model_id: str, fresh: bool, quiet_tools: bool = False,
                  provider: str = "deepseek", output_mode: str = "text",
-                 loaded_settings: "LoadedSettings | None" = None) -> None:
+                 loaded_settings: "LoadedSettings | None" = None,
+                 extension_paths=()) -> None:
         self.cwd = cwd
         self.provider = provider
         self.model_id = model_id
         self.fresh = fresh
         self.quiet_tools = quiet_tools  # headless: tool chatter goes to stderr
-        self.output_mode = output_mode  # "text" (final reply) | "json" (event stream)
+        self.output_mode = output_mode  # "text" (final reply) | "json" (event stream) | "rpc"
         self.loaded_settings = loaded_settings if loaded_settings is not None else load_settings(cwd)
         self.settings = self.loaded_settings.settings
         self.models, self.auth_source = build_models()
@@ -238,13 +250,27 @@ class KarenCli:
             self.models.set_provider(deepseek_provider())
         self.model = self.resolve_model()
         self.agent_dir = DEFAULT_AGENT_DIR
-        self.templates, self.template_diagnostics = load_all_templates(cwd, self.settings.prompts)
-        skills_result = load_project_skills(cwd, self.agent_dir)
-        self.skills = skills_result.skills
-        self.skill_diagnostics = skills_result.diagnostics
+        self.tui: "Any" = None  # set when running in alt-screen TUI mode
+        # Extension runtime state. Loading is deferred to the first
+        # `_open_session` (factories may be `async def`, and `__init__` may run
+        # inside an event loop in tests, where the sync loader is illegal);
+        # the host is built now, with a notify sink that reads the face
+        # dynamically — `self.tui` appears when the TUI starts.
+        self.extension_paths = list(extension_paths)
+        self.extension_host = ExtensionHost(
+            settings=self.settings,
+            mode=self._face(),
+            has_ui=self._face() in ("repl", "tui"),
+            notify=self._extension_notify,
+        )
+        self.loaded_extensions = None
+        self.extension_runner = None
+        self._extension_prompt_paths: list = []
+        self._extension_skill_paths: list = []
+        self.templates, self.template_diagnostics = self._load_templates()
+        self._reload_skills()
         self.session: AgentSession | None = None
         self.tool_counts = {}
-        self.tui: "Any" = None  # set when running in alt-screen TUI mode
         self._print_settings_diagnostics()
         for diagnostic in self.skill_diagnostics:
             print(f"[skill warning: {diagnostic.code} {diagnostic.path}: {diagnostic.message}]", file=sys.stderr)
@@ -255,6 +281,24 @@ class KarenCli:
                 f"[settings warning: Invalid settings file {diagnostic.path}: {diagnostic.message}]",
                 file=sys.stderr,
             )
+
+    def _face(self) -> str:
+        """The extension-facing mode name for the current output configuration."""
+        if self.output_mode == "rpc":
+            return "rpc"
+        if self.quiet_tools:
+            return "print"
+        return "tui" if self.tui is not None else "repl"
+
+    def _load_templates(self):
+        """Prompt templates: conventional dirs, settings `prompts`, extension paths."""
+        extra = [*(self.settings.prompts or []), *self._extension_prompt_paths]
+        return load_all_templates(self.cwd, extra)
+
+    def _reload_skills(self) -> None:
+        result = load_project_skills(self.cwd, self.agent_dir, extra_dirs=self._extension_skill_paths)
+        self.skills = result.skills
+        self.skill_diagnostics = result.diagnostics
 
     def resolve_model(self):
         model = self.models.get_model(self.provider, self.model_id)
@@ -348,6 +392,109 @@ class KarenCli:
                 f"in {seconds:.1f}s: {event['errorMessage']}]"
             )
 
+    # -- extensions (M10) -------------------------------------------------------
+
+    def _extension_notify(self, message: str, level: str = "info") -> None:
+        """Route an extension's user-facing message by face (pi's `ui.notify`).
+
+        The TUI gets a transcript notice; the plain REPL prints info to stdout
+        and anything graver to stderr; headless modes keep stdout clean for
+        the reply / event stream / protocol, so all of it goes to stderr.
+        """
+        if self.tui is not None:
+            self.tui.app.add_notice(message, error=(level != "info"))
+            return
+        interactive = self.output_mode == "text" and not self.quiet_tools
+        print(message, file=sys.stdout if interactive and level == "info" else sys.stderr)
+
+    def _on_extension_error(self, error) -> None:
+        """The runner's error sink: a handler or factory failed at runtime."""
+        self._extension_notify(
+            f"[extension error: {error.event} ({error.extension_path}): {error.message}]",
+            level="error",
+        )
+
+    async def _ensure_extensions(self) -> None:
+        """Load extensions once, on the first session open.
+
+        Deferred out of `__init__` because factories may be `async def` (the
+        loader awaits them) and a CLI built inside a running loop — the tests
+        do this — cannot drive the sync loader's `asyncio.run`. The runner
+        then outlives sessions: `/new` re-opens rebind it, never reload it.
+        """
+        if self.loaded_extensions is not None:
+            return
+        self.loaded_extensions = await load_extensions_async(
+            cwd=self.cwd,
+            agent_dir=self.agent_dir,
+            settings_paths=self.settings.extensions or (),
+            cli_paths=self.extension_paths,
+            host=self.extension_host,
+            settings=self.settings,
+            on_error=self._on_extension_error,
+        )
+        self.extension_runner = self.loaded_extensions.runner
+        for diagnostic in self.loaded_extensions.diagnostics:
+            level = "error" if diagnostic.severity == "error" else "warning"
+            for line in f"[extension {diagnostic.severity}: {diagnostic.path}: {diagnostic.message}]".splitlines():
+                self._extension_notify(line, level=level)
+        # resources_discover is the CLI's own event — nobody else fires it, and
+        # its contributions feed the same loaders templates/skills come from.
+        runner = self.extension_runner
+        if runner.has_handlers("resources_discover"):
+            discovered = await runner.emit_resources_discover(
+                extension_events.ResourcesDiscoverEvent(cwd=self.cwd, reason="startup")
+            )
+            self._extension_prompt_paths = discovered.get("prompt_paths") or []
+            self._extension_skill_paths = discovered.get("skill_paths") or []
+            # theme_paths are accepted for pi parity; karen has no theme loader.
+            if self._extension_prompt_paths:
+                self.templates, self.template_diagnostics = self._load_templates()
+            if self._extension_skill_paths:
+                self._reload_skills()
+
+    def _extension_command_names(self):
+        # getattr: test doubles build a bare KarenCli (object.__new__, no
+        # __init__) carrying only what the input router reads.
+        runner = getattr(self, "extension_runner", None)
+        return set(runner.commands()) if runner is not None else set()
+
+    def _extension_command_context(self) -> CommandContext:
+        """A command handler's reach: the live session, notify, and composition."""
+        host = self.extension_host
+
+        async def run_extension(name: str, args: Optional[str] = None) -> None:
+            await self._run_extension_command(name, args or "")
+
+        return CommandContext(
+            session=self.session,
+            notify=lambda message: host.notify(message),
+            run_extension=run_extension,
+        )
+
+    async def _run_extension_command(self, name: str, rest: str) -> bool:
+        """Dispatch `/name args` to an extension (pi's `_tryExecuteExtensionCommand`).
+
+        The runner reports a failing handler to the error sink and still counts
+        the command as handled; False means the name was never registered, so
+        the caller falls back to ordinary prompt handling, like pi.
+        """
+        runner = getattr(self, "extension_runner", None)
+        if runner is None:
+            return False
+        return await runner.run_command(name, rest or None, self._extension_command_context())
+
+    def _extension_summary_line(self) -> "str | None":
+        """The one-line startup summary of what the extension runtime loaded."""
+        loaded = self.loaded_extensions
+        if not loaded or not loaded.extensions:
+            return None
+        line = f"extensions: {len(loaded.extensions)} loaded"
+        commands = self._extension_command_names()
+        if commands:
+            line += f" | commands: {' '.join('/' + name for name in sorted(commands))}"
+        return line
+
     # -- session ---------------------------------------------------------------
 
     def _select_default_tools(self, entries):
@@ -403,8 +550,12 @@ class KarenCli:
             return None
 
     async def _open_session(self, fresh: bool) -> None:
-        if self.session is not None:
-            await self.session.close()
+        replacing = self.session is not None
+        if replacing:
+            # The only path that swaps a live session out is /new, which is
+            # also the shutdown reason pi reports to extension handlers.
+            await self.session.close(reason="new" if fresh else "quit")
+        await self._ensure_extensions()
         settings = self.settings
         sessions_root = None
         if settings.session_dir and not os.environ.get("KAREN_SESSIONS_ROOT"):
@@ -443,13 +594,44 @@ class KarenCli:
             else None,
             retry_policy=retry_policy,
             mcp_manager=mcp_manager,
+            extensions=self.extension_runner,
         )
-        await self.session.open()
+        await self.session.open(reason="new" if replacing and fresh else None)
         self.session.subscribe(self._on_agent_event)
         self.tool_counts = {}
         restored = len(self.session.agent.state.messages) - 1  # minus the seeded system message
         if restored:
             self._tool_line(f"context restored: {restored} messages, ~{self.session.estimate_tokens()} tokens")
+
+    async def _shutdown_session(self, *, reason: str = "quit") -> None:
+        """Close the live session, surviving cancellation (Ctrl-C).
+
+        Every mode calls this in a `finally`, because the interesting exits are
+        the ones that never reach an ordinary statement: `asyncio.run` cancels
+        the main task on Ctrl-C, and an exception in the TUI's key loop skips
+        the rest of `repl_tui`. Cleanup still has to run — `close()` dispatches
+        the extension `session_shutdown` and flushes the transcript — so a
+        cancellation that lands *during* cleanup is absorbed and the original
+        one re-raised once the session is down. The cancellation state is
+        cleared first so the awaits inside `close()` actually get to run.
+        """
+        session = self.session
+        if session is None:
+            return
+        task = asyncio.current_task()
+        cancelled = task.cancelling() if task is not None and hasattr(task, "cancelling") else 0
+        if cancelled and hasattr(task, "uncancel"):
+            for _ in range(cancelled):
+                task.uncancel()
+        try:
+            await session.close(reason=reason)
+        except asyncio.CancelledError:
+            # A second Ctrl-C while shutting down wins: propagate it.
+            raise
+        finally:
+            if cancelled and task is not None:
+                for _ in range(cancelled):
+                    task.cancel()
 
     # -- navigation --------------------------------------------------------------
 
@@ -696,7 +878,7 @@ class KarenCli:
         self.loaded_settings = load_settings(self.cwd)
         settings = self.loaded_settings.settings
         self.settings = settings
-        self.templates, self.template_diagnostics = load_all_templates(self.cwd, settings.prompts)
+        self.templates, self.template_diagnostics = self._load_templates()
         self._print_settings_diagnostics()
         if self.session is not None:
             self.session.auto_resize_images = image_auto_resize(settings.images)
@@ -732,6 +914,8 @@ class KarenCli:
         text mode: stdout gets the final assistant message's text only (exit 1
         on an error/aborted final message). json mode: stdout gets the session
         header followed by one JSON event per line (exit 1 only on exceptions).
+        The session is closed on the way out of either — including a cancelled
+        run (Ctrl-C), which is what the `run_print` repro in `.scratch` pinned.
         """
         await self._open_session(self.fresh)
         if self.output_mode == "json":
@@ -740,11 +924,14 @@ class KarenCli:
                 print(json.dumps(header, ensure_ascii=False), flush=True)
         exit_code = 0
         try:
-            for prompt in prompts:
-                await self.session.prompt(prompt)
-        except Exception as error:
-            print(str(error), file=sys.stderr)
-            exit_code = 1
+            try:
+                for prompt in prompts:
+                    await self.session.prompt(prompt)
+            except Exception as error:
+                print(str(error), file=sys.stderr)
+                exit_code = 1
+        finally:
+            await self._shutdown_session()
         if exit_code == 0 and self.output_mode == "text":
             messages = self.session.agent.state.messages
             final = messages[-1] if messages else None
@@ -758,14 +945,33 @@ class KarenCli:
                         if text is not None:
                             sys.stdout.write(f"{text}\n")
             sys.stdout.flush()
-        await self.session.close()
         return exit_code
 
     async def repl(self) -> int:
+        return await self._run_until_closed(self._repl_loop)
+
+    async def _run_until_closed(self, body) -> int:
+        """Run a REPL/TUI body with the session closed on every exit.
+
+        Both faces reach their end in more than one way: the loop returns, the
+        user hits Ctrl-C (the main task is cancelled), or something inside the
+        view raises. The plain `repl()` finishes with two statements that a
+        cancellation never reaches, so the close lives here — see
+        `_shutdown_session` for the cancellation handling.
+        """
         await self._open_session(self.fresh)
+        try:
+            return await body()
+        finally:
+            await self._shutdown_session()
+
+    async def _repl_loop(self) -> int:
         tool_names = " ".join(tool.name for tool in self.session.tools)
         print(f"model: {self.provider}/{self.model.id} | cwd: {self.cwd} | tools: {tool_names}")
         print("type /help for commands")
+        summary = self._extension_summary_line()
+        if summary:
+            print(summary)
         if self.template_diagnostics:
             for diagnostic in self.template_diagnostics:
                 print(f"[template warning: {diagnostic.code} {diagnostic.path}]", file=sys.stderr)
@@ -778,7 +984,10 @@ class KarenCli:
             if not line:
                 continue
             kind, name, rest = parse_command(
-                line, {t.name for t in self.templates}, {s.name for s in self.skills}
+                line,
+                {t.name for t in self.templates},
+                {s.name for s in self.skills},
+                self._extension_command_names(),
             )
             if kind == "quit":
                 break
@@ -830,6 +1039,16 @@ class KarenCli:
                 except (OSError, ValueError) as error:  # malformed file, unwritable path
                     print(f"[error: {error}]", file=sys.stderr)
                 continue
+            if kind == "extension":
+                try:
+                    handled = await self._run_extension_command(name, rest)
+                except Exception as error:  # keep the REPL alive
+                    print(f"[error: {error}]", file=sys.stderr)
+                    continue
+                if handled:
+                    continue
+                # The name was never registered after all: fall through and
+                # send the line to the model, exactly like pi.
             if kind == "template":
                 template = next(t for t in self.templates if t.name == name)
                 line = format_prompt_template_invocation(template, parse_command_args(rest))
@@ -845,7 +1064,6 @@ class KarenCli:
                 print("\n[interrupted]")
             except Exception as error:
                 print(f"[error: {error}]", file=sys.stderr)
-        await self.session.close()
         return 0
 
     async def repl_tui(self) -> int:
@@ -864,20 +1082,30 @@ class KarenCli:
         # lands in the transcript instead of on stdout (redraw is gated on
         # `start`, which happens once the alt screen is entered).
         self.tui = LiveTui()
+        # The face is known now: extension contexts and notifications are TUI's.
+        self.extension_host.mode = "tui"
+        self.extension_host.has_ui = True
         try:
             await self._open_session(self.fresh)
             tool_count = len(self.session.tools)
             self.tui.app.set_status_provider(
                 lambda: f"model: {self.provider}/{self.model.id} | tools: {tool_count} | cwd: {self.cwd}"
             )
+            summary = self._extension_summary_line()
+            if summary:
+                self.tui.app.add_notice(summary)
 
             async def _prompt_handler(app, text: str) -> None:
                 await self._dispatch_tui_input(app, text)
 
-            await self.tui.run(_prompt_handler)
+            try:
+                await self.tui.run(_prompt_handler)
+            finally:
+                self.tui = None
         finally:
-            self.tui = None
-        await self.session.close()
+            # The TUI is down by now; the session still needs its shutdown on
+            # the paths that skip the tail of this method (Ctrl-C, a raise).
+            await self._shutdown_session()
         return 0
 
     async def _dispatch_tui_input(self, app, text: str) -> None:
@@ -891,7 +1119,10 @@ class KarenCli:
             await self._run_tui_bash(app, text[1:])
             return
         kind, name, rest = parse_command(
-            text, {t.name for t in self.templates}, {s.name for s in self.skills}
+            text,
+            {t.name for t in self.templates},
+            {s.name for s in self.skills},
+            self._extension_command_names(),
         )
         if kind == "quit":
             app.transcript.resolve_pending()
@@ -922,7 +1153,7 @@ class KarenCli:
                 self.tui.app.add_notice(f"[error: {error}]", error=True)
             return
         try:
-            await self._handle_navigation_or_settings(kind, rest)
+            await self._handle_navigation_or_settings(kind, name, rest)
         except Exception as error:
             self.tui.app.add_notice(f"[error: {error}]", error=True)
 
@@ -978,7 +1209,7 @@ class KarenCli:
             transcript.on_bash_end(entry, result=result)
         app.redraw()
 
-    async def _handle_navigation_or_settings(self, kind: str, rest: str) -> None:
+    async def _handle_navigation_or_settings(self, kind: str, name: str, rest: str) -> None:
         """TUI-side dispatcher for slash commands that aren't prompt-shaped.
 
         Every branch's output is captured and reposted as transcript notice
@@ -989,6 +1220,8 @@ class KarenCli:
             await self._run_captured(
                 lambda: self._handle_navigation(kind, rest)
             )
+        elif kind == "extension":
+            await self._run_captured(lambda: self._run_extension_command(name, rest))
         elif kind == "retry":
             await self._run_captured(lambda: self._handle_retry(rest))
         elif kind == "thinking":
@@ -1062,6 +1295,9 @@ def main(argv=None) -> int:
                     help="plain line-based REPL instead of the alt-screen TUI")
     parser.add_argument("--export", metavar="FILE", dest="export_file",
                         help="export a session file to HTML and exit (an optional PROMPT arg is the output path)")
+    parser.add_argument("--extension", dest="extensions", action="append", default=[], metavar="PATH",
+                        help="load an extension file or directory (repeatable); loads after the "
+                             "conventional directories and the settings `extensions` list")
     parser.add_argument("messages", nargs="*", metavar="PROMPT",
                         help="prompt(s) for headless mode; several run sequentially")
     args = parser.parse_args(argv)
@@ -1095,7 +1331,8 @@ def main(argv=None) -> int:
         # session, so positional prompts don't apply and stdout is reserved
         # for the JSON stream.
         cli = KarenCli(cwd=cwd, model_id=model_id, fresh=args.new, quiet_tools=True,
-                       provider=provider, output_mode="rpc", loaded_settings=loaded_settings)
+                       provider=provider, output_mode="rpc", loaded_settings=loaded_settings,
+                       extension_paths=args.extensions)
         session = None
 
         async def _run_rpc() -> int:
@@ -1108,6 +1345,11 @@ def main(argv=None) -> int:
             return asyncio.run(_run_rpc())
         finally:
             async def _close() -> None:
+                # `run_rpc_mode` closes whatever session was live at EOF itself
+                # — a `new_session` command rebinds its holder, so the startup
+                # session is not necessarily the live one. This is the guard for
+                # a failure before that loop was reached; when the loop already
+                # closed its session this is a no-op.
                 if session is not None:
                     await session.close()
 
@@ -1115,7 +1357,7 @@ def main(argv=None) -> int:
     headless = args.print_flag or bool(args.messages) or args.mode == "json"
     cli = KarenCli(cwd=cwd, model_id=model_id, fresh=args.new,
                    quiet_tools=headless, provider=provider, output_mode=args.mode,
-                   loaded_settings=loaded_settings)
+                   loaded_settings=loaded_settings, extension_paths=args.extensions)
     if headless:
         return asyncio.run(cli.run_print(args.messages))
     use_tui, notice = resolve_interactive_mode(

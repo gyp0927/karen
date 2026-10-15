@@ -3,7 +3,7 @@
 The `karen` CLI coding assistant — the application layer on top of
 [karen-agent](../karen-agent), and the karen equivalent of
 [`@earendil-works/pi`](https://github.com/earendil-works/pi)'s
-`packages/coding-agent` (smaller scope: no extensions; the TUI is hand-rolled
+`packages/coding-agent` (extensions included as of M10; the TUI is hand-rolled
 in pure stdlib rather than ported from pi's React/Ink framework).
 
 ## M1: AgentSession + CLI
@@ -54,7 +54,7 @@ await session.close()
 
 Simplifications vs pi (documented at the port sites): no settings manager on
 the session itself (the CLI loads the settings files, see M4), no session
-projections, context edits, or extension events; pi's retention/staleness
+projections or context edits; pi's retention/staleness
 guards are dropped because karen sessions are append-only and only fresh
 post-run messages are checked.
 
@@ -190,8 +190,9 @@ Ported subset (camelCase wire keys, like pi):
   `maxAgentDelayMs: 60000`; wrong types fall back instead of failing.
 - `~` is expanded in path settings. `tui` (a karen addition) keeps `karen` in
   the plain REPL when it is `false`; it is read at startup, like the model and
-  shell settings. Writes (pi's `/settings` command) and the rest of pi's
-  Settings (extensions, analytics, themes, `retry.provider`, …) are not ported.
+  shell settings. `extensions` (a list of paths) loads extensions after the
+  conventional directories (M10). The rest of pi's Settings (analytics,
+  themes, `retry.provider`, …) is not ported.
 
 ## M5: RPC mode
 
@@ -244,8 +245,8 @@ printf '%s\n' '{"type":"prompt","message":"say hi","id":"1"}' '{"type":"get_stat
 - `get_entries` answers the session's entries (with `since` slicing after a
   named entry); M7 turned the earlier id-only shape into pi's entry objects.
 - Not ported at M5: the thinking-level commands, pi's bash side channel,
-  export-html, `get_commands` and the extension UI sub-protocol (karen has no
-  extensions or TUI yet), and image inputs on `prompt`/`steer`/`follow_up`.
+  export-html, `get_commands` and the extension UI sub-protocol, and image
+  inputs on `prompt`/`steer`/`follow_up`.
   Fork/clone/switch/session-stats arrived in M7, retry control in M8, and the
   rest of that list in M9 (below) — only `get_commands` and the extension UI
   sub-protocol remain.
@@ -650,10 +651,115 @@ covered with a real shell — the child writes a marker file a second in, and
 cancelling the caller must leave it unwritten (karen-agent's
 `tests/test_local_shell.py`, and the same chain through `execute_bash`).
 
+## M10: extensions
+
+`src/karen_coding_agent/extensions/` ports pi's `core/extensions/` to Python.
+An extension is a Python module exposing a factory that registers capabilities
+before the session starts:
+
+```python
+def extension(pi):
+    pi.register_tool(name="word_count", description="...", parameters={...}, execute=run)
+    pi.register_command("hello", handler=lambda args, ctx: ctx.notify("hi"))
+    pi.on("tool_call", lambda event, ctx: {"block": True, "reason": "no bash"} if event.tool_name == "bash" else None)
+```
+
+The factory may be `async def`; handlers and command/tool callbacks may be
+sync or async. Load order (name conflicts are first-registration-wins):
+
+1. `<cwd>/.karen/extensions/` — project
+2. `~/.karen/extensions/` — user
+3. the settings `extensions: [...]` list
+4. `--extension PATH` (repeatable)
+
+Inside a search directory every direct `*.py` file is an extension, and every
+subdirectory holding an `index.py` is one (the directory goes on `sys.path`
+while it loads, so it can import helpers); `_`/`.`-prefixed names are skipped.
+pi gates project-local extensions behind project trust; karen has no trust
+system, so `<cwd>/.karen/extensions/` loads unconditionally — treat a
+checkout's `.karen/` directory like its `Makefile`.
+
+What an extension can do:
+
+- **Tools** (`pi.register_tool`) join the session's tool set, callable by the
+  model exactly like the built-ins (the same four-argument `execute`).
+- **Commands** (`pi.register_command`) share the one `/name` namespace —
+  precedence: built-ins, extension commands, templates, skills. `/hello world`
+  calls the handler with `args="world"` and a
+  `CommandContext(session, notify, run_extension)`; the line never reaches the
+  model, and a failing handler is reported rather than turned into a prompt.
+- **Events** (`pi.on(event, handler)`): the session lifecycle
+  (`session_start`/`session_shutdown`/`session_info_changed`, `agent_start`/
+  `agent_end`/`agent_error`, `turn_start`/`turn_end`, `message_start`/
+  `message_update`/`message_end`, `tool_execution_start`/`update`/`end`) and
+  the transforming gates — `input` (rewrite or consume a prompt),
+  `before_agent_start` (inject a custom message and/or swap the system prompt
+  for one run), `context`/`context_with_system` (rewrite the outgoing
+  messages), `tool_call` (block a call; a failing handler blocks too — fail
+  closed), `tool_result` (rewrite the result field-wise), `user_bash` (answer
+  or block a `!command`), `message_end` (replace a finalized message, same
+  role only), and `resources_discover` (contribute skill/prompt directories,
+  fired by the CLI at startup).
+
+  Contract semantics, ported from the pi snapshot:
+
+  - `session_shutdown` / `session_start` pair around a session replacement
+    carries pi's reason vocabulary (`"quit"` | `"new"` | `"resume"` |
+    `"fork"`), not an invented one; the shutdown and the start that follows
+    share the reason.
+  - `before_agent_start`: every handler's `message` is kept (not
+    last-writer-wins), and a handler that returns a `system_prompt` — even
+    the empty string — sets it; pi's `!== undefined` rule, so `""` clears the
+    prompt for the run.
+  - `context_with_system`: a replacement that drops the leading system
+    message is honoured (the result is what the provider gets) but reported —
+    the request would otherwise go out with no prompt and no tool
+    declarations, which reads as a provider bug rather than an extension
+    bug.
+  - `user_bash`: a handler that answers returns `{"result": …}`; anything
+    else (pi's `{"operations": …}` alternative, or a typo) is treated as a
+    failure and blocks the command rather than letting it fall through to
+    local execution — a handler that thought it intercepted the command must
+    never see it run.
+  - `input`: the event's `source` field follows pi's
+    `InputSource` vocabulary (`"interactive"` | `"rpc"` | `"extension"`), and
+    RPC prompts report `"rpc"`, not `"interactive"`.
+  - `ToolResultEventResult` has no `terminate` — that is a `tool_call` /
+    tool-result field, and a `tool_result` handler cannot change it.
+- **Session controls** (`pi.append_entry`, `send_message`,
+  `send_user_message`, `exec`, `set_session_name`, `set_label`,
+  `get/set_active_tools`, `get/set_thinking_level`, `set_model`, `notify`,
+  `get_settings`, `get_commands`) delegate to a host bound to the live
+  session, so they follow fork/switch; with no session bound they raise, like
+  pi's actions.
+- **The `pi.events` bus** lets two extensions coordinate without importing
+  each other.
+
+The CLI wires the rest: the runner is built once at the first session open
+(async factories need the loop), handed to every `AgentSession` (a `/new` or
+RPC `new_session` re-binds the same runner, tools deduped by name — an
+extension tool whose name an active built-in or MCP tool already holds loses
+the slot and the drop is reported, never silent), and load diagnostics plus
+runtime handler failures surface per face (a transcript notice in the TUI,
+stderr elsewhere — stdout stays clean in the headless modes). A startup line
+summarizes what loaded. Every mode closes its session on the way out —
+including the paths that never reach a trailing statement: a cancelled
+headless run (Ctrl-C), a REPL interruption, and a TUI that raises mid-run all
+still dispatch `session_shutdown` and flush the transcript.
+
+Not ported (pi surface karen cannot supply): terminal-UI primitives, shortcuts
+and flags, provider/virtual-model registration, `before_provider_*` and cache
+events, nested tool calls, `project_trust`, and pi 1.2's ResourceLoader/
+PackageManager extras (built-in extensions, `builtin:<name>`,
+`--no-extensions`, the `+`/`-`/`!` enable/disable patterns in the settings
+list). Also not ported: `user_bash`'s `{"operations": …}` alternative (a
+handler returning it blocks the command; see above) and the `reload` lifecycle
+reason (karen has no reload path, so it is never emitted).
+
 ## Roadmap
 
-Later milestones: extensions (unscheduled). MCP tool integration and the TUI
-both landed (above/below).
+No later milestones scheduled — extensions (M10), MCP tool integration and
+the TUI have all landed.
 
 ## MCP: tools from external servers
 

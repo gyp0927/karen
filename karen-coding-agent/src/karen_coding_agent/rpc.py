@@ -165,7 +165,7 @@ class RpcSession:
         """Create a brand-new on-disk session and rebind to it."""
         old = self.agent_session
         if old.session is not None:
-            await old.close()
+            await old.close(reason="new")
         session = AgentSession(
             cwd=self.cwd,
             models=old.models,
@@ -184,8 +184,12 @@ class RpcSession:
             retry_policy=old.retry,
             compaction_settings=old.settings,
             stream_fn=old._stream_fn,
+            # The extension runner is shared, never rebuilt: the new session
+            # re-wraps its tools (deduped by name against `tools=old.tools`,
+            # which already carries them) and re-binds its host on open.
+            extensions=old.extensions,
         )
-        await session.open()
+        await session.open(reason="new")
         self.agent_session = session
         return session
 
@@ -207,6 +211,9 @@ class RpcServer:
         self.emit = emit
         self.on_command_error = on_command_error
         self.session = holder.agent_session
+        #: The prompt's `input`-event source. RPC prompts are not typed input:
+        #: extensions see them as "rpc" (pi's InputSource).
+        self._input_source = "rpc"
         self.auto_compaction_enabled = True
         self.is_compacting = False
         self._prompt_task: Optional[asyncio.Task] = None
@@ -273,10 +280,20 @@ class RpcServer:
         if command_type == "prompt":
             return await self._cmd_prompt(command_id, raw)
         if command_type == "steer":
-            self.session.steer(_user_message(str(raw.get("message", "")), _parse_images(raw.get("images"))))
+            await self.session.send_user_message(
+                str(raw.get("message", "")),
+                _parse_images(raw.get("images")),
+                deliver_as="steer",
+                source=self._input_source,
+            )
             return _success(command_id, "steer", {"disposition": "queued"})
         if command_type == "follow_up":
-            self.session.follow_up(_user_message(str(raw.get("message", "")), _parse_images(raw.get("images"))))
+            await self.session.send_user_message(
+                str(raw.get("message", "")),
+                _parse_images(raw.get("images")),
+                deliver_as="follow_up",
+                source=self._input_source,
+            )
             return _success(command_id, "follow_up", {"disposition": "queued"})
         if command_type == "abort":
             self.session.abort()
@@ -505,9 +522,21 @@ class RpcServer:
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
             )
         if streaming_behavior == "followUp":
-            self.session.follow_up(_user_message(text, images))
+            await self.session.send_user_message(
+                text,
+                images,
+                deliver_as="follow_up",
+                source=self._input_source,
+                streaming_behavior="followUp",
+            )
         else:
-            self.session.steer(_user_message(text, images))
+            await self.session.send_user_message(
+                text,
+                images,
+                deliver_as="steer",
+                source=self._input_source,
+                streaming_behavior="steer",
+            )
         return _success(command_id, "prompt", {"disposition": "queued"})
 
     async def wait_for_idle(self) -> None:
@@ -524,7 +553,12 @@ class RpcServer:
 
     async def _run_prompt(self, text: str, images: Optional[List[ImageContent]] = None) -> None:
         try:
-            await self.session.prompt(text, images=images, auto_compact=self.auto_compaction_enabled)
+            await self.session.prompt(
+                text,
+                images=images,
+                auto_compact=self.auto_compaction_enabled,
+                source=self._input_source,
+            )
         except Exception as error:  # prompt failures surface through events; log elsewhere
             if self.on_command_error is not None:
                 self.on_command_error(error)
@@ -591,7 +625,16 @@ async def run_rpc_mode(
         emit=emit or _StdoutEmitter(stdout or sys.stdout),
         on_command_error=on_command_error,
     )
-    return await server.run()
+    try:
+        return await server.run()
+    finally:
+        # A `new_session` command rebinds the holder to a fresh session
+        # (closing the old one as it goes). The rebind is what the process's
+        # exit-time close has to follow: at EOF, close whatever the holder
+        # now points at, so the new session gets its `session_shutdown` and
+        # no `new_session`-created session leaks open.
+        if holder.agent_session is not session:
+            await holder.agent_session.close()
 
 
 class _AsyncStdinLines:

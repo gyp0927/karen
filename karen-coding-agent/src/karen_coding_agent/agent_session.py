@@ -4,8 +4,9 @@ Wires karen_agent's `Agent` to durable session persistence, automatic
 compaction (threshold + overflow recovery), auto-retry of transient provider
 failures (M8), session navigation (tree, fork, clone, switch — M7), and the
 hook registry — the karen equivalent of pi coding-agent's `core/agent-session.ts`,
-greatly simplified: no settings manager, session projections, context edits, or
-extension events yet (those are later milestones).
+greatly simplified: no settings manager, session projections, or context edits.
+When an `ExtensionRunner` is attached, every lifecycle point below also
+dispatches to its handlers (M10 — see `extensions/` for the event contract).
 
 Persistence model: every message is persisted as its `message_end` event
 arrives (crash-safe, like pi). Recovery rewinds the branch tip to persistently
@@ -49,6 +50,7 @@ from karen_agent import (
     BeforeToolEvent,
     HookRegistry,
     StreamFn,
+    TransformContextEvent,
     convert_to_llm,
     models_stream_fn,
 )
@@ -96,6 +98,12 @@ from karen_agent.session.jsonl import to_jsonable
 from karen_agent.session.types import CompactionEntry
 from .navigation import TreeNode, build_tree, entry_text, forkable_user_messages
 from .bash_executor import BashResult
+from .extensions import (
+    ExtensionRunner,
+    bash_result_from,
+    make_agent_tool,
+)
+from .extensions import events as extension_events
 from .settings import DEFAULT_RETRY_POLICY
 from .tools import create_default_tools
 
@@ -220,6 +228,7 @@ class AgentSession:
         stream_fn: Optional[StreamFn] = None,
         listener: Optional[SessionListener] = None,
         mcp_manager: Optional[Any] = None,
+        extensions: Optional[ExtensionRunner] = None,
     ) -> None:
         self.cwd = cwd
         self.models = models
@@ -257,6 +266,44 @@ class AgentSession:
         self.mcp_manager = mcp_manager
         if mcp_manager is not None:
             self.tools = [*self.tools, *mcp_manager.tools()]
+        #: The extension runtime (pi's `ExtensionRunner`). When present, its
+        #: tools join the active set and every lifecycle hook below dispatches
+        #: to its handlers. Read on every call, so tests can attach one to a
+        #: constructed session.
+        self.extensions = extensions
+        if extensions is not None:
+            extension_tools = [make_agent_tool(definition) for definition in extensions.tools()]
+            known = {getattr(tool, "name", None) for tool in self.tools}
+            kept = []
+            for tool in extension_tools:
+                if tool.name not in known:
+                    kept.append(tool)
+                    continue
+                # The name is taken. When the pool already holds this very
+                # wrapped tool — RPC `new_session` passes `tools=old.tools`,
+                # which carries the previous session's wraps — skipping it is a
+                # no-op, not a drop. A collision with a built-in, an MCP tool or
+                # another extension does cost this registration, and that is
+                # reported, never silent.
+                owner = extensions.extension_for_tool(tool.name)
+                provider = getattr(owner, "module_path", "<unknown>")
+                definition = getattr(owner, "tools", {}).get(tool.name)
+                already = any(
+                    active is tool
+                    or (
+                        getattr(active, "name", None) == tool.name
+                        and getattr(active, "execute", None) is getattr(definition, "execute", None)
+                    )
+                    for active in self.tools
+                )
+                if not already:
+                    extensions.report_error(
+                        provider,
+                        "register_tool",
+                        f"tool {tool.name!r} was ignored: an active tool already has that name",
+                    )
+            if kept:
+                self.tools = [*self.tools, *kept]
         #: Structured prompt sections (pi's `SystemMessage.sections`), when the
         #: caller assembles the prompt with `karen_coding_agent.prompt`.
         self.system_prompt_sections = system_prompt_sections
@@ -283,12 +330,18 @@ class AgentSession:
             initial_state=AgentInitialState(
                 system_prompt=self.system_prompt_text, model=model, tools=self.tools
             ),
-            convert_to_llm=self._convert_to_llm,
+            convert_to_llm=self._convert_to_llm_for_request,
+            transform_context=self._transform_context,
             stream_fn=self._stream_fn,
             before_tool_call=self._before_tool_call,
             after_tool_call=self._after_tool_call,
         )
         self.agent.subscribe(self._on_agent_event)
+        #: Extension bookkeeping: whether a `session_start` was emitted (so
+        #: `close` emits the matching `session_shutdown`), and the running turn
+        #: counter for the forwarded turn events (reset on each `agent_start`).
+        self._ext_session_started = False
+        self._ext_turn_index = 0
         self._overflow_recovery_attempted = False
         #: Everything appended to the branch during the current run, in append
         #: order, as `(kind, entry_id, entry)` — `entry` is the `CustomEntry`
@@ -312,8 +365,55 @@ class AgentSession:
         if self._listener is not None:
             self._listener(event)
 
-    async def open(self) -> None:
-        """Create or resume the on-disk session and rebuild the context."""
+    async def _ext_emit(self, event: Any, signal: Optional[Any] = None) -> None:
+        """Fire a notification event at the extension runner, if anything listens."""
+        runner = self.extensions
+        if runner is None or not runner.has_handlers(getattr(type(event), "type", "")):
+            return
+        await runner.emit(event, signal)
+
+    def _bind_extension_host(self) -> None:
+        """Bind the runner's host to this session (pi binds actions per session).
+
+        The host travels on the runner (the loader put it there), so every path
+        that adopts a runner — CLI open, RPC `new_session`, a test — rebinds
+        here without knowing the host exists.
+        """
+        runner = self.extensions
+        host = getattr(runner, "host", None) if runner is not None else None
+        if host is not None:
+            host.bind(self)
+
+    async def _emit_input(
+        self,
+        text: str,
+        images: Any = None,
+        *,
+        source: str = "interactive",
+        streaming_behavior: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Fire the extension `input` event; the outcome, or None with no handlers.
+
+        Shared by `prompt` (typed/RPC prompts) and the extension host's
+        `send_user_message` (source `"extension"`): a handler may rewrite the
+        text/images or consume the prompt outright (`handled`).
+        """
+        runner = self.extensions
+        if runner is None or not runner.has_handlers("input"):
+            return None
+        return await runner.emit_input(
+            extension_events.InputEvent(
+                text=text, images=images, source=source, streaming_behavior=streaming_behavior
+            )
+        )
+
+    async def open(self, *, reason: Optional[str] = None) -> None:
+        """Create or resume the on-disk session and rebuild the context.
+
+        *reason* is the `session_start` reason for a non-resumed open —
+        `"startup"` (the default) or `"new"` when the caller replaced a live
+        session (`/new`, RPC `new_session`).
+        """
         resumed = False
         if not self.fresh:
             existing = await self.repo.list(JsonlSessionListOptions(cwd=self.cwd))
@@ -326,9 +426,15 @@ class AgentSession:
         await self._ensure_branch(self.session)
         await self._reload_context()
         await self._restore_thinking_level()
+        self._bind_extension_host()
         self._emit(
             {"type": "session_opened", "session_id": self.session.metadata.id, "resumed": resumed}
         )
+        # pi fires session_start once the context is loaded, before any run.
+        await self._ext_emit(
+            extension_events.SessionStartEvent(reason=reason or ("resume" if resumed else "startup"))
+        )
+        self._ext_session_started = True
 
     async def _thinking_level_entries(self) -> List[Any]:
         branch = await self.session.branch(self.branch_name)
@@ -386,7 +492,18 @@ class AgentSession:
                 lane_state(self.branch_name), LaneState().model_dump(mode="json", by_alias=True)
             )
 
-    async def close(self) -> None:
+    async def close(self, *, reason: str = "quit", target_session_file: Optional[str] = None) -> None:
+        # The shutdown event goes first: handlers release session-scoped
+        # resources here and may still want to read the session. Emitted once
+        # per started session, so a repeated close is silent (pi's idempotency
+        # ask: cancellation, reload and exit can all land on this path).
+        if self._ext_session_started:
+            self._ext_session_started = False
+            await self._ext_emit(
+                extension_events.SessionShutdownEvent(
+                    reason=reason, target_session_file=target_session_file
+                )
+            )
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -446,6 +563,7 @@ class AgentSession:
             raise ValueError("Session name cannot be empty")
         await self.session.set_name(name)
         self._emit({"type": "session_info_changed", "name": name})
+        await self._ext_emit(extension_events.SessionInfoChangedEvent(name=name))
 
     async def list_sessions(self) -> List[JsonlSessionMetadata]:
         """Sessions on disk for this cwd, newest first (pi's resume list)."""
@@ -735,8 +853,27 @@ class AgentSession:
         await self.session.mutate(apply)
 
     async def _rebind(self, session: Session, *, reason: str = "new") -> None:
-        """Adopt a different session handle (fork/clone/switch) and reload context."""
+        """Adopt a different session handle (fork/clone/switch) and reload context.
+
+        The extension lifecycle brackets the swap with a `session_shutdown` /
+        `session_start` pair carrying pi's reason vocabulary — `"fork"` for a
+        fork or clone, `"resume"` for a switch (moving to an existing session
+        is a resume; the vocabulary has no "switch"), `"new"` otherwise.
+        """
+        shutdown_reason = {"fork": "fork", "switch": "resume"}.get(reason, "new")
         previous = self.session
+        previous_file = getattr(getattr(previous, "metadata", None), "path", None)
+        new_file = getattr(getattr(session, "metadata", None), "path", None)
+        if previous is not None and previous is not session and self._ext_session_started:
+            # pi's session-replacement shutdown: the runtime lives on, but the
+            # session extensions were bound to is going away. Its reason is the
+            # replacement's own reason, so a handler can pair it with the
+            # `session_start` that follows.
+            await self._ext_emit(
+                extension_events.SessionShutdownEvent(
+                    reason=shutdown_reason, target_session_file=new_file
+                )
+            )
         self.session = session
         if previous is not None and previous is not session:
             await previous.close()
@@ -757,6 +894,14 @@ class AgentSession:
                 "reason": reason,
             }
         )
+        # The matching session_start, sharing the shutdown's reason.
+        await self._ext_emit(
+            extension_events.SessionStartEvent(
+                reason=shutdown_reason,
+                previous_session_file=previous_file,
+            )
+        )
+        self._ext_session_started = True
 
     # -- agent passthrough -------------------------------------------------------
 
@@ -867,6 +1012,24 @@ class AgentSession:
         """
         from .bash_executor import execute_bash
 
+        # The extension `user_bash` gate runs before the shell is touched: a
+        # handler may answer the command itself (recorded exactly like a real
+        # run), and a handler failure blocks the command rather than letting
+        # it fall through unvetted (pi's fail-safe).
+        runner = self.extensions
+        if runner is not None and runner.has_handlers("user_bash"):
+            outcome = await runner.emit_user_bash(
+                extension_events.UserBashEvent(
+                    command=command, exclude_from_context=exclude_from_context, cwd=self.cwd
+                )
+            )
+            if outcome.blocked:
+                raise RuntimeError(outcome.reason)
+            if outcome.result is not None:
+                result = bash_result_from(outcome.result)
+                await self.record_bash_result(command, result, exclude_from_context=exclude_from_context)
+                return result
+
         controller = AbortController()
         self._bash_controllers.append(controller)
 
@@ -889,6 +1052,46 @@ class AgentSession:
         finally:
             if controller in self._bash_controllers:
                 self._bash_controllers.remove(controller)
+
+    async def send_user_message(
+        self,
+        text: str,
+        images: Any = None,
+        *,
+        deliver_as: str = "steer",
+        source: str = "extension",
+        streaming_behavior: Optional[str] = None,
+    ) -> None:
+        """Queue a user message as if it had been typed (pi's `sendUserMessage`).
+
+        The single path for a message that arrives while a run is in flight,
+        whether an extension sent it or the RPC client did: the `input` event
+        fires first (source ``"extension"`` / ``"rpc"``) and a handler may
+        rewrite the text or consume the message outright, exactly as it may for
+        a typed prompt. *deliver_as* is ``"steer"`` (mid-run) or ``"follow_up"``
+        (after the run).
+        """
+        from karen_agent.messages import UserMessage
+        from karen_ai import TextContent
+
+        behavior = "followUp" if deliver_as in ("follow_up", "followUp") else "steer"
+        outcome = await self._emit_input(
+            text,
+            images,
+            source=source,
+            streaming_behavior=streaming_behavior or behavior,
+        )
+        if outcome is not None:
+            if outcome.handled:
+                return
+            text, images = outcome.text, outcome.images
+        blocks: List[Any] = [TextContent(text=text)]
+        blocks.extend(images or [])
+        message = UserMessage(content=blocks, timestamp=_now_ms())
+        if behavior == "followUp":
+            self.follow_up(message)
+        else:
+            self.steer(message)
 
     async def record_bash_result(
         self, command: str, result: "BashResult", *, exclude_from_context: bool = False
@@ -925,7 +1128,9 @@ class AgentSession:
 
     # -- prompting ---------------------------------------------------------------
 
-    async def prompt(self, text: str, images=None, auto_compact: bool = True) -> None:
+    async def prompt(
+        self, text: str, images=None, auto_compact: bool = True, source: str = "interactive"
+    ) -> None:
         """Run one user prompt to completion, including auto-retry of transient
         provider failures, overflow recovery and threshold auto-compaction (pi's
         post-run `_handlePostAgentRun` driver; `auto_compact=False` skips the
@@ -936,9 +1141,20 @@ class AgentSession:
         converted/resized to the model's inline limits, failures are dropped and
         their messages appended to the text as hints. `steer()`/`follow_up()`
         keep images raw, exactly like pi.
+
+        Extension points, in firing order (pi's run pipeline): `input` may
+        rewrite or consume the prompt (*source* is "interactive" | "rpc" |
+        "extension"), `before_agent_start` may inject a custom message and/or
+        swap the system prompt for this run, and a run that settles on a
+        failure nobody retried away ends in `agent_error`.
         """
         self._overflow_recovery_attempted = False
         self._abort_requested = False
+        outcome = await self._emit_input(text, images, source=source)
+        if outcome is not None:
+            if outcome.handled:
+                return  # a handler consumed the prompt: no run happens
+            text, images = outcome.text, outcome.images
         # pi's second flush point (the first is the run-settle flush in the
         # `finally` below): a bash result recorded in the window after that
         # flush but before the run fully settled is still queued here, and the
@@ -950,10 +1166,23 @@ class AgentSession:
         normalized_images, hints = await self._normalize_prompt_images(images)
         if hints:
             text = f"{text}\n\n" + "\n".join(hints)
+        original_system_message = await self._before_agent_start(text, normalized_images)
         try:
             await self.agent.prompt(text, normalized_images)
             await self._post_run(auto_compact)
+            # agent_error: the run's final state is a failure auto-retry and
+            # overflow recovery both declined or exhausted (pi emits it once
+            # the failure is kept, not per attempt).
+            final = self._last_assistant_message()
+            if final is not None and message_field(final, "stop_reason", "stopReason") == "error":
+                await self._ext_emit(
+                    extension_events.AgentErrorEvent(
+                        error=message_field(final, "error_message", "errorMessage") or ""
+                    )
+                )
         finally:
+            if original_system_message is not None:
+                self._restore_system_message(original_system_message)
             # pi flushes pending side-channel results in the `finally` of
             # `_runAgentPrompt` — once the whole run is over, including
             # auto-retry and overflow recovery. Flushing at each attempt's
@@ -965,6 +1194,55 @@ class AgentSession:
             # settle flush rather than having a message spliced into it.
             if not getattr(self.agent.state, "is_streaming", False):
                 await self._flush_pending_bash_messages()
+
+    async def _before_agent_start(self, text: str, images: Any) -> Optional[SystemMessage]:
+        """Fire the extension `before_agent_start` event and apply its injections.
+
+        Each custom message a handler returned is persisted and appended to the
+        transcript before the user message lands (pi's `appendCustomMessage` on
+        this path), in handler order; a returned system prompt — including the
+        empty string, which clears it — swaps the leading system message for the
+        run's duration, and the original message object comes back so `prompt`
+        can restore it afterwards. Returns None when nothing was swapped.
+        """
+        runner = self.extensions
+        if runner is None or not runner.has_handlers("before_agent_start"):
+            return None
+        collected = await runner.emit_before_agent_start(
+            extension_events.BeforeAgentStartEvent(
+                prompt=text, images=images, system_prompt=self.system_prompt_text
+            )
+        )
+        for message_spec in collected.get("messages") or ():
+            from karen_agent.messages import create_custom_message
+
+            spec = message_spec if isinstance(message_spec, dict) else {}
+            injected = create_custom_message(
+                custom_type=spec.get("custom_type") or spec.get("customType") or "extension",
+                content=spec.get("content") or "",
+                display=bool(spec.get("display", False)),
+                details=spec.get("details"),
+                timestamp=_now_ms(),
+            )
+            await self._persist_message(injected)
+            self.agent.state.messages.append(injected)
+        if "system_prompt" not in collected:
+            return None
+        replacement = collected["system_prompt"]
+        if replacement is None:
+            return None
+        messages = self.agent.state.messages
+        if not messages or getattr(messages[0], "role", None) != "system":
+            return None
+        original = messages[0]
+        messages[0] = SystemMessage(content=replacement, tools_added=self.tools, timestamp=_now_ms())
+        return original
+
+    def _restore_system_message(self, original: SystemMessage) -> None:
+        """Undo `_before_agent_start`'s run-scoped system prompt swap."""
+        messages = self.agent.state.messages
+        if messages and getattr(messages[0], "role", None) == "system":
+            messages[0] = original
 
     @staticmethod
     def _resize_options_for(model):
@@ -983,6 +1261,43 @@ class AgentSession:
         if not self.block_images:
             return converted
         return [_block_message_images(message) for message in converted]
+
+    async def _convert_to_llm_for_request(self, messages: List[AgentMessage]) -> Any:
+        """`_convert_to_llm` plus the extension `context_with_system` event.
+
+        The event fires after conversion (and after the block-images filter),
+        so what a handler returns is what the provider is sent, verbatim —
+        that is the event's "sent as returned" contract. Kept as a separate
+        async wrapper so `_convert_to_llm` itself stays synchronous for the
+        tests and embedders that call it directly.
+        """
+        converted = self._convert_to_llm(messages)
+        runner = self.extensions
+        if runner is None or not runner.has_handlers("context_with_system"):
+            return converted
+        return await runner.emit_context_with_system(
+            extension_events.ContextWithSystemEvent(messages=converted)
+        )
+
+    async def _transform_context(self, messages: List[AgentMessage], signal) -> List[AgentMessage]:
+        """The AgentMessage-level transform applied before conversion (pi's
+        `transformContext`): karen-native hooks first (the registry's
+        `transform_context`), then the extension `context` event chaining over
+        the result — the same hooks-then-extensions order `_before_tool_call`
+        uses. A hook's `system_prompt` override is dropped here on purpose:
+        karen's system prompt lives *in* the transcript's leading system
+        message, so transforming it is the messages' business.
+        """
+        hook_result = await self.hooks.run(
+            "transform_context",
+            TransformContextEvent(messages=list(messages), system_prompt=self.system_prompt_text),
+        )
+        if hook_result is not None and hook_result.messages is not None:
+            messages = hook_result.messages
+        runner = self.extensions
+        if runner is None or not runner.has_handlers("context"):
+            return messages
+        return await runner.emit_context(extension_events.ContextEvent(messages=messages), signal)
 
     def _image_resize_options(self):
         """The current model's image resize profile (pi's `model.inputLimits.images.resize`)."""
@@ -1261,11 +1576,55 @@ class AgentSession:
         if event_type == "agent_start":
             self._abort_requested = False
             self._run_appends = []
+            self._ext_turn_index = 0
             branch = await self.session.branch(self.branch_name)
             self._pre_run_tip = await branch.get_tip_id()
+            await self._ext_emit(extension_events.AgentStartEvent(), signal)
+        elif event_type == "agent_end":
+            await self._ext_emit(
+                extension_events.AgentEndEvent(messages=list(getattr(event, "messages", None) or [])),
+                signal,
+            )
+        elif event_type == "turn_start":
+            await self._ext_emit(
+                extension_events.TurnStartEvent(turn_index=self._ext_turn_index, timestamp=_now_ms()),
+                signal,
+            )
+        elif event_type == "turn_end":
+            await self._ext_emit(
+                extension_events.TurnEndEvent(
+                    turn_index=self._ext_turn_index,
+                    timestamp=_now_ms(),
+                    message=getattr(event, "message", None),
+                    tool_results=list(getattr(event, "tool_results", None) or []),
+                ),
+                signal,
+            )
+            self._ext_turn_index += 1
+        elif event_type == "message_start":
+            await self._ext_emit(extension_events.MessageStartEvent(message=event.message), signal)
+        elif event_type == "message_update":
+            await self._ext_emit(
+                extension_events.MessageUpdateEvent(
+                    message=event.message,
+                    assistant_message_event=getattr(event, "assistant_message_event", None),
+                ),
+                signal,
+            )
         elif event_type == "message_end":
-            await self._persist_message(event.message)
             message = event.message
+            runner = self.extensions
+            if runner is not None and runner.has_handlers("message_end"):
+                # Handlers may replace the finalized message (same role only,
+                # enforced by the runner). The replacement is what gets
+                # persisted, and it is swapped into the live transcript so the
+                # model sees on the next turn exactly what the session stored.
+                message = await runner.emit_message_end(
+                    extension_events.MessageEndEvent(message=message), signal
+                )
+                if message is not event.message:
+                    self._swap_message(event.message, message)
+            await self._persist_message(message)
             if message_field(message, "role") == "assistant":
                 # Reset the retry counter immediately on a successful assistant
                 # response, so it cannot accumulate across a turn's LLM calls.
@@ -1276,6 +1635,47 @@ class AgentSession:
                     attempt = self._retry_attempt
                     self._retry_attempt = 0
                     self._emit({"type": "auto_retry_end", "success": True, "attempt": attempt})
+        elif event_type == "tool_execution_start":
+            await self._ext_emit(
+                extension_events.ToolExecutionStartEvent(
+                    tool_call_id=event.tool_call_id,
+                    tool_name=event.tool_name,
+                    args=getattr(event, "args", None),
+                ),
+                signal,
+            )
+        elif event_type == "tool_execution_update":
+            await self._ext_emit(
+                extension_events.ToolExecutionUpdateEvent(
+                    tool_call_id=event.tool_call_id,
+                    tool_name=event.tool_name,
+                    args=getattr(event, "args", None),
+                    partial_result=getattr(event, "partial_result", None),
+                ),
+                signal,
+            )
+        elif event_type == "tool_execution_end":
+            await self._ext_emit(
+                extension_events.ToolExecutionEndEvent(
+                    tool_call_id=event.tool_call_id,
+                    tool_name=event.tool_name,
+                    args=getattr(event, "args", None),
+                    result=getattr(event, "result", None),
+                    is_error=bool(getattr(event, "is_error", False)),
+                ),
+                signal,
+            )
+
+    def _swap_message(self, original: Any, replacement: Any) -> None:
+        """Best-effort in-place swap of a `message_end`-replaced message in the
+        live transcript (the loop finalized it there before emitting). A
+        message already gone — an abort rewound it — is simply not swapped;
+        the persisted entry still carries the replacement."""
+        messages = self.agent.state.messages
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index] is original:
+                messages[index] = replacement
+                return
 
     async def _flush_pending_bash_messages(self) -> None:
         """Append side-channel bash results queued during the run (pi's
@@ -1443,6 +1843,27 @@ class AgentSession:
             return BeforeToolCallResult(
                 block=True, reason=result.block.reason, terminate=result.block.terminate
             )
+        runner = self.extensions
+        if runner is None or not runner.has_handlers("tool_call"):
+            return None
+        # The event's input IS the validated-args dict the loop executes with
+        # (the loop keeps the reference, not a copy), so a handler mutating it
+        # in place patches the call's arguments — pi's `tool_call` contract.
+        args = hook_context.args
+        if not isinstance(args, dict):
+            args = dict(args or {})
+        decision = await runner.emit_tool_call(
+            extension_events.ToolCallEvent(
+                tool_call_id=hook_context.tool_call.id,
+                tool_name=hook_context.tool_call.name,
+                input=args,
+            ),
+            signal,
+        )
+        if decision.block:
+            return BeforeToolCallResult(
+                block=True, reason=decision.reason, terminate=decision.terminate
+            )
         return None
 
     async def _after_tool_call(self, hook_context, signal):
@@ -1458,19 +1879,58 @@ class AgentSession:
                 usage=hook_context.result.usage,
             ),
         )
-        # pi runs image normalization AFTER the extension tool_result hook so
-        # hook-injected images are normalized too. Oversized images from tools
-        # (screenshots, MCP bridges) would otherwise make the provider reject
-        # the whole conversation, so normalize them once here.
-        content = hook_context.result.content
+        # The extension tool_result hook: handlers rewrite what the model sees,
+        # field-wise. pi runs image normalization AFTER it so hook-injected
+        # images are normalized too — hence the two-step compose below.
+        overrides = None
+        runner = self.extensions
+        if runner is not None and runner.has_handlers("tool_result"):
+            overrides = await runner.emit_tool_result(
+                extension_events.ToolResultEvent(
+                    tool_call_id=hook_context.tool_call.id,
+                    tool_name=hook_context.tool_call.name,
+                    input=dict(hook_context.args or {}),
+                    content=list(hook_context.result.content or []),
+                    details=hook_context.result.details,
+                    is_error=hook_context.is_error,
+                    usage=hook_context.result.usage,
+                ),
+                signal,
+            )
+        # Oversized images from tools (screenshots, MCP bridges) would make the
+        # provider reject the whole conversation, so normalize them once here.
+        content = (
+            overrides.content
+            if overrides is not None and overrides.content is not None
+            else hook_context.result.content
+        )
+        normalized = None
         if content and any(getattr(block, "type", None) == "image" for block in content):
             from .utils import normalize_tool_result_images
 
-            normalized = await normalize_tool_result_images(
+            resized = await normalize_tool_result_images(
                 content,
                 auto_resize_images=self.auto_resize_images,
                 resize_options=self._image_resize_options(),
             )
-            if normalized != list(content):
-                return AfterToolCallResult(content=normalized)
-        return None
+            if resized != list(content):
+                normalized = resized
+        if overrides is None and normalized is None:
+            return None
+        # Unchanged fields arrive as None (a handler cannot express "clear to
+        # None" — the loop's own field merge has the same limitation), so any
+        # non-None field is a real override; an all-None result is a no-op.
+        has_overrides = overrides is not None and any(
+            value is not None
+            for value in (overrides.content, overrides.details, overrides.usage, overrides.is_error)
+        )
+        if not has_overrides and normalized is None:
+            return None
+        return AfterToolCallResult(
+            content=normalized
+            if normalized is not None
+            else (overrides.content if overrides is not None else None),
+            details=overrides.details if overrides is not None else None,
+            usage=overrides.usage if overrides is not None else None,
+            is_error=overrides.is_error if overrides is not None else None,
+        )
